@@ -317,49 +317,22 @@ impl Filesystem for GDriveFS {
             }
         }
 
-        // 3. Archivo binario normal: estrategia de caché adaptativa
+        // 3. Archivo binario normal: estrategia de caché bajo demanda
         let cache_path = self.get_cache_path(&gdrive_id);
-        const SMALL_FILE_THRESHOLD: i64 = 5 * 1024 * 1024; // 5MB
         
-        // 3a. Si el archivo ya existe en caché con tamaño correcto, servir desde ahí
-        if cache_path.exists() {
-            if let Ok(metadata) = tokio::fs::metadata(&cache_path).await {
-                if metadata.len() == file_size as u64 {
-                    match self.read_from_cache(&cache_path, offset, size).await {
-                        Ok(data) => return Ok(ReplyData { data: data.into() }),
-                        Err(e) => {
-                            debug!("Error leyendo caché, re-descargando: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3b. Para archivos pequeños: descargar completo y cachear
-        if file_size > 0 && file_size < SMALL_FILE_THRESHOLD {
-            match self.download_to_cache(&gdrive_id, file_size as u64).await {
-                Ok(_) => {
-                    match self.read_from_cache(&cache_path, offset, size).await {
-                        Ok(data) => return Ok(ReplyData { data: data.into() }),
-                        Err(e) => {
-                            error!("Error leyendo caché: {}", e);
-                            return Err(Errno::from(libc::EIO));
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error descargando archivo pequeño: {}", e);
-                    return Err(Errno::from(libc::EIO));
-                }
-            }
-        }
-
-        // 3c. Para archivos grandes: descarga bajo demanda (solo el chunk solicitado)
+        // 3a. Asegurar que el rango solicitado esté disponible
         if file_size > 0 {
-            match self.drive_client.download_chunk(&gdrive_id, offset, size).await {
+            // Descargar solo lo necesario
+            if let Err(e) = self.ensure_range_cached(inode, &gdrive_id, offset, size, file_size as u64).await {
+                error!("Error descargando chunk para inode {}: {}", inode, e);
+                return Err(Errno::from(libc::EIO));
+            }
+
+            // Leer desde caché
+            match self.read_from_cache(&cache_path, offset, size).await {
                 Ok(data) => return Ok(ReplyData { data: data.into() }),
                 Err(e) => {
-                    error!("Error descargando chunk de {}: {}", gdrive_id, e);
+                    error!("Error leyendo caché para inode {}: {}", inode, e);
                     return Err(Errno::from(libc::EIO));
                 }
             }
@@ -905,38 +878,105 @@ impl GDriveFS {
         Ok(buffer)
     }
 
-    /// Descarga un archivo completo de GDrive a caché local
-    async fn download_to_cache(&self, gdrive_id: &str, file_size: u64) -> anyhow::Result<()> {
-        use tokio::io::AsyncWriteExt;
+
+    /// Asegura que un rango específico esté disponible en caché
+    /// Descarga solo los chunks faltantes EN PARALELO para mejor performance
+    async fn ensure_range_cached(
+        &self,
+        inode: u64,
+        gdrive_id: &str,
+        offset: u64,
+        size: u32,
+        file_size: u64,
+    ) -> anyhow::Result<()> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
         
+        // Calcular el rango solicitado (ajustado al tamaño del archivo)
+        let requested_start = offset;
+        let requested_end = (offset + size as u64 - 1).min(file_size.saturating_sub(1));
+        
+        if requested_start >= file_size {
+            return Ok(()); // Fuera de rango, nada que hacer
+        }
+
+        // Obtener rangos faltantes de la DB
+        let missing_ranges = self.db.get_missing_ranges(inode, requested_start, requested_end).await?;
+        
+        if missing_ranges.is_empty() {
+            tracing::debug!("✅ Rango ya cacheado: inode={} offset={} size={}", inode, offset, size);
+            return Ok(());
+        }
+
         let cache_path = self.get_cache_path(gdrive_id);
         
         // Crear directorio de caché si no existe
         if let Some(parent) = cache_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        
-        tracing::info!("📥 Descargando archivo completo a caché: {} ({} bytes)", gdrive_id, file_size);
-        
-        // Descargar en chunks de 1MB para archivos grandes
-        const CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
-        
-        let mut file = tokio::fs::File::create(&cache_path).await?;
-        let mut offset: u64 = 0;
-        
-        while offset < file_size {
-            let remaining = file_size - offset;
-            let chunk_size = remaining.min(CHUNK_SIZE) as u32;
-            
-            let data = self.drive_client.download_chunk(gdrive_id, offset, chunk_size).await?;
-            file.write_all(&data).await?;
-            
-            offset += data.len() as u64;
+
+        // Asegurar que el archivo existe (puede estar vacío o sparse)
+        if !cache_path.exists() {
+            tokio::fs::File::create(&cache_path).await?;
         }
-        
-        file.flush().await?;
-        
-        tracing::debug!("✅ Archivo cacheado: {}", gdrive_id);
+
+        // OPTIMIZACIÓN: Descargar todos los rangos EN PARALELO
+        tracing::info!("📥 Descargando {} chunks faltantes en paralelo para inode {}", 
+                       missing_ranges.len(), inode);
+
+        let drive_client = self.drive_client.clone();
+        let db = self.db.clone();
+        let gdrive_id_owned = gdrive_id.to_string();
+        let cache_path_owned = cache_path.clone();
+
+        // Spawn tasks para descargar cada rango en paralelo
+        let download_tasks: Vec<_> = missing_ranges.into_iter().map(|(start, end)| {
+            let drive_client = drive_client.clone();
+            let db = db.clone();
+            let gdrive_id = gdrive_id_owned.clone();
+            let cache_path = cache_path_owned.clone();
+
+            tokio::spawn(async move {
+                let chunk_size = (end - start + 1) as u32;
+                
+                tracing::debug!("📥 Descargando chunk: inode={} range={}-{} ({} bytes)", 
+                               inode, start, end, chunk_size);
+                
+                // Descargar chunk
+                let data = drive_client.download_chunk(&gdrive_id, start, chunk_size).await?;
+                
+                // Escribir en el archivo de caché en la posición correcta (con lock)
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&cache_path)
+                    .await?;
+                
+                file.seek(std::io::SeekFrom::Start(start)).await?;
+                file.write_all(&data).await?;
+                file.flush().await?;
+                
+                // Registrar el chunk descargado en la DB
+                db.add_cached_chunk(inode, start, end).await?;
+                
+                tracing::debug!("✅ Chunk cacheado: {}-{}", start, end);
+                
+                Ok::<_, anyhow::Error>((start, end))
+            })
+        }).collect();
+
+        // Esperar a que todas las descargas completen
+        let results = futures_util::future::join_all(download_tasks).await;
+
+        // Verificar errores
+        for result in results {
+            match result {
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(anyhow::anyhow!("Task panicked: {}", e)),
+            }
+        }
+
+        tracing::info!("✅ Todos los chunks descargados para inode {}", inode);
         Ok(())
     }
 }
+

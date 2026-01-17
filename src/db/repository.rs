@@ -77,6 +77,21 @@ impl MetadataRepository {
             .execute(&self.pool)
             .await?;
 
+        // 3. Crear tabla file_cache_chunks si no existe
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_cache_chunks (
+                inode INTEGER NOT NULL,
+                start_offset INTEGER NOT NULL,
+                end_offset INTEGER NOT NULL,
+                PRIMARY KEY (inode, start_offset),
+                FOREIGN KEY (inode) REFERENCES inodes(inode) ON DELETE CASCADE
+            )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -506,5 +521,85 @@ impl MetadataRepository {
 
         tracing::info!("Purgados {} tombstones expirados (grace_days={})", count, grace_days);
         Ok(count)
+    }
+
+    // ============================================================
+    // Métodos para File Cache Chunks (On-Demand Caching)
+    // ============================================================
+
+    /// Registra un rango descargado en la caché
+    pub async fn add_cached_chunk(&self, inode: u64, start: u64, end: u64) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO file_cache_chunks (inode, start_offset, end_offset)
+            VALUES (?, ?, ?)
+            "#
+        )
+        .bind(inode as i64)
+        .bind(start as i64)
+        .bind(end as i64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Obtiene los rangos faltantes para un archivo en un intervalo dado
+    /// Retorna una lista de (start, end) que necesitan descargarse
+    pub async fn get_missing_ranges(&self, inode: u64, requested_start: u64, requested_end: u64) -> Result<Vec<(u64, u64)>> {
+        // Obtener todos los chunks cacheados para este inode que se solapan con el rango solicitado
+        let cached_chunks: Vec<(i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT start_offset, end_offset
+            FROM file_cache_chunks
+            WHERE inode = ?
+              AND end_offset >= ?
+              AND start_offset <= ?
+            ORDER BY start_offset
+            "#
+        )
+        .bind(inode as i64)
+        .bind(requested_start as i64)
+        .bind(requested_end as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Si no hay chunks, el rango completo falta
+        if cached_chunks.is_empty() {
+            return Ok(vec![(requested_start, requested_end)]);
+        }
+
+        let mut missing = Vec::new();
+        let mut current_pos = requested_start;
+
+        for (start, end) in cached_chunks {
+            let start = start as u64;
+            let end = end as u64;
+
+            // Si hay un gap antes de este chunk
+            if current_pos < start {
+                missing.push((current_pos, start - 1));
+            }
+
+            // Avanzar más allá del chunk actual
+            current_pos = current_pos.max(end + 1);
+        }
+
+        // Si queda espacio después del último chunk
+        if current_pos <= requested_end {
+            missing.push((current_pos, requested_end));
+        }
+
+        Ok(missing)
+    }
+
+    /// Limpia todos los chunks cacheados para un inode (útil al invalidar caché)
+    pub async fn clear_cached_chunks(&self, inode: u64) -> Result<()> {
+        sqlx::query("DELETE FROM file_cache_chunks WHERE inode = ?")
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
     }
 }
