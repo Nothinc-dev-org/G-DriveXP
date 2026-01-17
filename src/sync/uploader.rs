@@ -189,7 +189,23 @@ impl Uploader {
     async fn update_file(&self, inode: u64, gdrive_id: &str) -> Result<()> {
         info!("📤 Actualizando archivo en GDrive: {} (inode={})", gdrive_id, inode);
         
-        // Ruta del archivo en caché
+        // 1. Obtener MD5 remoto conocido de la DB
+        let known_md5 = self.db.get_remote_md5(inode).await?;
+        
+        // 2. Consultar MD5 actual del servidor
+        let current_remote_md5 = self.client.get_file_md5(gdrive_id).await?;
+        
+        // 3. Detectar conflicto: si ambos existen y son diferentes
+        if let (Some(known), Some(current)) = (&known_md5, &current_remote_md5) {
+            if known != current {
+                warn!("⚠️ CONFLICTO DETECTADO: archivo remoto cambió desde la última sync");
+                warn!("   - MD5 conocido: {}", known);
+                warn!("   - MD5 actual:   {}", current);
+                return self.handle_conflict(inode, gdrive_id).await;
+            }
+        }
+        
+        // 4. Ruta del archivo en caché
         let cache_path = self.cache_dir.join(gdrive_id);
         
         if !cache_path.exists() {
@@ -197,11 +213,16 @@ impl Uploader {
             return Ok(()); // Skip
         }
         
-        // Actualizar contenido usando la API
+        // 5. Actualizar contenido usando la API
         self.client.update_file_content(gdrive_id, &cache_path).await
             .context("Error actualizando archivo")?;
         
-        // Marcar como limpio
+        // 6. Obtener el nuevo MD5 tras la actualización
+        if let Some(new_md5) = self.client.get_file_md5(gdrive_id).await? {
+            self.db.set_remote_md5(inode, &new_md5).await?;
+        }
+        
+        // 7. Marcar como limpio
         sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
             .bind(inode as i64)
             .execute(self.db.pool())
@@ -232,6 +253,78 @@ impl Uploader {
             .await?;
         
         info!("✅ Archivo eliminado en GDrive: {} (inode={})", gdrive_id, inode);
+        
+        Ok(())
+    }
+
+    /// Maneja un conflicto de sincronización creando una copia del archivo local
+    async fn handle_conflict(&self, inode: u64, gdrive_id: &str) -> Result<()> {
+        warn!("📥 Resolviendo conflicto de sincronización para inode={}", inode);
+        
+        // 1. Obtener nombre original del archivo
+        let original_name = self.get_file_name(inode).await?;
+        
+        // 2. Generar sufijo de timestamp (formato simple: YYYY-MM-DD-HHMMSS)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        
+        // Convertir timestamp Unix a componentes de fecha aproximados
+        // Esta es una aproximación simple para generar un nombre legible
+        let days = now / 86400;
+        let years_since_1970 = days / 365;
+        let year = 1970 + years_since_1970;
+        let remaining_days = days % 365;
+        let month = (remaining_days / 30).min(11) + 1;
+        let day = (remaining_days % 30).max(1);
+        
+        let seconds_today = now % 86400;
+        let hour = seconds_today / 3600;
+        let minute = (seconds_today % 3600) / 60;
+        let second = seconds_today % 60;
+        
+        let timestamp = format!("{:04}-{:02}-{:02}-{:02}{:02}{:02}", 
+            year, month, day, hour, minute, second);
+        
+        // 3. Construir nombre de conflicto
+        let conflict_name = if let Some(dot_pos) = original_name.rfind('.') {
+            let (base, ext) = original_name.split_at(dot_pos);
+            format!("{} (Conflicto local {}){}", base, timestamp, ext)
+        } else {
+            format!("{} (Conflicto local {})", original_name, timestamp)
+        };
+        
+        warn!("   Archivo original: {}", original_name);
+        warn!("   Copia de conflicto: {}", conflict_name);
+        
+        // 4. Subir el archivo local como nuevo archivo con nombre de conflicto
+        let parent_gdrive_id = self.get_parent_gdrive_id(inode).await?;
+        let cache_path = self.cache_dir.join(gdrive_id);
+        
+        if !cache_path.exists() {
+            warn!("Archivo de caché no existe para conflicto: {:?}", cache_path);
+            return Ok(());
+        }
+        
+        // Obtener metadatos para mime_type
+        let attrs = self.db.get_attrs(inode).await?;
+        
+        // Crear el archivo de conflicto en GDrive
+        let conflict_gdrive_id = self.client.upload_file(
+            &cache_path,
+            &conflict_name,
+            attrs.mime_type.as_deref(),
+            &parent_gdrive_id,
+        ).await.context("Error subiendo copia de conflicto")?;
+        
+        // 5. Marcar el archivo original como limpio (no lo modificamos)
+        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await?;
+        
+        warn!("✅ Conflicto resuelto: copia local guardada como {}", conflict_gdrive_id);
+        warn!("   El archivo original permanece sin cambios en la nube");
         
         Ok(())
     }

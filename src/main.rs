@@ -150,8 +150,7 @@ pub fn run_backend(ui_sender: ComponentSender<gui::app_model::AppModel>) -> Resu
         tracing::info!("Montando sistema de archivos en {:?}...", config.mount_point);
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus(format!("Montando en {:?}...", config.mount_point)));
         
-        // Crear handler de montaje
-        let handle = Session::new(mount_options)
+        let mut handle = Session::new(mount_options)
             .mount_with_unprivileged(fs, &config.mount_point)
             .await
             .context("Error al montar sistema de archivos FUSE")?;
@@ -159,13 +158,28 @@ pub fn run_backend(ui_sender: ComponentSender<gui::app_model::AppModel>) -> Resu
         tracing::info!("✅ Sistema de archivos montado exitosamente");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Sistema de archivos montado y activo".to_string()));
         
-        // Esperar a que termine la sesión (bloqueante hasta unmount o Ctrl+C)
-        handle.await.context("Error durante la sesión FUSE")?;
+        // Esperar a que termine la sesión O sea interrumpida por Ctrl+C
+        tokio::select! {
+            res = &mut handle => {
+                if let Err(e) = res {
+                    tracing::error!("Error en la sesión FUSE: {:?}", e);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("🛑 Recibida señal de interrupción (Ctrl+C)");
+                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cerrando por señal...".to_string()));
+            }
+        }
         
         tracing::info!("🛑 Desmontando sistema de archivos y cerrando...");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Desmontando...".to_string()));
         
-        Ok(())
+        // El drop de 'handle' debería intentar desmontar, pero lo forzamos por seguridad
+        let _ = utils::mount::unmount(&config.mount_point);
+        
+        // Forzar salida del proceso (GTK no responde a señales del backend)
+        tracing::info!("👋 Cerrando aplicación...");
+        std::process::exit(0);
     })
 }
 

@@ -55,6 +55,23 @@ impl MetadataRepository {
                 .await?;
         }
 
+        // 2. Verificar si la columna remote_md5 existe en sync_state
+        let has_remote_md5 = sqlx::query("PRAGMA table_info(sync_state)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "remote_md5"
+            });
+
+        if !has_remote_md5 {
+            sqlx::query("ALTER TABLE sync_state ADD COLUMN remote_md5 TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
         // Asegurar que el índice existe (CREATE INDEX IF NOT EXISTS es seguro)
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_sync_deleted ON sync_state(deleted_at) WHERE deleted_at IS NOT NULL")
             .execute(&self.pool)
@@ -147,6 +164,19 @@ impl MetadataRepository {
         Ok(children.into_iter()
             .map(|(inode, name, is_dir)| (inode as u64, name, is_dir))
             .collect())
+    }
+
+    /// Cuenta el número de hijos de un directorio (para verificación rápida de paginación)
+    /// Esta operación es O(1) con el índice de parent_inode
+    pub async fn count_children(&self, parent_inode: u64) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dentry WHERE parent_inode = ?"
+        )
+        .bind(parent_inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        
+        Ok(count as u64)
     }
 
     /// Verifica si la tabla de inodos está vacía (excepto el root si existe)
@@ -276,6 +306,39 @@ impl MetadataRepository {
         .await?;
 
         Ok(row)
+    }
+
+    // ============================================================
+    // Métodos para Conflict Detection (Remote MD5 Tracking)
+    // ============================================================
+
+    /// Obtiene el MD5 remoto conocido para un archivo
+    pub async fn get_remote_md5(&self, inode: u64) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT remote_md5 FROM sync_state WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    /// Actualiza el MD5 remoto conocido para un archivo
+    pub async fn set_remote_md5(&self, inode: u64, md5: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (inode, dirty, version, remote_md5)
+            VALUES (?, 0, 0, ?)
+            ON CONFLICT(inode) DO UPDATE SET remote_md5 = excluded.remote_md5
+            "#
+        )
+        .bind(inode as i64)
+        .bind(md5)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     // ============================================================

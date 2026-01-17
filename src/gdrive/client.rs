@@ -214,6 +214,40 @@ impl DriveClient {
         Ok((changes, new_start_token))
     }
 
+    /// Obtiene el MD5 checksum de un archivo remoto (para detectar conflictos)
+    pub async fn get_file_md5(&self, file_id: &str) -> Result<Option<String>> {
+        let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
+            .await
+            .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
+            .context("No se obtuvo ningún token válido")?;
+
+        let client = reqwest::Client::new();
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files/{}?fields=md5Checksum",
+            file_id
+        );
+
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .context("Error de red al obtener md5Checksum")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!("Error API Drive get_file_md5: {} - {}", status, body);
+            anyhow::bail!("Error API Drive get_file_md5: {} - {}", status, body);
+        }
+
+        let file: google_drive3::api::File = response.json()
+            .await
+            .context("Error al parsear respuesta de get_file_md5")?;
+
+        Ok(file.md5_checksum)
+    }
+
     // ============================================================
     // Métodos para Upload (escritura)
     // ============================================================

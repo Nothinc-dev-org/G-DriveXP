@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
     version INTEGER NOT NULL,
     md5_checksum TEXT,
     deleted_at INTEGER DEFAULT NULL,  -- Timestamp de soft delete
+    remote_md5 TEXT,  -- MD5 de la versión remota conocida (para detección de conflictos)
     FOREIGN KEY (inode) REFERENCES inodes(inode)
 );
 CREATE INDEX IF NOT EXISTS idx_dirty ON sync_state(inode) WHERE dirty=1;

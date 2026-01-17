@@ -182,6 +182,11 @@ impl BackgroundSyncer {
                 self.db.upsert_dentry(1, inode, name).await?;
             }
 
+            // Actualizar remote_md5 si está disponible (para detección de conflictos)
+            if let Some(md5) = file.md5_checksum {
+                self.db.set_remote_md5(inode, &md5).await?;
+            }
+
             tracing::debug!(
                 "Cambio detectado: UPSERT file_id={}, name={}, is_dir={}",
                 file_id, name, is_dir

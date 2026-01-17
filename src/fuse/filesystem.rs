@@ -55,30 +55,44 @@ impl Filesystem for GDriveFS {
         _fh: u64,
         offset: i64,
     ) -> Result<ReplyDirectory<Self::DirEntryStream<'_>>> {
-        debug!("👁️ readdir INVOCADO: parent={} offset={}", parent, offset);
+        tracing::trace!("👁️ readdir: parent={} offset={}", parent, offset);
 
+        // 1. Verificación temprana: obtener conteo sin cargar datos
+        let child_count = match self.db.count_children(parent).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("❌ Error contando hijos de {}: {}", parent, e);
+                return Err(Errno::from(libc::EIO));
+            }
+        };
+        
+        // Total = hijos + 2 (por . y ..)
+        let total_entries = child_count + 2;
+        
+        // Short-circuit: si ya consumieron todo, retornar vacío sin consultar DB
+        if offset as u64 >= total_entries {
+            tracing::trace!("📊 readdir short-circuit: offset={} >= total={}", offset, total_entries);
+            return Ok(ReplyDirectory {
+                entries: Box::pin(stream::empty())
+            });
+        }
+
+        // 2. Solo si hay entradas por retornar, consultar los datos
         let children = match self.db.list_children(parent).await {
-            Ok(c) => {
-                debug!("✅ list_children retornó {} entradas para parent={}", c.len(), parent);
-                c
-            },
+            Ok(c) => c,
             Err(e) => {
                 error!("❌ Error listando hijos de {}: {}", parent, e);
                 return Err(Errno::from(libc::EIO));
             }
         };
 
-        // Agregar entradas especiales . y ..
-        let mut entries = Vec::new();
-        if offset == 0 {
-            entries.push((parent, ".".to_string(), true));
-            entries.push((1.max(parent), "..".to_string(), true));
-            debug!("📁 Agregadas entradas especiales . y ..");
-        }
+        // 3. Construir lista completa SIEMPRE (. y .. + hijos)
+        let mut entries: Vec<(u64, String, bool)> = Vec::with_capacity(children.len() + 2);
+        entries.push((parent, ".".to_string(), true));
+        entries.push((1.max(parent), "..".to_string(), true));
         entries.extend(children);
 
-        debug!("📊 Total de entradas a retornar: {}, offset: {}", entries.len(), offset);
-
+        // 4. Aplicar offset y generar stream
         let stream = stream::iter(entries)
             .skip(offset as usize)
             .enumerate()
@@ -246,7 +260,7 @@ impl Filesystem for GDriveFS {
         Ok(())
     }
 
-    // Leer contenido (read)
+    // Leer contenido (read) - CON CACHÉ LOCAL
     async fn read(
         &self,
         _req: Request,
@@ -257,9 +271,9 @@ impl Filesystem for GDriveFS {
     ) -> Result<ReplyData> {
         debug!("read: inode={} offset={} size={}", inode, offset, size);
 
-        // 1. Obtener el gdrive_id del archivo y su mime_type
-        let (gdrive_id, mime_type) = match sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT i.gdrive_id, a.mime_type 
+        // 1. Obtener el gdrive_id del archivo, mime_type y tamaño
+        let (gdrive_id, mime_type, file_size) = match sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT i.gdrive_id, a.mime_type, a.size 
              FROM inodes i 
              LEFT JOIN attrs a ON i.inode = a.inode 
              WHERE i.inode = ?"
@@ -303,14 +317,56 @@ impl Filesystem for GDriveFS {
             }
         }
 
-        // 3. Archivo binario normal: descargar el chunk desde la API
-        match self.drive_client.download_chunk(&gdrive_id, offset, size).await {
-            Ok(data) => Ok(ReplyData { data: data.into() }),
-            Err(e) => {
-                error!("Error descargando contenido de {}: {}", gdrive_id, e);
-                Err(Errno::from(libc::EIO))
+        // 3. Archivo binario normal: estrategia de caché adaptativa
+        let cache_path = self.get_cache_path(&gdrive_id);
+        const SMALL_FILE_THRESHOLD: i64 = 5 * 1024 * 1024; // 5MB
+        
+        // 3a. Si el archivo ya existe en caché con tamaño correcto, servir desde ahí
+        if cache_path.exists() {
+            if let Ok(metadata) = tokio::fs::metadata(&cache_path).await {
+                if metadata.len() == file_size as u64 {
+                    match self.read_from_cache(&cache_path, offset, size).await {
+                        Ok(data) => return Ok(ReplyData { data: data.into() }),
+                        Err(e) => {
+                            debug!("Error leyendo caché, re-descargando: {}", e);
+                        }
+                    }
+                }
             }
         }
+
+        // 3b. Para archivos pequeños: descargar completo y cachear
+        if file_size > 0 && file_size < SMALL_FILE_THRESHOLD {
+            match self.download_to_cache(&gdrive_id, file_size as u64).await {
+                Ok(_) => {
+                    match self.read_from_cache(&cache_path, offset, size).await {
+                        Ok(data) => return Ok(ReplyData { data: data.into() }),
+                        Err(e) => {
+                            error!("Error leyendo caché: {}", e);
+                            return Err(Errno::from(libc::EIO));
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error descargando archivo pequeño: {}", e);
+                    return Err(Errno::from(libc::EIO));
+                }
+            }
+        }
+
+        // 3c. Para archivos grandes: descarga bajo demanda (solo el chunk solicitado)
+        if file_size > 0 {
+            match self.drive_client.download_chunk(&gdrive_id, offset, size).await {
+                Ok(data) => return Ok(ReplyData { data: data.into() }),
+                Err(e) => {
+                    error!("Error descargando chunk de {}: {}", gdrive_id, e);
+                    return Err(Errno::from(libc::EIO));
+                }
+            }
+        }
+
+        // Archivo vacío
+        Ok(ReplyData { data: vec![].into() })
     }
 
     // Obtener estadísticas del sistema de archivos (requerido por comandos como ls/df)
@@ -338,35 +394,50 @@ impl Filesystem for GDriveFS {
         offset: u64,
         _lock_owner: u64,
     ) -> Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'_>>> {
-        tracing::trace!("👁️ readdirplus INVOCADO: parent={} offset={}", parent, offset);
+        tracing::trace!("👁️ readdirplus: parent={} offset={}", parent, offset);
 
         let db = self.db.clone();
         
-        let entries = match db.list_children_extended(parent).await {
-            Ok(c) => {
-                debug!("✅ list_children_extended retornó {} entradas para parent={}", c.len(), parent);
-                c
-            },
+        // 1. Verificación temprana: obtener conteo sin cargar datos
+        let child_count = match db.count_children(parent).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("❌ Error contando hijos de {}: {}", parent, e);
+                return Err(Errno::from(libc::EIO));
+            }
+        };
+        
+        // Total = hijos + 2 (por . y ..)
+        let total_entries = child_count + 2;
+        
+        // Short-circuit: si ya consumieron todo, retornar vacío sin consultar DB
+        if offset >= total_entries {
+            tracing::trace!("📊 readdirplus short-circuit: offset={} >= total={}", offset, total_entries);
+            return Ok(ReplyDirectoryPlus {
+                entries: Box::pin(stream::empty())
+            });
+        }
+
+        // 2. Solo si hay entradas por retornar, consultar los datos
+        let children = match db.list_children_extended(parent).await {
+            Ok(c) => c,
             Err(e) => {
                 error!("❌ Error listando hijos de {}: {}", parent, e);
                 return Err(Errno::from(libc::EIO));
             }
         };
 
-        // Agregar entradas especiales . y .. (sin metadatos extendidos para estos casos especiales)
-        let mut final_entries: Vec<(u64, String, bool, Option<String>, Option<String>)> = Vec::new();
-        if offset == 0 {
-            final_entries.push((parent, ".".to_string(), true, None, None));
-            final_entries.push((1.max(parent), "..".to_string(), true, None, None));
-        }
+        // 3. Construir lista completa SIEMPRE (. y .. + hijos)
+        let mut final_entries: Vec<(u64, String, bool, Option<String>, Option<String>)> = 
+            Vec::with_capacity(children.len() + 2);
+        final_entries.push((parent, ".".to_string(), true, None, None));
+        final_entries.push((1.max(parent), "..".to_string(), true, None, None));
 
-        for (inode, name, is_dir, mime, gdrive_id) in entries {
+        for (inode, name, is_dir, mime, gdrive_id) in children {
             final_entries.push((inode, name, is_dir, mime, Some(gdrive_id)));
         }
 
-        debug!("📊 Total de entradas a retornar: {}, offset: {}", final_entries.len(), offset);
-
-        // Construir stream con atributos completos usando los datos ya cargados
+        // 4. Construir stream con atributos completos usando los datos ya cargados
         let stream = stream::iter(final_entries)
             .skip(offset as usize)
             .enumerate()
@@ -813,5 +884,59 @@ impl GDriveFS {
         .await?;
         
         Ok(gdrive_id)
+    }
+
+    /// Lee datos desde un archivo de caché local
+    async fn read_from_cache(
+        &self,
+        cache_path: &std::path::Path,
+        offset: u64,
+        size: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        
+        let mut file = tokio::fs::File::open(cache_path).await?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        
+        let mut buffer = vec![0u8; size as usize];
+        let bytes_read = file.read(&mut buffer).await?;
+        buffer.truncate(bytes_read);
+        
+        Ok(buffer)
+    }
+
+    /// Descarga un archivo completo de GDrive a caché local
+    async fn download_to_cache(&self, gdrive_id: &str, file_size: u64) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        
+        let cache_path = self.get_cache_path(gdrive_id);
+        
+        // Crear directorio de caché si no existe
+        if let Some(parent) = cache_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        
+        tracing::info!("📥 Descargando archivo completo a caché: {} ({} bytes)", gdrive_id, file_size);
+        
+        // Descargar en chunks de 1MB para archivos grandes
+        const CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
+        
+        let mut file = tokio::fs::File::create(&cache_path).await?;
+        let mut offset: u64 = 0;
+        
+        while offset < file_size {
+            let remaining = file_size - offset;
+            let chunk_size = remaining.min(CHUNK_SIZE) as u32;
+            
+            let data = self.drive_client.download_chunk(gdrive_id, offset, chunk_size).await?;
+            file.write_all(&data).await?;
+            
+            offset += data.len() as u64;
+        }
+        
+        file.flush().await?;
+        
+        tracing::debug!("✅ Archivo cacheado: {}", gdrive_id);
+        Ok(())
     }
 }
