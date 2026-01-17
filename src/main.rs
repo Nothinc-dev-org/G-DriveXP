@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod db;
 mod fuse;
+mod gdrive;
 
 use anyhow::{Context, Result};
 use fuse3::MountOptions;
@@ -37,14 +38,37 @@ async fn main() -> Result<()> {
     tracing::info!("Directorio de caché: {:?}", config.cache_dir);
     tracing::info!("Base de datos: {:?}", config.db_path);
     
-    // TODO: Fase 1 - Implementar flujo de autenticación OAuth2 (Pendiente de integración final)
+    // Fase 1: Autenticación OAuth2
+    tracing::info!("Iniciando sistema de autenticación...");
+    
+    // Buscar archivo de credenciales
+    let cred_path = "credentials.json";
+    if !std::path::Path::new(cred_path).exists() {
+        tracing::error!("No se encontró el archivo '{}'. Por favor siga las instrucciones de instalación.", cred_path);
+        anyhow::bail!("Archivo de credenciales no encontrado");
+    }
+
+    let oauth_manager = auth::OAuth2Manager::new_from_file(cred_path)
+        .await
+        .context("Error al inicializar gestor OAuth2")?;
+
+    tracing::info!("Verificando estado de autenticación (esto puede abrir su navegador)...");
+    oauth_manager.authenticate()
+        .await
+        .context("Fallo crítico en autenticación")?;
+        
+    tracing::info!("✅ Autenticación correcta");
     
     // Inicializar base de datos SQLite
     tracing::info!("Inicializando repositorio de metadatos...");
     let db = Arc::new(db::MetadataRepository::new(&config.db_path).await?);
     
+    // Inicializar cliente de Google Drive
+    let authenticator = oauth_manager.get_authenticator().await?;
+    let drive_client = Arc::new(gdrive::client::DriveClient::new(authenticator));
+    
     // Inicializar sistema de archivos
-    let fs = GDriveFS::new(db.clone());
+    let fs = GDriveFS::new(db.clone(), drive_client);
     
     // Configurar opciones de montaje
     let uid = unsafe { libc::getuid() };

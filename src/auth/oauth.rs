@@ -22,34 +22,34 @@ impl OAuth2Manager {
             token_storage: Arc::new(TokenStorage::new()),
         }
     }
+
+    /// Crea una nueva instancia cargando el secreto desde un archivo JSON
+    pub async fn new_from_file(path: &str) -> Result<Self> {
+        let secret = yup_oauth2::read_application_secret(path)
+            .await
+            .context(format!("No se pudo leer el archivo de credenciales: {}", path))?;
+        
+        Ok(Self::new(secret))
+    }
     
-    /// Ejecuta el flujo completo de autenticación OAuth2
-    /// 
-    /// Este método:
-    /// 1. Verifica si ya existe un token válido en el keyring
-    /// 2. Si no existe, inicia el flujo de autenticación con el navegador
-    /// 3. Guarda el refresh token de forma segura
-    pub async fn authenticate(&self) -> Result<()> {
-        tracing::info!("Iniciando proceso de autenticación OAuth2");
-        
-        // Verificar si ya existe un token
-        if self.token_storage.has_stored_token().await {
-            tracing::info!("Token existente encontrado, intentando reutilizar");
-            // TODO: Validar que el token sigue siendo válido
-        }
-        
-        // Construir el autenticador
-        // yup-oauth2 maneja automáticamente el servidor HTTP local
-        let auth = InstalledFlowAuthenticator::builder(
+    /// Construye y retorna el autenticador configurado
+    pub async fn get_authenticator(&self) -> Result<yup_oauth2::authenticator::Authenticator<yup_oauth2::hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>> {
+        InstalledFlowAuthenticator::builder(
             self.app_secret.clone(),
             InstalledFlowReturnMethod::HTTPRedirect,
         )
         .persist_tokens_to_disk("~/.config/fedoradrive/tokens.json")
         .build()
         .await
-        .context("Error al construir el autenticador OAuth2")?;
+        .context("Error al construir el autenticador OAuth2")
+    }
+
+    /// Ejecuta el flujo completo de autenticación OAuth2
+    pub async fn authenticate(&self) -> Result<()> {
+        tracing::info!("Iniciando proceso de autenticación OAuth2");
         
-        // Solicitar token para el scope de Google Drive
+        let auth = self.get_authenticator().await?;
+        
         let scopes = &["https://www.googleapis.com/auth/drive"];
         let token = auth
             .token(scopes)
@@ -58,10 +58,6 @@ impl OAuth2Manager {
         
         tracing::info!("Autenticación exitosa, token obtenido");
         tracing::debug!("Token expira en: {:?}", token.expiration_time());
-        
-        // Nota: yup-oauth2 maneja internamente la persistencia del refresh_token
-        // cuando usamos persist_tokens_to_disk(). Sin embargo, también lo guardamos
-        // en el keyring para mayor seguridad si está disponible en los metadatos.
         
         Ok(())
     }

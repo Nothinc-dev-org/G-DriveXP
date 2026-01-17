@@ -71,4 +71,24 @@ impl MetadataRepository {
         
         Ok(attrs)
     }
+    /// Listar contenido de un directorio (para readdir)
+    pub async fn list_children(&self, parent_inode: u64) -> Result<Vec<(u64, String, bool)>> {
+        // Hacemos un JOIN para saber si es directorio (de la tabla attrs)
+        let children = sqlx::query_as::<_, (i64, String, bool)>(
+            r#"
+            SELECT d.child_inode, d.name, a.is_dir 
+            FROM dentry d
+            JOIN attrs a ON d.child_inode = a.inode
+            WHERE d.parent_inode = ?
+            ORDER BY d.name
+            "#
+        )
+        .bind(parent_inode as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        
+        Ok(children.into_iter()
+            .map(|(inode, name, is_dir)| (inode as u64, name, is_dir))
+            .collect())
+    }
 }

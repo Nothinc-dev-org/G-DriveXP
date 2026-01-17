@@ -17,11 +17,12 @@ sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 
 # API de Google Drive
 google-drive3 = "5.0"
-yup-oauth2 = "11.0"
+yup-oauth2 = "9.0"
 
 # Cliente HTTP
 reqwest = { version = "0.12", features = ["stream", "json"] }
-hyper = { version = "1.5", features = ["server"] }
+hyper = { version = "0.14", features = ["full"] }
+hyper-rustls = "0.25.0"
 
 # Gestión de secretos
 keyring = "3.6"
