@@ -1,13 +1,16 @@
 mod auth;
 mod config;
+mod db;
+mod fuse;
 
 use anyhow::{Context, Result};
+use fuse3::MountOptions;
+use fuse3::raw::Session;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-// OAuth2Manager se usará cuando implementemos el flujo de autenticación completo
-#[allow(unused_imports)]
-use auth::OAuth2Manager;
 use config::Config;
+use fuse::GDriveFS;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,17 +37,37 @@ async fn main() -> Result<()> {
     tracing::info!("Directorio de caché: {:?}", config.cache_dir);
     tracing::info!("Base de datos: {:?}", config.db_path);
     
-    // TODO: Fase 1 - Implementar flujo de autenticación OAuth2
-    // TODO: Fase 2 - Inicializar base de datos SQLite
-    // TODO: Fase 2 - Montar sistema de archivos FUSE
-    // TODO: Fase 3 - Lanzar interfaz GTK4
+    // TODO: Fase 1 - Implementar flujo de autenticación OAuth2 (Pendiente de integración final)
     
-    tracing::info!("✅ Inicialización completada. Presione Ctrl+C para detener.");
+    // Inicializar base de datos SQLite
+    tracing::info!("Inicializando repositorio de metadatos...");
+    let db = Arc::new(db::MetadataRepository::new(&config.db_path).await?);
     
-    // Mantener el proceso activo
-    tokio::signal::ctrl_c()
+    // Inicializar sistema de archivos
+    let fs = GDriveFS::new(db.clone());
+    
+    // Configurar opciones de montaje
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    
+    let mut mount_options = MountOptions::default();
+    mount_options
+        .uid(uid)
+        .gid(gid)
+        .fs_name("fedoradrive");
+        
+    tracing::info!("Montando sistema de archivos en {:?}...", config.mount_point);
+    
+    // Crear handler de montaje
+    let handle = Session::new(mount_options)
+        .mount_with_unprivileged(fs, &config.mount_point)
         .await
-        .context("Error al esperar señal de interrupción")?;
+        .context("Error al montar sistema de archivos FUSE")?;
+    
+    tracing::info!("✅ Sistema de archivos montado exitosamente");
+    
+    // Esperar a que termine la sesión (bloqueante hasta unmount o Ctrl+C)
+    handle.await.context("Error durante la sesión FUSE")?;
     
     tracing::info!("🛑 Desmontando sistema de archivos y cerrando...");
     

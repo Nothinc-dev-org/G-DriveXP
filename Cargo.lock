@@ -670,6 +670,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fuse3",
+ "futures-util",
  "google-drive3",
  "gtk4",
  "hyper 1.8.1",
