@@ -127,6 +127,7 @@ pub fn run_backend(ui_sender: ComponentSender<gui::app_model::AppModel>) -> Resu
             socket_path,
             db.clone(),
             config.mount_point.clone(),
+            config.cache_dir.clone(),
         );
         let _ipc_handle = ipc_server.spawn();
         

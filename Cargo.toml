@@ -43,6 +43,7 @@ async-trait = "0.1"
 libc = "0.2"
 futures-util = "0.3"
 uuid = { version = "1.11", features = ["v4"] }
+percent-encoding = "2.3"
 
 [profile.release]
 opt-level = 3

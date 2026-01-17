@@ -208,13 +208,89 @@ impl Filesystem for GDriveFS {
         Ok(())
     }
 
+
     // Abrir archivo (open)
     async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
         debug!("open: inode={}", inode);
-        // Validar que existe en DB
-        if self.db.get_attrs(inode).await.is_err() {
-            return Err(Errno::from(libc::ENOENT));
+        
+        // Validar que existe en DB y obtener metadatos
+        let attrs = self.db.get_attrs(inode).await
+            .map_err(|_| Errno::from(libc::ENOENT))?;
+        
+        // OPTIMIZACIÓN MULTIMEDIA: Pre-descargar archivos multimedia pequeños
+        if let Some(ref mime_type) = attrs.mime_type {
+            if Self::is_multimedia_file(mime_type) && !attrs.is_dir {
+                let file_size = attrs.size as u64;
+                
+                // Para archivos < 10MB, pre-descargar completo en background
+                const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+                
+                if file_size > 0 && file_size < SMALL_FILE_THRESHOLD {
+                    let gdrive_id = self.get_gdrive_id(inode).await
+                        .unwrap_or_else(|_| String::new());
+                    
+                    if !gdrive_id.is_empty() {
+                        let cache_path = self.get_cache_path(&gdrive_id);
+                        
+                        // Solo pre-descargar si no está completamente cacheado
+                        if !cache_path.exists() || 
+                           tokio::fs::metadata(&cache_path).await.ok()
+                               .map(|m| m.len() != file_size).unwrap_or(true) {
+                            
+                            debug!("🎬 Prefetching multimedia completo: inode={} size={} mime={}", 
+                                   inode, file_size, mime_type);
+                            
+                            // Spawn background task para pre-descarga
+                            let db = self.db.clone();
+                            let drive_client = self.drive_client.clone();
+                            let gdrive_id_owned = gdrive_id.clone();
+                            let cache_path_owned = cache_path.clone();
+                            
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::prefetch_entire_file(
+                                    &db, 
+                                    &drive_client, 
+                                    inode, 
+                                    &gdrive_id_owned, 
+                                    &cache_path_owned, 
+                                    file_size
+                                ).await {
+                                    error!("Error en prefetch multimedia: {}", e);
+                                }
+                            });
+                        }
+                    }
+                } else if file_size >= SMALL_FILE_THRESHOLD {
+                    // Para archivos grandes multimedia, prefetch cabeceras + cola
+                    let gdrive_id = self.get_gdrive_id(inode).await
+                        .unwrap_or_else(|_| String::new());
+                    
+                    if !gdrive_id.is_empty() {
+                        debug!("🎬 Prefetching cabeceras+cola: inode={} size={} mime={}", 
+                               inode, file_size, mime_type);
+                        
+                        let db = self.db.clone();
+                        let drive_client = self.drive_client.clone();
+                        let gdrive_id_owned = gdrive_id.clone();
+                        let cache_path = self.get_cache_path(&gdrive_id);
+                        
+                        tokio::spawn(async move {
+                            if let Err(e) = Self::prefetch_headers_and_tail(
+                                &db,
+                                &drive_client,
+                                inode,
+                                &gdrive_id_owned,
+                                &cache_path,
+                                file_size
+                            ).await {
+                                error!("Error en prefetch cabeceras: {}", e);
+                            }
+                        });
+                    }
+                }
+            }
         }
+        
         Ok(ReplyOpen { fh: 0, flags: 0 }) 
     }
 
@@ -976,6 +1052,114 @@ impl GDriveFS {
         }
 
         tracing::info!("✅ Todos los chunks descargados para inode {}", inode);
+        Ok(())
+    }
+
+    /// Detecta si un archivo es multimedia por MIME type
+    fn is_multimedia_file(mime_type: &str) -> bool {
+        mime_type.starts_with("audio/") || 
+        mime_type.starts_with("video/") ||
+        mime_type.starts_with("image/")
+    }
+
+    /// Pre-descarga un archivo completo en background (para archivos pequeños)
+    async fn prefetch_entire_file(
+        db: &Arc<MetadataRepository>,
+        drive_client: &Arc<DriveClient>,
+        inode: u64,
+        gdrive_id: &str,
+        cache_path: &std::path::Path,
+        file_size: u64,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        
+        // Crear directorio de caché si no existe
+        if let Some(parent) = cache_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        
+        // Descargar archivo completo
+        tracing::info!("📥 Descargando archivo completo: {} bytes", file_size);
+        let data = drive_client.download_chunk(gdrive_id, 0, file_size as u32).await?;
+        
+        // Escribir a caché
+        let mut file = tokio::fs::File::create(cache_path).await?;
+        file.write_all(&data).await?;
+        file.flush().await?;
+        
+        // Registrar en DB como completamente cacheado
+        db.add_cached_chunk(inode, 0, file_size - 1).await?;
+        
+        tracing::info!("✅ Archivo multimedia completo cacheado: {} bytes", file_size);
+        Ok(())
+    }
+
+    /// Pre-descarga cabeceras (primeros 1MB) + cola (últimos 256KB) para archivos grandes
+    async fn prefetch_headers_and_tail(
+        db: &Arc<MetadataRepository>,
+        drive_client: &Arc<DriveClient>,
+        inode: u64,
+        gdrive_id: &str,
+        cache_path: &std::path::Path,
+        file_size: u64,
+    ) -> anyhow::Result<()> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        
+        const HEADER_SIZE: u64 = 1024 * 1024; // 1MB
+        const TAIL_SIZE: u64 = 256 * 1024;    // 256KB
+        
+        // Crear directorio de caché si no existe
+        if let Some(parent) = cache_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        
+        // Asegurar que el archivo existe
+        if !cache_path.exists() {
+            tokio::fs::File::create(cache_path).await?;
+        }
+        
+        // Descargar cabeceras (primeros 1MB)
+        let header_end = HEADER_SIZE.min(file_size - 1);
+        let missing_header = db.get_missing_ranges(inode, 0, header_end).await?;
+        
+        if !missing_header.is_empty() {
+            tracing::info!("📥 Prefetching cabeceras: 0-{}", header_end);
+            let header_data = drive_client.download_chunk(gdrive_id, 0, (header_end + 1) as u32).await?;
+            
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(cache_path)
+                .await?;
+            file.seek(std::io::SeekFrom::Start(0)).await?;
+            file.write_all(&header_data).await?;
+            file.flush().await?;
+            
+            db.add_cached_chunk(inode, 0, header_end).await?;
+        }
+        
+        // Descargar cola (últimos 256KB)
+        if file_size > TAIL_SIZE {
+            let tail_start = file_size - TAIL_SIZE;
+            let tail_end = file_size - 1;
+            let missing_tail = db.get_missing_ranges(inode, tail_start, tail_end).await?;
+            
+            if !missing_tail.is_empty() {
+                tracing::info!("📥 Prefetching cola: {}-{}", tail_start, tail_end);
+                let tail_data = drive_client.download_chunk(gdrive_id, tail_start, TAIL_SIZE as u32).await?;
+                
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(cache_path)
+                    .await?;
+                file.seek(std::io::SeekFrom::Start(tail_start)).await?;
+                file.write_all(&tail_data).await?;
+                file.flush().await?;
+                
+                db.add_cached_chunk(inode, tail_start, tail_end).await?;
+            }
+        }
+        
+        tracing::info!("✅ Prefetch cabeceras+cola completado");
         Ok(())
     }
 }

@@ -669,6 +669,7 @@ dependencies = [
  "keyring",
  "libadwaita",
  "libc",
+ "percent-encoding 2.3.2",
  "relm4",
  "reqwest",
  "rusqlite",

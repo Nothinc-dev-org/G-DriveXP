@@ -593,7 +593,9 @@ impl MetadataRepository {
         Ok(missing)
     }
 
+
     /// Limpia todos los chunks cacheados para un inode (útil al invalidar caché)
+    #[allow(dead_code)]
     pub async fn clear_cached_chunks(&self, inode: u64) -> Result<()> {
         sqlx::query("DELETE FROM file_cache_chunks WHERE inode = ?")
             .bind(inode as i64)

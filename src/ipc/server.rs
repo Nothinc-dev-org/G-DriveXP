@@ -3,6 +3,7 @@
 //! Escucha en /run/user/{UID}/gdrivexp.sock y responde queries de estado de sincronización.
 
 use anyhow::{Context, Result};
+use percent_encoding::percent_decode_str;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,6 +18,7 @@ pub struct IpcServer {
     socket_path: PathBuf,
     db: Arc<MetadataRepository>,
     mount_point: PathBuf,
+    cache_dir: PathBuf,
 }
 
 impl IpcServer {
@@ -25,11 +27,13 @@ impl IpcServer {
         socket_path: PathBuf,
         db: Arc<MetadataRepository>,
         mount_point: PathBuf,
+        cache_dir: PathBuf,
     ) -> Self {
         Self {
             socket_path,
             db,
             mount_point,
+            cache_dir,
         }
     }
 
@@ -60,9 +64,10 @@ impl IpcServer {
                 Ok((stream, _addr)) => {
                     let db = self.db.clone();
                     let mount_point = self.mount_point.clone();
+                    let cache_dir = self.cache_dir.clone();
                     
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, db, mount_point).await {
+                        if let Err(e) = handle_client(stream, db, mount_point, cache_dir).await {
                             tracing::debug!("Error manejando cliente IPC: {:?}", e);
                         }
                     });
@@ -80,6 +85,7 @@ async fn handle_client(
     mut stream: UnixStream,
     db: Arc<MetadataRepository>,
     mount_point: PathBuf,
+    cache_dir: PathBuf,
 ) -> Result<()> {
     // Buffer para leer el request (max 4KB)
     let mut buf = vec![0u8; 4096];
@@ -103,7 +109,7 @@ async fn handle_client(
     let response = match request {
         IpcRequest::Ping => IpcResponse::Pong,
         IpcRequest::GetFileStatus { path } => {
-            let status = get_file_status(&db, &mount_point, &path).await;
+            let status = get_file_status(&db, &mount_point, &cache_dir, &path).await;
             IpcResponse::FileStatus(status)
         }
     };
@@ -124,13 +130,20 @@ async fn handle_client(
 async fn get_file_status(
     db: &MetadataRepository,
     mount_point: &std::path::Path,
+    cache_dir: &std::path::Path,
     file_path: &str,
 ) -> SyncStatus {
-    // Convertir URI file:// a path si es necesario
-    let path = if file_path.starts_with("file://") {
+    // Convertir URI file:// a path si es necesario y decodificar URL encoding
+    let raw_path = if file_path.starts_with("file://") {
         file_path.strip_prefix("file://").unwrap_or(file_path)
     } else {
         file_path
+    };
+    
+    // Decodificar caracteres URL-encoded (espacios=%20, paréntesis=%28%29, etc.)
+    let path = match percent_decode_str(raw_path).decode_utf8() {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => return SyncStatus::Unknown,
     };
     
     // Verificar si el archivo está dentro del mount point
@@ -147,24 +160,24 @@ async fn get_file_status(
     
     // Buscar el archivo en la base de datos por nombre
     // Recorremos el path para encontrar el inode
-    let inode = match resolve_path_to_inode(db, relative_path).await {
-        Ok(Some(inode)) => inode,
+    let (inode, gdrive_id) = match resolve_path_to_inode_and_gdrive_id(db, relative_path).await {
+        Ok(Some(result)) => result,
         Ok(None) => return SyncStatus::Unknown,
         Err(_) => return SyncStatus::Unknown,
     };
     
-    // Consultar estado de sincronización
-    match get_sync_state(db, inode).await {
+    // Consultar estado de sincronización, pasando info de cache
+    match get_sync_state(db, cache_dir, inode, &gdrive_id).await {
         Ok(state) => state,
         Err(_) => SyncStatus::Unknown,
     }
 }
 
-/// Resuelve un path relativo a su inode
-async fn resolve_path_to_inode(
+/// Resuelve un path relativo a su inode y gdrive_id
+async fn resolve_path_to_inode_and_gdrive_id(
     db: &MetadataRepository,
     relative_path: &str,
-) -> Result<Option<u64>> {
+) -> Result<Option<(u64, String)>> {
     let parts: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
     
     let mut current_inode = 1u64; // Root inode
@@ -176,11 +189,31 @@ async fn resolve_path_to_inode(
         }
     }
     
-    Ok(Some(current_inode))
+    // Obtener gdrive_id del inode final
+    let gdrive_id: Option<String> = sqlx::query_scalar(
+        "SELECT gdrive_id FROM inodes WHERE inode = ?"
+    )
+    .bind(current_inode as i64)
+    .fetch_optional(db.pool())
+    .await?;
+    
+    match gdrive_id {
+        Some(id) => Ok(Some((current_inode, id))),
+        None => Ok(None),
+    }
 }
 
 /// Consulta el estado de sincronización en sync_state
-async fn get_sync_state(db: &MetadataRepository, inode: u64) -> Result<SyncStatus> {
+async fn get_sync_state(
+    db: &MetadataRepository,
+    cache_dir: &std::path::Path,
+    inode: u64,
+    gdrive_id: &str,
+) -> Result<SyncStatus> {
+    // Verificar si el archivo tiene cache local
+    let cache_path = cache_dir.join(gdrive_id);
+    let has_local_cache = cache_path.exists();
+    
     // Consultar si está dirty
     let result = sqlx::query_as::<_, (bool, Option<i64>)>(
         "SELECT dirty, deleted_at FROM sync_state WHERE inode = ?"
@@ -193,16 +226,26 @@ async fn get_sync_state(db: &MetadataRepository, inode: u64) -> Result<SyncStatu
         Some((dirty, deleted_at)) => {
             if deleted_at.is_some() {
                 // Archivo marcado para eliminación
-                Ok(SyncStatus::Pending)
+                Ok(SyncStatus::LocalOnly)
             } else if dirty {
-                Ok(SyncStatus::Pending)
-            } else {
+                // Cambios locales pendientes de subir
+                Ok(SyncStatus::LocalOnly)
+            } else if has_local_cache {
+                // Sincronizado y disponible localmente
                 Ok(SyncStatus::Synced)
+            } else {
+                // En Drive pero no descargado localmente
+                Ok(SyncStatus::CloudOnly)
             }
         }
         None => {
-            // Sin registro en sync_state, asumimos sincronizado (solo lectura)
-            Ok(SyncStatus::Synced)
+            // Sin registro en sync_state
+            if has_local_cache {
+                Ok(SyncStatus::Synced)
+            } else {
+                // Archivo solo en la nube
+                Ok(SyncStatus::CloudOnly)
+            }
         }
     }
 }

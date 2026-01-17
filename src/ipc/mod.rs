@@ -27,14 +27,18 @@ pub enum IpcResponse {
 }
 
 /// Estado de sincronización de un archivo
+/// - Synced: Local + Drive (verde)
+/// - CloudOnly: Solo en Drive, no descargado (azul)
+/// - LocalOnly: Solo local, pendiente de subir (naranja)
+/// - Error: Error de sincronización (rojo)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncStatus {
-    /// Sincronizado con Google Drive (dirty=0)
+    /// Sincronizado: existe en local y en Drive
     Synced,
-    /// Subida en progreso
-    Syncing,
-    /// Pendiente de subida (dirty=1)
-    Pending,
+    /// Solo en Drive: no descargado localmente
+    CloudOnly,
+    /// Solo local: pendiente de subir a Drive
+    LocalOnly,
     /// Error de sincronización
     Error,
     /// No es un archivo de G-DriveXP
