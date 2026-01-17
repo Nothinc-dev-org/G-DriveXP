@@ -6,6 +6,7 @@ mod gdrive;
 mod sync;
 mod gui;
 mod ipc;
+mod utils;
 
 use anyhow::{Context, Result};
 use fuse3::MountOptions;
@@ -118,6 +119,23 @@ pub fn run_backend(ui_sender: ComponentSender<gui::app_model::AppModel>) -> Resu
             &config.cache_dir,
         );
         let _uploader_handle = uploader.spawn();
+        
+        // Fase 2.4: Servidor IPC para extensiones externas (Nautilus)
+        tracing::info!("Iniciando servidor IPC...");
+        let socket_path = ipc::get_socket_path();
+        let ipc_server = ipc::server::IpcServer::new(
+            socket_path,
+            db.clone(),
+            config.mount_point.clone(),
+        );
+        let _ipc_handle = ipc_server.spawn();
+        
+        // CRITICAL: Limpiar punto de montaje huérfano antes de intentar montar
+        utils::mount::cleanup_if_needed(&config.mount_point)
+            .context("Error al limpiar punto de montaje huérfano")?;
+        
+        // Informar a la GUI del punto de montaje para cleanup
+        ui_sender.input(gui::app_model::AppMsg::SetMountPoint(config.mount_point.clone()));
         
         // Configurar opciones de montaje
         let uid = unsafe { libc::getuid() };

@@ -6,12 +6,14 @@ use adw::prelude::*;
 pub struct AppModel {
     pub status_message: String,
     pub is_connected: bool,
+    pub mount_point: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
 pub enum AppMsg {
     UpdateStatus(String),
     SetConnected(bool),
+    SetMountPoint(std::path::PathBuf),
     Quit,
 }
 
@@ -77,6 +79,7 @@ impl SimpleComponent for AppModel {
         let model = AppModel {
             status_message: "Iniciando FedoraDrive...".to_string(),
             is_connected: false,
+            mount_point: None,
         };
 
         // Spawnear el backend en un hilo separado
@@ -88,6 +91,13 @@ impl SimpleComponent for AppModel {
         });
 
         let widgets = view_output!();
+        
+        // Configurar manejador de cierre de ventana
+        let sender_clone = sender.clone();
+        root.connect_close_request(move |_| {
+            sender_clone.input(AppMsg::Quit);
+            gtk::glib::Propagation::Proceed
+        });
 
         ComponentParts { model, widgets }
     }
@@ -100,8 +110,19 @@ impl SimpleComponent for AppModel {
             AppMsg::SetConnected(connected) => {
                 self.is_connected = connected;
             }
+            AppMsg::SetMountPoint(path) => {
+                self.mount_point = Some(path);
+            }
             AppMsg::Quit => {
-                // TODO: Graceful shutdown logic
+                tracing::info!("Cerrando aplicación...");
+                
+                // Intentar desmontar si tenemos el mount point
+                if let Some(ref mount_point) = self.mount_point {
+                    if let Err(e) = crate::utils::mount::unmount(mount_point) {
+                        tracing::error!("Error al desmontar en cierre: {:?}", e);
+                    }
+                }
+                
                 std::process::exit(0);
             }
         }

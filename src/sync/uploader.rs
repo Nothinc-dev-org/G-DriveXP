@@ -13,9 +13,6 @@ use tracing::{debug, error, info, warn};
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
 
-/// Intervalo base de escaneo en segundos
-const DEFAULT_SCAN_INTERVAL_SECS: u64 = 30;
-
 /// Intervalo máximo de backoff en segundos
 const MAX_BACKOFF_SECS: u64 = 300;
 

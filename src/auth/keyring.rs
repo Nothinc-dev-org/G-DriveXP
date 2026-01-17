@@ -3,6 +3,7 @@ use keyring::Entry;
 
 /// Gestiona el almacenamiento seguro de tokens en GNOME Keyring
 pub struct TokenStorage {
+    #[allow(dead_code)] // Usado en métodos de la estructura
     service: String,
 }
 
@@ -14,6 +15,7 @@ impl TokenStorage {
     }
     
     /// Guarda el refresh token de forma segura en el keyring del sistema
+    #[allow(dead_code)] // Feature para gestión manual de tokens
     pub async fn save_refresh_token(&self, token: &str) -> Result<()> {
         let entry = Entry::new(&self.service, "refresh_token")?;
         entry.set_password(token)?;
@@ -22,6 +24,7 @@ impl TokenStorage {
     }
     
     /// Recupera el refresh token desde el keyring
+    #[allow(dead_code)] // Feature para gestión manual de tokens
     pub async fn load_refresh_token(&self) -> Result<String> {
         let entry = Entry::new(&self.service, "refresh_token")?;
         let token = entry.get_password()?;
@@ -30,6 +33,7 @@ impl TokenStorage {
     }
     
     /// Elimina el refresh token del keyring (útil para logout)
+    #[allow(dead_code)] // Usado por logout() en OAuth2Manager
     pub async fn delete_refresh_token(&self) -> Result<()> {
         let entry = Entry::new(&self.service, "refresh_token")?;
         entry.delete_credential()?;
@@ -38,6 +42,7 @@ impl TokenStorage {
     }
     
     /// Verifica si existe un token guardado
+    #[allow(dead_code)] // Usado por is_authenticated() en OAuth2Manager
     pub async fn has_stored_token(&self) -> bool {
         let entry = Entry::new(&self.service, "refresh_token");
         entry.map(|e| e.get_password().is_ok()).unwrap_or(false)

@@ -12,6 +12,7 @@ use super::TokenStorage;
 /// Gestor de autenticación OAuth2 para Google Drive
 pub struct OAuth2Manager {
     app_secret: ApplicationSecret,
+    #[allow(dead_code)] // Será usado para logout
     token_storage: Arc<TokenStorage>,
 }
 
@@ -73,6 +74,7 @@ impl OAuth2Manager {
     }
     
     /// Revoca la autenticación y elimina los tokens almacenados
+    #[allow(dead_code)] // Feature para logout futuro
     pub async fn logout(&self) -> Result<()> {
         tracing::info!("Cerrando sesión y eliminando tokens");
         self.token_storage.delete_refresh_token().await?;
@@ -84,6 +86,7 @@ impl OAuth2Manager {
     }
     
     /// Verifica si el usuario está autenticado
+    #[allow(dead_code)] // Feature para verificación de sesión
     pub async fn is_authenticated(&self) -> bool {
         self.token_storage.has_stored_token().await
     }
