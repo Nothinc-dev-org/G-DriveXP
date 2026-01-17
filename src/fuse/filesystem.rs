@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error};
-use futures_util::stream::{self, Empty, BoxStream, StreamExt};
+use futures_util::stream::{self, BoxStream, StreamExt};
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
@@ -15,18 +15,23 @@ use crate::gdrive::client::DriveClient;
 pub struct GDriveFS {
     db: Arc<MetadataRepository>,
     drive_client: Arc<DriveClient>,
+    cache_dir: std::path::PathBuf,
 }
 
 impl GDriveFS {
-    pub fn new(db: Arc<MetadataRepository>, drive_client: Arc<DriveClient>) -> Self {
-        Self { db, drive_client }
+    pub fn new(db: Arc<MetadataRepository>, drive_client: Arc<DriveClient>, cache_dir: impl AsRef<std::path::Path>) -> Self {
+        Self { 
+            db, 
+            drive_client,
+            cache_dir: cache_dir.as_ref().to_path_buf(),
+        }
     }
 }
 
 
 impl Filesystem for GDriveFS {
     type DirEntryStream<'a> = BoxStream<'a, Result<DirectoryEntry>>;
-    type DirEntryPlusStream<'a> = Empty<Result<DirectoryEntryPlus>>;
+    type DirEntryPlusStream<'a> = BoxStream<'a, Result<DirectoryEntryPlus>>;
 
     // Inicialización del sistema de archivos
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
@@ -48,23 +53,31 @@ impl Filesystem for GDriveFS {
         _fh: u64,
         offset: i64,
     ) -> Result<ReplyDirectory<Self::DirEntryStream<'_>>> {
-        debug!("readdir: parent={} offset={}", parent, offset);
+        debug!("👁️ readdir INVOCADO: parent={} offset={}", parent, offset);
 
-        let mut children = match self.db.list_children(parent).await {
-            Ok(c) => c,
+        let children = match self.db.list_children(parent).await {
+            Ok(c) => {
+                debug!("✅ list_children retornó {} entradas para parent={}", c.len(), parent);
+                c
+            },
             Err(e) => {
-                error!("Error listando hijos de {}: {}", parent, e);
+                error!("❌ Error listando hijos de {}: {}", parent, e);
                 return Err(Errno::from(libc::EIO));
             }
         };
 
         // Agregar entradas especiales . y ..
+        let mut entries = Vec::new();
         if offset == 0 {
-            children.insert(0, (parent, ".".to_string(), true));
-            children.insert(1, (1.max(parent), "..".to_string(), true));
+            entries.push((parent, ".".to_string(), true));
+            entries.push((1.max(parent), "..".to_string(), true));
+            debug!("📁 Agregadas entradas especiales . y ..");
         }
+        entries.extend(children);
 
-        let stream = stream::iter(children)
+        debug!("📊 Total de entradas a retornar: {}, offset: {}", entries.len(), offset);
+
+        let stream = stream::iter(entries)
             .skip(offset as usize)
             .enumerate()
             .map(move |(index, (inode, name, is_dir))| {
@@ -84,7 +97,8 @@ impl Filesystem for GDriveFS {
     // Buscar un archivo en un directorio (ls)
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> Result<ReplyEntry> {
         let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
-        debug!("lookup: parent={} name={}", parent, name_str);
+        // trace is enough for lookup
+        tracing::trace!("lookup: parent={} name={}", parent, name_str);
 
         // Consultar la base de datos
         // NOTA: Implementación temporal simulando que todo existe en SQLite
@@ -114,7 +128,7 @@ impl Filesystem for GDriveFS {
 
     // Obtener atributos de un archivo (stat)
     async fn getattr(&self, _req: Request, inode: u64, _fh: Option<u64>, _flags: u32) -> Result<ReplyAttr> {
-        debug!("getattr: inode={}", inode);
+        tracing::trace!("getattr: inode={}", inode);
 
         let attrs = self.db.get_attrs(inode)
             .await
@@ -137,6 +151,28 @@ impl Filesystem for GDriveFS {
     // Métodos requeridos adicionales que faltaban (placeholders)
     async fn forget(&self, _req: Request, _inode: u64, _nlookup: u64) {}
 
+    // Abrir directorio (requerido antes de readdir)
+    async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
+        tracing::trace!("📂 opendir: inode={}", inode);
+        
+        // Verificar que el inode existe y es un directorio
+        match self.db.get_attrs(inode).await {
+            Ok(attrs) => {
+                if !attrs.is_dir {
+                    return Err(Errno::from(libc::ENOTDIR));
+                }
+                Ok(ReplyOpen { fh: 0, flags: 0 })
+            }
+            Err(_) => Err(Errno::from(libc::ENOENT)),
+        }
+    }
+
+    // Cerrar directorio
+    async fn releasedir(&self, _req: Request, inode: u64, _fh: u64, _flags: u32) -> Result<()> {
+        tracing::trace!("📂 releasedir: inode={}", inode);
+        Ok(())
+    }
+
     // Abrir archivo (open)
     async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
         debug!("open: inode={}", inode);
@@ -158,6 +194,34 @@ impl Filesystem for GDriveFS {
         _flush: bool,
     ) -> Result<()> {
         debug!("release");
+        Ok(())
+    }
+
+    // Flush de datos pendientes (llamado en cada close())
+    async fn flush(
+        &self,
+        _req: Request,
+        inode: u64,
+        _fh: u64,
+        _lock_owner: u64,
+    ) -> Result<()> {
+        debug!("flush: inode={}", inode);
+        // Los datos ya se persisten sincrónicamente en write(),
+        // el upload a GDrive es asíncrono vía uploader
+        Ok(())
+    }
+
+    // Sincronizar datos a disco
+    async fn fsync(
+        &self,
+        _req: Request,
+        inode: u64,
+        _fh: u64,
+        _datasync: bool,
+    ) -> Result<()> {
+        debug!("fsync: inode={}", inode);
+        // Los datos ya se persisten sincrónicamente en write(),
+        // el upload a GDrive es asíncrono vía uploader
         Ok(())
     }
 
@@ -194,5 +258,473 @@ impl Filesystem for GDriveFS {
                 Err(Errno::from(libc::EIO))
             }
         }
+    }
+
+    // Obtener estadísticas del sistema de archivos (requerido por comandos como ls/df)
+    async fn statfs(&self, _req: Request, _inode: u64) -> Result<ReplyStatFs> {
+        tracing::trace!("statfs");
+        Ok(ReplyStatFs {
+            blocks: 1024 * 1024 * 1024, // 1 TB ficticio
+            bfree: 512 * 1024 * 1024,
+            bavail: 512 * 1024 * 1024,
+            files: 1000000,
+            ffree: 1000000,
+            bsize: 4096,
+            namelen: 255,
+            frsize: 4096,
+        })
+    }
+
+    // readdirplus: versión optimizada de readdir que incluye atributos
+    // Requerido por herramientas modernas como lsd, nautilus, etc.
+    async fn readdirplus(
+        &self,
+        _req: Request,
+        parent: u64,
+        _fh: u64,
+        offset: u64,
+        _lock_owner: u64,
+    ) -> Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'_>>> {
+        tracing::trace!("👁️ readdirplus INVOCADO: parent={} offset={}", parent, offset);
+
+        let db = self.db.clone();
+        
+        let children = match db.list_children(parent).await {
+            Ok(c) => {
+                debug!("✅ list_children retornó {} entradas para parent={}", c.len(), parent);
+                c
+            },
+            Err(e) => {
+                error!("❌ Error listando hijos de {}: {}", parent, e);
+                return Err(Errno::from(libc::EIO));
+            }
+        };
+
+        // Agregar entradas especiales . y ..
+        let mut entries: Vec<(u64, String, bool)> = Vec::new();
+        if offset == 0 {
+            entries.push((parent, ".".to_string(), true));
+            entries.push((1.max(parent), "..".to_string(), true));
+            debug!("📁 Agregadas entradas especiales . y ..");
+        }
+        entries.extend(children);
+
+        debug!("📊 Total de entradas a retornar: {}, offset: {}", entries.len(), offset);
+
+        // Construir stream con atributos completos
+        let stream = stream::iter(entries)
+            .skip(offset as usize)
+            .enumerate()
+            .then(move |(index, (inode, name, is_dir))| {
+                let db_clone = db.clone();
+                async move {
+                    let attr = match db_clone.get_attrs(inode).await {
+                        Ok(a) => a.to_file_attr(),
+                        Err(_) => {
+                            // Si no hay atributos, crear unos por defecto
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64;
+                            crate::fuse::attr::FileAttributes {
+                                inode: inode as i64,
+                                size: if is_dir { 4096 } else { 0 },
+                                mtime: now,
+                                ctime: now,
+                                mode: if is_dir { 0o755 } else { 0o644 },
+                                is_dir,
+                                mime_type: None,
+                            }.to_file_attr()
+                        }
+                    };
+
+                    Ok(DirectoryEntryPlus {
+                        inode,
+                        generation: 0,
+                        kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
+                        name: name.into(),
+                        offset: (offset as i64 + index as i64 + 1),
+                        attr,
+                        entry_ttl: Duration::from_secs(1),
+                        attr_ttl: Duration::from_secs(1),
+                    })
+                }
+            });
+
+        Ok(ReplyDirectoryPlus {
+            entries: Box::pin(stream)
+        })
+    }
+
+    // ============================================================
+    // WRITE OPERATIONS (Phase 2: Upstream Sync)
+    // ============================================================
+
+    // Crear un nuevo archivo
+    async fn create(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        flags: u32,
+    ) -> Result<ReplyCreated> {
+        let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
+        debug!("✏️ create: parent={} name={} mode={:o} flags={}", parent, name_str, mode, flags);
+
+        // Generar un gdrive_id temporal (será reemplazado al subir)
+        let temp_gdrive_id = format!("temp_{}", uuid::Uuid::new_v4());
+        
+        // Crear inode en la DB
+        let inode = self.db.get_or_create_inode(&temp_gdrive_id).await
+            .map_err(|e| {
+                error!("Error creando inode: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Timestamp actual
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Insertar metadatos del archivo vacío
+        self.db.upsert_file_metadata(
+            inode,
+            0, // size inicial
+            now,
+            mode,
+            false, // no es directorio
+            Some("application/octet-stream"),
+        ).await.map_err(|e| {
+            error!("Error insertando metadatos: {}", e);
+            Errno::from(libc::EIO)
+        })?;
+
+        // Agregar al dentry
+        self.db.upsert_dentry(parent, inode, name_str).await
+            .map_err(|e| {
+                error!("Error insertando dentry: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Marcar como dirty (pendiente de subida)
+        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await
+            .map_err(|e| {
+                error!("Error marcando archivo como dirty: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        let attrs = self.db.get_attrs(inode).await
+            .map_err(|_| Errno::from(libc::EIO))?;
+
+        debug!("✅ Archivo creado: inode={} nombre={}", inode, name_str);
+
+        Ok(ReplyCreated {
+            ttl: Duration::from_secs(1),
+            attr: attrs.to_file_attr(),
+            generation: 0,
+            fh: 0,
+            flags: 0,
+        })
+    }
+
+    // Escribir datos en un archivo
+    async fn write(
+        &self,
+        _req: Request,
+        inode: u64,
+        _fh: u64,
+        offset: u64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: u32,
+    ) -> Result<ReplyWrite> {
+        debug!("✏️ write: inode={} offset={} size={}", inode, offset, data.len());
+
+        // Obtener el gdrive_id del archivo
+        let gdrive_id = sqlx::query_scalar::<_, String>("SELECT gdrive_id FROM inodes WHERE inode = ?")
+            .bind(inode as i64)
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(|e| {
+                error!("Error obteniendo gdrive_id: {}", e);
+                Errno::from(libc::ENOENT)
+            })?;
+
+        // Ruta local de caché
+        let cache_path = self.get_cache_path(&gdrive_id);
+        
+        // Crear directorio de caché si no existe
+        if let Some(parent_dir) = cache_path.parent() {
+            tokio::fs::create_dir_all(parent_dir).await
+                .map_err(|e| {
+                    error!("Error creando directorio de caché: {}", e);
+                    Errno::from(libc::EIO)
+                })?;
+        }
+
+        // Escribir datos en el archivo de caché
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&cache_path)
+            .await
+            .map_err(|e| {
+                error!("Error abriendo archivo de caché: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        file.seek(std::io::SeekFrom::Start(offset)).await
+            .map_err(|e| {
+                error!("Error posicionando en archivo: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        file.write_all(data).await
+            .map_err(|e| {
+                error!("Error escribiendo datos: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        file.flush().await
+            .map_err(|e| {
+                error!("Error haciendo flush: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Obtener el nuevo tamaño del archivo
+        let metadata = file.metadata().await
+            .map_err(|e| {
+                error!("Error obteniendo metadata: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+        let new_size = metadata.len() as i64;
+
+        // Actualizar tamaño en la base de datos
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        sqlx::query("UPDATE attrs SET size = ?, mtime = ? WHERE inode = ?")
+            .bind(new_size)
+            .bind(now)
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await
+            .map_err(|e| {
+                error!("Error actualizando attrs: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Marcar como dirty
+        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await
+            .map_err(|e| {
+                error!("Error marcando como dirty: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        debug!("✅ Escritura completada: {} bytes", data.len());
+
+        Ok(ReplyWrite {
+            written: data.len() as u32,
+        })
+    }
+
+    // Cambiar atributos de un archivo (truncate, chmod, etc.)
+    async fn setattr(
+        &self,
+        _req: Request,
+        inode: u64,
+        _fh: Option<u64>,
+        set_attr: SetAttr,
+    ) -> Result<ReplyAttr> {
+        debug!("✏️ setattr: inode={} set_attr={:?}", inode, set_attr);
+
+        // Actualizar solo los campos especificados
+        if let Some(size) = set_attr.size {
+            // Truncar archivo
+            let gdrive_id = sqlx::query_scalar::<_, String>("SELECT gdrive_id FROM inodes WHERE inode = ?")
+                .bind(inode as i64)
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(|_| Errno::from(libc::ENOENT))?;
+
+            let cache_path = self.get_cache_path(&gdrive_id);
+            
+            if cache_path.exists() {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&cache_path)
+                    .map_err(|_| Errno::from(libc::EIO))?;
+                    
+                file.set_len(size)
+                    .map_err(|_| Errno::from(libc::EIO))?;
+            } else {
+                // Crear archivo vacío del tamaño especificado
+                std::fs::write(&cache_path, vec![0u8; size as usize])
+                    .map_err(|_| Errno::from(libc::EIO))?;
+            }
+
+            sqlx::query("UPDATE attrs SET size = ? WHERE inode = ?")
+                .bind(size as i64)
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await
+                .map_err(|_| Errno::from(libc::EIO))?;
+
+            // Marcar como dirty
+            sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await
+                .map_err(|_| Errno::from(libc::EIO))?;
+        }
+
+        if let Some(mtime) = set_attr.mtime {
+            let mtime_secs = mtime.sec;
+
+            sqlx::query("UPDATE attrs SET mtime = ? WHERE inode = ?")
+                .bind(mtime_secs)
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await
+                .map_err(|_| Errno::from(libc::EIO))?;
+        }
+
+        if let Some(mode) = set_attr.mode {
+            sqlx::query("UPDATE attrs SET mode = ? WHERE inode = ?")
+                .bind(mode)
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await
+                .map_err(|_| Errno::from(libc::EIO))?;
+        }
+
+        let attrs = self.db.get_attrs(inode).await
+            .map_err(|_| Errno::from(libc::ENOENT))?;
+
+        Ok(ReplyAttr {
+            ttl: Duration::from_secs(1),
+            attr: attrs.to_file_attr(),
+        })
+    }
+
+    // Eliminar un archivo (soft delete)
+    async fn unlink(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+    ) -> Result<()> {
+        let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
+        debug!("🗑️ unlink: parent={} name={}", parent, name_str);
+
+        // Buscar el archivo
+        let inode = self.db.lookup(parent, name_str).await
+            .map_err(|_| Errno::from(libc::EIO))?
+            .ok_or(Errno::from(libc::ENOENT))?;
+
+        // Obtener gdrive_id
+        let gdrive_id = sqlx::query_scalar::<_, String>("SELECT gdrive_id FROM inodes WHERE inode = ?")
+            .bind(inode as i64)
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(|_| Errno::from(libc::ENOENT))?;
+
+        // Soft delete
+        self.db.soft_delete_by_gdrive_id(&gdrive_id).await
+            .map_err(|e| {
+                error!("Error en soft delete: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Marcar como dirty para que el uploader lo envíe como delete a GDrive
+        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
+
+        debug!("✅ Archivo marcado para eliminación: {}", name_str);
+
+        Ok(())
+    }
+
+    // Renombrar/mover un archivo
+    async fn rename(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+    ) -> Result<()> {
+        let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
+        let new_name_str = new_name.to_str().ok_or(Errno::from(libc::EINVAL))?;
+        debug!("🔄 rename: parent={} name={} -> new_parent={} new_name={}", 
+               parent, name_str, new_parent, new_name_str);
+
+        // Buscar el inode del archivo origen
+        let inode = self.db.lookup(parent, name_str).await
+            .map_err(|_| Errno::from(libc::EIO))?
+            .ok_or(Errno::from(libc::ENOENT))?;
+
+        // Si existe un archivo destino, eliminarlo primero (overwite)
+        if let Ok(Some(existing_inode)) = self.db.lookup(new_parent, new_name_str).await {
+            // Obtener gdrive_id del existente
+            if let Ok(gdrive_id) = sqlx::query_scalar::<_, String>("SELECT gdrive_id FROM inodes WHERE inode = ?")
+                .bind(existing_inode as i64)
+                .fetch_one(self.db.pool())
+                .await
+            {
+                self.db.soft_delete_by_gdrive_id(&gdrive_id).await
+                    .map_err(|_| Errno::from(libc::EIO))?;
+            }
+        }
+
+        // Eliminar la entrada dentry antigua
+        sqlx::query("DELETE FROM dentry WHERE parent_inode = ? AND name = ?")
+            .bind(parent as i64)
+            .bind(name_str)
+            .execute(self.db.pool())
+            .await
+            .map_err(|e| {
+                error!("Error eliminando dentry antiguo: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Crear la nueva entrada dentry
+        self.db.upsert_dentry(new_parent, inode, new_name_str).await
+            .map_err(|e| {
+                error!("Error creando nuevo dentry: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Marcar como dirty para sincronizar el cambio de nombre
+        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
+
+        debug!("✅ Archivo renombrado: {} -> {}", name_str, new_name_str);
+
+        Ok(())
+    }
+}
+
+impl GDriveFS {
+    /// Construye la ruta local de caché para un archivo de GDrive
+    fn get_cache_path(&self, gdrive_id: &str) -> std::path::PathBuf {
+        self.cache_dir.join(gdrive_id)
     }
 }

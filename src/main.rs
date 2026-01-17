@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod fuse;
 mod gdrive;
+mod sync;
 
 use anyhow::{Context, Result};
 use fuse3::MountOptions;
@@ -68,7 +69,32 @@ async fn main() -> Result<()> {
     let drive_client = Arc::new(gdrive::client::DriveClient::new(authenticator));
     
     // Inicializar sistema de archivos
-    let fs = GDriveFS::new(db.clone(), drive_client);
+    let fs = GDriveFS::new(db.clone(), drive_client.clone(), &config.cache_dir);
+    
+    // Fase 2.1: Bootstrapping (Sincronización de metadatos)
+    if db.is_empty().await? {
+        tracing::info!("Base de datos vacía, iniciando sincronización inicial...");
+        sync::bootstrap::sync_all_metadata(&db, &drive_client).await?;
+    }
+    
+    // Fase 2.2: Background Syncer (sincronización continua)
+    tracing::info!("Iniciando sincronizador en background...");
+    let syncer = sync::syncer::BackgroundSyncer::new(
+        db.clone(),
+        drive_client.clone(),
+        60, // Intervalo base: 60 segundos
+    );
+    let _syncer_handle = syncer.spawn();
+    
+    // Fase 2.3: Uploader (subida de archivos dirty)
+    tracing::info!("Iniciando uploader en background...");
+    let uploader = sync::uploader::Uploader::new(
+        db.clone(),
+        drive_client.clone(),
+        30, // Intervalo: 30 segundos
+        &config.cache_dir,
+    );
+    let _uploader_handle = uploader.spawn();
     
     // Configurar opciones de montaje
     let uid = unsafe { libc::getuid() };

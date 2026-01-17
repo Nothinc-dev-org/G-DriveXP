@@ -35,10 +35,31 @@ CREATE TABLE IF NOT EXISTS sync_state (
     dirty BOOLEAN DEFAULT 0,
     version INTEGER NOT NULL,
     md5_checksum TEXT,
+    deleted_at INTEGER DEFAULT NULL,  -- Timestamp de soft delete
     FOREIGN KEY (inode) REFERENCES inodes(inode)
 );
 CREATE INDEX IF NOT EXISTS idx_dirty ON sync_state(inode) WHERE dirty=1;
 
+
+-- Token de sincronización para changes.list
+CREATE TABLE IF NOT EXISTS sync_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- Tombstones: Entradas de directorio eliminadas (soft delete)
+-- Permite recuperación y previene resurrecciones accidentales
+CREATE TABLE IF NOT EXISTS dentry_deleted (
+    parent_inode INTEGER NOT NULL,
+    child_inode INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    deleted_at INTEGER NOT NULL,
+    PRIMARY KEY (parent_inode, name)
+);
+CREATE INDEX IF NOT EXISTS idx_tombstone_deleted_at ON dentry_deleted(deleted_at);
+
 -- Optimizaciones de WAL (Write-Ahead Logging) para concurrencia
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+

@@ -82,11 +82,27 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         
-        if let Some(parent) = self.mount_point.parent() {
-            fs::create_dir_all(parent)?;
+        // Crear el punto de montaje si no existe
+        // Si ya existe (incluso en estado stale por crash anterior), ignorar el error EEXIST
+        match fs::create_dir_all(&self.mount_point) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                tracing::debug!("Punto de montaje ya existe, continuando...");
+            },
+            Err(e) => {
+                // Verificar si es accesible (stale mount devuelve error al acceder)
+                if fs::read_dir(&self.mount_point).is_err() {
+                    tracing::warn!(
+                        "Punto de montaje {:?} existe pero no es accesible. \
+                         Por favor ejecute: fusermount3 -u {:?}",
+                        self.mount_point, self.mount_point
+                    );
+                }
+                return Err(e.into());
+            }
         }
         
-        tracing::info!("Directorios de configuración creados");
+        tracing::info!("Directorios de configuración y montaje creados");
         Ok(())
     }
 }

@@ -34,11 +34,21 @@ impl OAuth2Manager {
     
     /// Construye y retorna el autenticador configurado
     pub async fn get_authenticator(&self) -> Result<yup_oauth2::authenticator::Authenticator<yup_oauth2::hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>> {
+        // Resolver la ruta del home correctamente (~ no funciona en Rust)
+        let home = std::env::var("HOME").context("No se pudo obtener variable HOME")?;
+        let token_path = format!("{}/.config/fedoradrive/tokens.json", home);
+        
+        // Asegurar que el directorio padre existe
+        let token_dir = std::path::Path::new(&token_path).parent();
+        if let Some(dir) = token_dir {
+            std::fs::create_dir_all(dir).ok();
+        }
+        
         InstalledFlowAuthenticator::builder(
             self.app_secret.clone(),
             InstalledFlowReturnMethod::HTTPRedirect,
         )
-        .persist_tokens_to_disk("~/.config/fedoradrive/tokens.json")
+        .persist_tokens_to_disk(&token_path)
         .build()
         .await
         .context("Error al construir el autenticador OAuth2")
