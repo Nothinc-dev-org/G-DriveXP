@@ -1,0 +1,46 @@
+[package]
+name = "g-drive-xp"
+version = "0.1.0"
+edition = "2024"
+authors = ["FedoraDrive Team"]
+
+[dependencies]
+# Runtime asíncrono
+tokio = { version = "1.44", features = ["full"] }
+
+# Sistema de archivos FUSE
+fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
+
+# Base de datos
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+
+# API de Google Drive
+google-drive3 = "5.0"
+yup-oauth2 = "11.0"
+
+# Cliente HTTP
+reqwest = { version = "0.12", features = ["stream", "json"] }
+hyper = { version = "1.5", features = ["server"] }
+
+# Gestión de secretos
+keyring = "3.6"
+
+# GUI GTK4
+gtk4 = { version = "0.9", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_5"] }
+relm4 = "0.9"
+
+# Utilidades
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
