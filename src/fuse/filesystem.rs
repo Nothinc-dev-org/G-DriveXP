@@ -10,6 +10,8 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
+use crate::fuse::shortcuts;
+
 
 /// Implementación del sistema de archivos FUSE para Google Drive
 pub struct GDriveFS {
@@ -142,9 +144,28 @@ impl Filesystem for GDriveFS {
                 Errno::from(libc::ENOENT)
             })?;
 
+        // Si es archivo Workspace, ajustar el tamaño reportado al tamaño del .desktop
+        let mut file_attr = attrs.to_file_attr();
+        
+        if let Some(ref mime) = attrs.mime_type {
+            if shortcuts::is_workspace_file(mime) {
+                let name = self.get_file_name(inode).await
+                    .unwrap_or_else(|_| "Documento de Google".to_string());
+                let gdrive_id = self.get_gdrive_id(inode).await
+                    .unwrap_or_else(|_| "unknown".to_string());
+                    
+                let desktop_content = shortcuts::generate_desktop_entry(
+                    &gdrive_id,
+                    &name,
+                    mime
+                );
+                file_attr.size = desktop_content.len() as u64;
+            }
+        }
+
         Ok(ReplyAttr {
             ttl: Duration::from_secs(1),
-            attr: attrs.to_file_attr(),
+            attr: file_attr,
         })
     }
     
@@ -236,21 +257,53 @@ impl Filesystem for GDriveFS {
     ) -> Result<ReplyData> {
         debug!("read: inode={} offset={} size={}", inode, offset, size);
 
-        // 1. Obtener los atributos para conseguir el gdrive_id
-        // (En una versión optimizada, esto debería estar en una caché de inodos -> file_id)
-        let gdrive_id = match sqlx::query_scalar::<_, String>("SELECT gdrive_id FROM inodes WHERE inode = ?")
+        // 1. Obtener el gdrive_id del archivo y su mime_type
+        let (gdrive_id, mime_type) = match sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT i.gdrive_id, a.mime_type 
+             FROM inodes i 
+             LEFT JOIN attrs a ON i.inode = a.inode 
+             WHERE i.inode = ?"
+        )
             .bind(inode as i64)
             .fetch_one(self.db.pool())
             .await 
         {
-            Ok(id) => id,
+            Ok(row) => row,
             Err(e) => {
-                error!("Error buscando gdrive_id para inode {}: {}", inode, e);
+                error!("Error buscando info para inode {}: {}", inode, e);
                 return Err(Errno::from(libc::ENOENT));
             }
         };
 
-        // 2. Descargar el chunk desde la API
+        // 2. Si es archivo de Google Workspace, generar .desktop file on-the-fly
+        if let Some(ref mime) = mime_type {
+            if shortcuts::is_workspace_file(mime) {
+                // Obtener el nombre del archivo
+                let name = self.get_file_name(inode).await
+                    .unwrap_or_else(|_| "Documento de Google".to_string());
+                
+                // Generar contenido del .desktop
+                let desktop_content = shortcuts::generate_desktop_entry(
+                    &gdrive_id,
+                    &name,
+                    mime
+                );
+                
+                let bytes = desktop_content.as_bytes();
+                let start = offset as usize;
+                let end = (start + size as usize).min(bytes.len());
+                
+                if start >= bytes.len() {
+                    return Ok(ReplyData { data: vec![].into() });
+                }
+                
+                return Ok(ReplyData {
+                    data: bytes[start..end].to_vec().into()
+                });
+            }
+        }
+
+        // 3. Archivo binario normal: descargar el chunk desde la API
         match self.drive_client.download_chunk(&gdrive_id, offset, size).await {
             Ok(data) => Ok(ReplyData { data: data.into() }),
             Err(e) => {
@@ -289,9 +342,9 @@ impl Filesystem for GDriveFS {
 
         let db = self.db.clone();
         
-        let children = match db.list_children(parent).await {
+        let entries = match db.list_children_extended(parent).await {
             Ok(c) => {
-                debug!("✅ list_children retornó {} entradas para parent={}", c.len(), parent);
+                debug!("✅ list_children_extended retornó {} entradas para parent={}", c.len(), parent);
                 c
             },
             Err(e) => {
@@ -300,43 +353,52 @@ impl Filesystem for GDriveFS {
             }
         };
 
-        // Agregar entradas especiales . y ..
-        let mut entries: Vec<(u64, String, bool)> = Vec::new();
+        // Agregar entradas especiales . y .. (sin metadatos extendidos para estos casos especiales)
+        let mut final_entries: Vec<(u64, String, bool, Option<String>, Option<String>)> = Vec::new();
         if offset == 0 {
-            entries.push((parent, ".".to_string(), true));
-            entries.push((1.max(parent), "..".to_string(), true));
-            debug!("📁 Agregadas entradas especiales . y ..");
+            final_entries.push((parent, ".".to_string(), true, None, None));
+            final_entries.push((1.max(parent), "..".to_string(), true, None, None));
         }
-        entries.extend(children);
 
-        debug!("📊 Total de entradas a retornar: {}, offset: {}", entries.len(), offset);
+        for (inode, name, is_dir, mime, gdrive_id) in entries {
+            final_entries.push((inode, name, is_dir, mime, Some(gdrive_id)));
+        }
 
-        // Construir stream con atributos completos
-        let stream = stream::iter(entries)
+        debug!("📊 Total de entradas a retornar: {}, offset: {}", final_entries.len(), offset);
+
+        // Construir stream con atributos completos usando los datos ya cargados
+        let stream = stream::iter(final_entries)
             .skip(offset as usize)
             .enumerate()
-            .then(move |(index, (inode, name, is_dir))| {
+            .then(move |(index, (inode, name, is_dir, mime, gdrive_id))| {
                 let db_clone = db.clone();
                 async move {
-                    let attr = match db_clone.get_attrs(inode).await {
-                        Ok(a) => a.to_file_attr(),
-                        Err(_) => {
-                            // Si no hay atributos, crear unos por defecto
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as i64;
-                            crate::fuse::attr::FileAttributes {
-                                inode: inode as i64,
-                                size: if is_dir { 4096 } else { 0 },
-                                mtime: now,
-                                ctime: now,
-                                mode: if is_dir { 0o755 } else { 0o644 },
-                                is_dir,
-                                mime_type: None,
-                            }.to_file_attr()
-                        }
+                    let mut attr = if let Ok(a) = db_clone.get_attrs(inode).await {
+                        a.to_file_attr()
+                    } else {
+                        // Si no hay atributos, crear unos por defecto
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64;
+                        crate::fuse::attr::FileAttributes {
+                            inode: inode as i64,
+                            size: if is_dir { 4096 } else { 0 },
+                            mtime: now,
+                            ctime: now,
+                            mode: if is_dir { 0o755 } else { 0o644 },
+                            is_dir,
+                            mime_type: None,
+                        }.to_file_attr()
                     };
+
+                    // Ajustar tamaño para archivos Workspace si tenemos los datos necesarios
+                    if let (Some(m), Some(gid)) = (mime, gdrive_id) {
+                        if shortcuts::is_workspace_file(&m) {
+                            let desktop_content = shortcuts::generate_desktop_entry(&gid, &name, &m);
+                            attr.size = desktop_content.len() as u64;
+                        }
+                    }
 
                     Ok(DirectoryEntryPlus {
                         inode,
@@ -726,5 +788,30 @@ impl GDriveFS {
     /// Construye la ruta local de caché para un archivo de GDrive
     fn get_cache_path(&self, gdrive_id: &str) -> std::path::PathBuf {
         self.cache_dir.join(gdrive_id)
+    }
+
+    /// Obtiene el nombre de un archivo dado su inode
+    async fn get_file_name(&self, inode: u64) -> anyhow::Result<String> {
+        let name = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM dentry WHERE child_inode = ? LIMIT 1"
+        )
+        .bind(inode as i64)
+        .fetch_optional(self.db.pool())
+        .await?
+        .unwrap_or_else(|| format!("file_{}", inode));
+        
+        Ok(name)
+    }
+
+    /// Obtiene el gdrive_id de un archivo dado su inode
+    async fn get_gdrive_id(&self, inode: u64) -> anyhow::Result<String> {
+        let gdrive_id = sqlx::query_scalar::<_, String>(
+            "SELECT gdrive_id FROM inodes WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_one(self.db.pool())
+        .await?;
+        
+        Ok(gdrive_id)
     }
 }
