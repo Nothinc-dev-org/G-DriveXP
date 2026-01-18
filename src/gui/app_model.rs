@@ -60,9 +60,20 @@ impl Component for AppModel {
 
                 append = &adw::HeaderBar {
                     #[wrap(Some)]
-                    set_title_widget = &adw::WindowTitle {
-                        set_title: "G-DriveXP",
-                        set_subtitle: "Cliente de Google Drive",
+                    set_title_widget = &gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 12,
+                        set_halign: gtk::Align::Center,
+
+                        #[name = "logo_image"]
+                        append = &gtk::Image {
+                            set_pixel_size: 32,
+                        },
+
+                        append = &adw::WindowTitle {
+                            set_title: "G-DriveXP",
+                            set_subtitle: "Cliente de Google Drive",
+                        },
                     },
                 },
 
@@ -255,6 +266,15 @@ impl Component for AppModel {
         });
 
         let widgets = view_output!();
+
+        // Cargar logo embebido y asignarlo al widget
+        let logo_bytes = include_bytes!("../../assets/logo.png");
+        if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(logo_bytes)) {
+            let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+            widgets.logo_image.set_paintable(Some(&texture));
+        } else {
+            widgets.logo_image.set_icon_name(Some("drive-harddisk-symbolic"));
+        }
         
         // Configurar manejador de cierre de ventana: Ocultar en lugar de Cerrar
         let sender_clone = sender.clone();
