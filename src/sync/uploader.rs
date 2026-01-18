@@ -227,15 +227,22 @@ impl Uploader {
 
         let known_md5 = self.db.get_remote_md5(inode).await?;
         
-        // 2. Detectar conflicto: si ambos existen y son diferentes
-        if let (Some(known), Some(current)) = (&known_md5, &current_remote_md5) {
-            if known != current {
-                warn!("⚠️ CONFLICTO DETECTADO: archivo remoto cambió desde la última sync");
-                warn!("   - MD5 conocido: {}", known);
-                warn!("   - MD5 actual:   {}", current);
-                return self.handle_conflict(inode, gdrive_id).await;
+        // 2. Detectar conflicto: SOLO si tenemos un MD5 conocido previo Y difiere del remoto
+        // Si known_md5 es None o vacío, significa que el archivo nunca fue registrado localmente
+        // (ej: solo se movió/renombró), NO es un conflicto real.
+        if let Some(known) = &known_md5 {
+            if !known.is_empty() {
+                if let Some(current) = &current_remote_md5 {
+                    if known != current {
+                        warn!("⚠️ CONFLICTO DETECTADO: archivo remoto cambió desde la última sync");
+                        warn!("   - MD5 conocido: {}", known);
+                        warn!("   - MD5 actual:   {}", current);
+                        return self.handle_conflict(inode, gdrive_id).await;
+                    }
+                }
             }
         }
+
         
         // 3. Detectar Cambio de Nombre (Rename) y MTime local vs remoto
         let local_name = self.get_file_name(inode).await?;
@@ -248,6 +255,8 @@ impl Uploader {
         let mut metadata_updated = false;
         let mut new_name: Option<&str> = None;
         let mut new_mtime: Option<google_drive3::chrono::DateTime<google_drive3::chrono::Utc>> = None;
+        let mut add_parent: Option<String> = None;
+        let mut remove_parent: Option<String> = None;
 
         if local_name != current_remote_name {
             info!("🔄 Detectado cambio de nombre: '{}' -> '{}'", current_remote_name, local_name);
@@ -268,9 +277,43 @@ impl Uploader {
              }
         }
 
-        if metadata_updated {
-             self.client.update_file_metadata(gdrive_id, new_name, None, None, new_mtime).await?;
+        // Detectar cambio de ubicación (Move)
+        let remote_parents = remote_meta.parents.clone().unwrap_or_default();
+        let local_parent_id = self.get_parent_gdrive_id(inode).await?;
+        
+        // Verificar si el padre local está en la lista de padres remotos
+        // Manejar el caso especial de "root" vs ID real del root
+        let is_in_remote = if local_parent_id == "root" {
+            // Obtener el ID real del root para comparar correctamente
+            match self.client.get_root_file_id().await {
+                Ok(root_id) => remote_parents.contains(&root_id) || remote_parents.contains(&"root".to_string()),
+                Err(_) => remote_parents.contains(&"root".to_string()),
+            }
+        } else {
+            remote_parents.contains(&local_parent_id)
+        };
+
+        if !is_in_remote {
+            info!("🔄 Detectado cambio de ubicación (Move): padre local={}, padres remotos={:?}", 
+                  local_parent_id, remote_parents);
+            add_parent = Some(local_parent_id.clone());
+            // Remover el primer padre remoto que no sea el nuevo
+            if let Some(old) = remote_parents.first() {
+                remove_parent = Some(old.clone());
+            }
+            metadata_updated = true;
         }
+
+        if metadata_updated {
+             self.client.update_file_metadata(
+                 gdrive_id, 
+                 new_name, 
+                 add_parent.as_deref(), 
+                 remove_parent.as_deref(), 
+                 new_mtime
+             ).await?;
+        }
+
 
         // 4. Ruta del archivo en caché
         let cache_path = self.cache_dir.join(gdrive_id);
