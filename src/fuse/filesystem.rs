@@ -283,7 +283,7 @@ impl Filesystem for GDriveFS {
                             let cache_path_owned = cache_path.clone();
                             
                             tokio::spawn(async move {
-                                if let Err(e) = Self::prefetch_entire_file(
+                                if let Err(e) = Self::prefetch_headers_and_tail(
                                     &db,
                                     &drive_client,
                                     inode,
@@ -291,7 +291,7 @@ impl Filesystem for GDriveFS {
                                     &cache_path_owned,
                                     file_size
                                 ).await {
-                                    error!("Error en prefetch multimedia grande: {}", e);
+                                    error!("Error en prefetch de cabeceras multimedia: {}", e);
                                 }
                             });
                         } else {

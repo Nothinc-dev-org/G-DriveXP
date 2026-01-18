@@ -20,11 +20,16 @@ const MAX_BACKOFF_SECS: u64 = 300;
 /// Período de gracia para tombstones en días
 const TOMBSTONE_GRACE_DAYS: i64 = 7;
 
+use crate::gui::history::{ActionHistory, ActionType};
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// Sincronizador en background que detecta cambios de Google Drive
 pub struct BackgroundSyncer {
     db: Arc<MetadataRepository>,
     client: Arc<DriveClient>,
     interval: Duration,
+    history: ActionHistory,
+    sync_paused: Arc<AtomicBool>,
 }
 
 impl BackgroundSyncer {
@@ -33,11 +38,15 @@ impl BackgroundSyncer {
         db: Arc<MetadataRepository>,
         client: Arc<DriveClient>,
         interval_secs: u64,
+        history: ActionHistory,
+        sync_paused: Arc<AtomicBool>,
     ) -> Self {
         Self {
             db,
             client,
             interval: Duration::from_secs(interval_secs),
+            history,
+            sync_paused,
         }
     }
 
@@ -49,16 +58,27 @@ impl BackgroundSyncer {
             let mut current_backoff = self.interval;
             
             loop {
+                // Verificar si está pausado
+                if self.sync_paused.load(Ordering::Relaxed) {
+                    sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+
                 match self.sync_once().await {
                     Ok(changes_count) => {
                         if changes_count > 0 {
                             tracing::info!("✅ Sincronización completada: {} cambios procesados", changes_count);
+                            self.history.log(
+                                ActionType::Sync, 
+                                format!("Sincronizados {} cambios remotos", changes_count)
+                            );
                         }
                         // Reset backoff en caso de éxito
                         current_backoff = self.interval;
                     }
                     Err(e) => {
                         tracing::error!("❌ Error en sincronización: {:?}", e);
+                        self.history.log(ActionType::Error, "Error en sincronización remota");
                         
                         // Exponential backoff
                         current_backoff = std::cmp::min(

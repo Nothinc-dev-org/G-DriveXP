@@ -448,7 +448,7 @@ impl MetadataRepository {
         // 1. Mover dentry a dentry_deleted
         sqlx::query(
             r#"
-            INSERT INTO dentry_deleted (parent_inode, child_inode, name, deleted_at)
+            INSERT OR REPLACE INTO dentry_deleted (parent_inode, child_inode, name, deleted_at)
             SELECT parent_inode, child_inode, name, ?
             FROM dentry WHERE child_inode = ?
             "#

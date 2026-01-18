@@ -5,35 +5,45 @@ use std::path::Path;
 use std::process::Command;
 
 /// Verifica si un directorio está montado como punto de montaje FUSE
-/// Es más robusto que mountpoint -q ya que detecta estados de error (endpoint no conectado)
+/// Detecta TANTO montajes normales COMO endpoints rotos (error 107 / ENOTCONN)
 pub fn is_mounted<P: AsRef<Path>>(path: P) -> bool {
     let path_ref = path.as_ref();
-    if !path_ref.exists() {
-        return false;
-    }
-
-    // El comando 'mountpoint' es confiable, pero si el endpoint no está conectado,
-    // a veces retorna error. En ese caso, IGUAL queremos intentar desmontar.
-    let status = Command::new("mountpoint")
-        .arg("-q")
-        .arg(path_ref)
-        .status();
-
-    match status {
-        Ok(s) if s.success() => true,
-        _ => {
-            // Si mountpoint falla, verificamos /proc/mounts como respaldo
-            match std::fs::read_to_string("/proc/mounts") {
-                Ok(content) => {
-                    let path_abs = path_ref.canonicalize()
-                        .unwrap_or_else(|_| path_ref.to_path_buf());
-                    let path_str = path_abs.to_string_lossy();
-                    content.lines().any(|line| line.contains(&*path_str))
-                },
-                Err(_) => false
+    
+    // Primero: detectar si el path tiene un endpoint roto (ENOTCONN)
+    // Esto ocurre cuando el proceso FUSE anterior murió sin desmontar
+    match std::fs::metadata(path_ref) {
+        Ok(_) => {
+            // El path es accesible, verificar si es un mountpoint
+            let status = Command::new("mountpoint")
+                .arg("-q")
+                .arg(path_ref)
+                .status();
+            
+            if let Ok(s) = status {
+                if s.success() {
+                    return true;
+                }
+            }
+        }
+        Err(e) => {
+            // Si el error es "Transport endpoint is not connected" (ENOTCONN = 107),
+            // entonces HAY un montaje zombie que necesita limpiarse
+            if e.raw_os_error() == Some(107) {
+                tracing::warn!("Detectado endpoint FUSE zombi en {:?} (ENOTCONN)", path_ref);
+                return true; // Reportar como montado para que se intente desmontar
             }
         }
     }
+    
+    // Fallback: verificar /proc/mounts sin depender de canonicalize
+    if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
+        let path_str = path_ref.to_string_lossy();
+        if content.lines().any(|line| line.contains(&*path_str)) {
+            return true;
+        }
+    }
+    
+    false
 }
 
 /// Intenta desmontar un punto de montaje FUSE de forma agresiva (Lazy)

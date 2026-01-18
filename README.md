@@ -46,8 +46,8 @@ cargo build --release
 2. Cree un nuevo proyecto
 3. Habilite la API de Google Drive
 4. Cree credenciales OAuth2 para "Aplicación de escritorio"
-5. Descargue el archivo `client_secret.json`
-6. Colóquelo en `~/.config/fedoradrive/client_secret.json`
+5. Descargue el archivo `credentials.json`
+6. Colóquelo en la raíz del proyecto como `credentials.json`
 
 ## 🎯 Uso
 
@@ -81,16 +81,13 @@ g-drive-xp/
 
 ## 🏗️ Estado del Desarrollo
 
-**Fase Actual**: Fase 1 - Autenticación y Configuración ✅
+**Fase Actual**: Fase 5 - Pulido, Documentación y Empaquetado 🚀
 
-- [x] Estructura del proyecto
-- [x] Dependencias configuradas
-- [x] OAuth2 implementado
-- [x] GNOME Keyring integrado
-- [x] Sistema de configuración
-- [ ] Núcleo FUSE (Fase 2)
-- [ ] Interfaz GTK4 (Fase 3)
-- [ ] Sincronización bidireccional (Fase 4)
+- [x] Fase 1: Autenticación OAuth2 y GNOME Keyring ✅
+- [x] Fase 2: Núcleo FUSE Asíncrono (Lectura/Escritura/readdirplus) ✅
+- [x] Fase 3: Interfaz GTK4/Libadwaita (Relm4, Tray Icon, Historial) ✅
+- [x] Fase 4: Sincronización Bidireccional y Gestión de Conflictos ✅
+- [ ] Fase 5: Empaquetado RPM/Flatpak y optimizaciones finales 🏗️
 
 ## 📚 Documentación
 
@@ -104,7 +101,7 @@ Este proyecto está en desarrollo activo. Las contribuciones son bienvenidas.
 
 ## 📄 Licencia
 
-[Pendiente de definir]
+GNU General Public License v3.0 (GPL-3.0)
 
 ## 🔗 Referencias
 

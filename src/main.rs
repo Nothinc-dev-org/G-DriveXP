@@ -33,7 +33,11 @@ fn main() -> Result<()> {
 }
 
 /// Ejecuta toda la lógica de backend (asíncrona)
-pub fn run_backend(ui_sender: ComponentSender<gui::app_model::AppModel>) -> Result<()> {
+pub fn run_backend(
+    ui_sender: ComponentSender<gui::app_model::AppModel>,
+    history: gui::history::ActionHistory,
+    sync_paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Inicializando backend...".to_string()));
     // Crear runtime de Tokio
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -107,6 +111,8 @@ pub fn run_backend(ui_sender: ComponentSender<gui::app_model::AppModel>) -> Resu
             db.clone(),
             drive_client.clone(),
             60, // Intervalo base: 60 segundos
+            history.clone(),
+            sync_paused.clone(),
         );
         let _syncer_handle = syncer.spawn();
         
@@ -117,6 +123,7 @@ pub fn run_backend(ui_sender: ComponentSender<gui::app_model::AppModel>) -> Resu
             drive_client.clone(),
             30, // Intervalo: 30 segundos
             &config.cache_dir,
+            history.clone(),
         );
         let _uploader_handle = uploader.spawn();
         

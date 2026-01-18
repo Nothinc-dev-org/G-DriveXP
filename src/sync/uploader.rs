@@ -16,12 +16,15 @@ use crate::gdrive::client::DriveClient;
 /// Intervalo máximo de backoff en segundos
 const MAX_BACKOFF_SECS: u64 = 300;
 
+use crate::gui::history::{ActionHistory, ActionType};
+
 /// Uploader en background que sube archivos dirty a Google Drive
 pub struct Uploader {
     db: Arc<MetadataRepository>,
     client: Arc<DriveClient>,
     interval: Duration,
     cache_dir: std::path::PathBuf,
+    history: ActionHistory,
 }
 
 impl Uploader {
@@ -31,12 +34,14 @@ impl Uploader {
         client: Arc<DriveClient>,
         interval_secs: u64,
         cache_dir: impl AsRef<Path>,
+        history: ActionHistory,
     ) -> Self {
         Self {
             db,
             client,
             interval: Duration::from_secs(interval_secs),
             cache_dir: cache_dir.as_ref().to_path_buf(),
+            history,
         }
     }
 
@@ -181,6 +186,7 @@ impl Uploader {
             .await?;
         
         info!("✅ Archivo creado en GDrive: {} (inode={})", real_gdrive_id, inode);
+        self.history.log(ActionType::Create, format!("Archivo creado: {}", name));
         
         Ok(())
     }
@@ -229,6 +235,7 @@ impl Uploader {
             .await?;
         
         info!("✅ Archivo actualizado en GDrive: {} (inode={})", gdrive_id, inode);
+        self.history.log(ActionType::Upload, format!("Archivo actualizado: {}", gdrive_id));
         
         Ok(())
     }
@@ -253,6 +260,7 @@ impl Uploader {
             .await?;
         
         info!("✅ Archivo eliminado en GDrive: {} (inode={})", gdrive_id, inode);
+        self.history.log(ActionType::Delete, format!("Archivo eliminado: {}", gdrive_id));
         
         Ok(())
     }
@@ -325,6 +333,7 @@ impl Uploader {
         
         warn!("✅ Conflicto resuelto: copia local guardada como {}", conflict_gdrive_id);
         warn!("   El archivo original permanece sin cambios en la nube");
+        self.history.log(ActionType::Conflict, format!("Conflicto resuelto: {}", conflict_name));
         
         Ok(())
     }
