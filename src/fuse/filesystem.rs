@@ -261,31 +261,42 @@ impl Filesystem for GDriveFS {
                         }
                     }
                 } else if file_size >= SMALL_FILE_THRESHOLD {
-                    // Para archivos grandes multimedia, prefetch cabeceras + cola
+                    // Para archivos grandes multimedia, prefetch COMPLETO en background
+                    // Esto evita la descarga lenta chunk-por-chunk al abrir la imagen
                     let gdrive_id = self.get_gdrive_id(inode).await
                         .unwrap_or_else(|_| String::new());
                     
                     if !gdrive_id.is_empty() {
-                        debug!("🎬 Prefetching cabeceras+cola: inode={} size={} mime={}", 
-                               inode, file_size, mime_type);
-                        
-                        let db = self.db.clone();
-                        let drive_client = self.drive_client.clone();
-                        let gdrive_id_owned = gdrive_id.clone();
                         let cache_path = self.get_cache_path(&gdrive_id);
                         
-                        tokio::spawn(async move {
-                            if let Err(e) = Self::prefetch_headers_and_tail(
-                                &db,
-                                &drive_client,
-                                inode,
-                                &gdrive_id_owned,
-                                &cache_path,
-                                file_size
-                            ).await {
-                                error!("Error en prefetch cabeceras: {}", e);
-                            }
-                        });
+                        // Solo pre-descargar si no está completamente cacheado
+                        if !cache_path.exists() || 
+                           tokio::fs::metadata(&cache_path).await.ok()
+                               .map(|m| m.len() != file_size).unwrap_or(true) {
+                            
+                            debug!("🎬 Prefetching multimedia completo (grande): inode={} size={} mime={}", 
+                                   inode, file_size, mime_type);
+                            
+                            let db = self.db.clone();
+                            let drive_client = self.drive_client.clone();
+                            let gdrive_id_owned = gdrive_id.clone();
+                            let cache_path_owned = cache_path.clone();
+                            
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::prefetch_entire_file(
+                                    &db,
+                                    &drive_client,
+                                    inode,
+                                    &gdrive_id_owned,
+                                    &cache_path_owned,
+                                    file_size
+                                ).await {
+                                    error!("Error en prefetch multimedia grande: {}", e);
+                                }
+                            });
+                        } else {
+                            tracing::info!("✅ Prefetch cabeceras+cola completado");
+                        }
                     }
                 }
             }
@@ -975,15 +986,27 @@ impl GDriveFS {
             return Ok(()); // Fuera de rango, nada que hacer
         }
 
-        // Obtener rangos faltantes de la DB
+        let cache_path = self.get_cache_path(gdrive_id);
+        
+        // OPTIMIZACIÓN CRÍTICA: Verificar primero si el archivo caché está COMPLETO
+        // Esto evita consultar la DB para archivos ya completamente cacheados
+        if let Ok(metadata) = tokio::fs::metadata(&cache_path).await {
+            if metadata.len() == file_size {
+                // Archivo completo en disco - no necesitamos consultar la DB
+                tracing::debug!("✅ Rango ya cacheado (fast-path): inode={} offset={} size={}", inode, offset, size);
+                return Ok(());
+            }
+        }
+
+        // Solo si el archivo no está completo, consultar la DB para rangos faltantes
         let missing_ranges = self.db.get_missing_ranges(inode, requested_start, requested_end).await?;
         
+
         if missing_ranges.is_empty() {
             tracing::debug!("✅ Rango ya cacheado: inode={} offset={} size={}", inode, offset, size);
             return Ok(());
         }
 
-        let cache_path = self.get_cache_path(gdrive_id);
         
         // Crear directorio de caché si no existe
         if let Some(parent) = cache_path.parent() {
@@ -1071,26 +1094,90 @@ impl GDriveFS {
         cache_path: &std::path::Path,
         file_size: u64,
     ) -> anyhow::Result<()> {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
         
         // Crear directorio de caché si no existe
         if let Some(parent) = cache_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         
-        // Descargar archivo completo
-        tracing::info!("📥 Descargando archivo completo: {} bytes", file_size);
-        let data = drive_client.download_chunk(gdrive_id, 0, file_size as u32).await?;
+        // Para archivos pequeños (<5MB), descargar en una sola solicitud
+        const SINGLE_DOWNLOAD_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MB
         
-        // Escribir a caché
-        let mut file = tokio::fs::File::create(cache_path).await?;
-        file.write_all(&data).await?;
-        file.flush().await?;
+        if file_size < SINGLE_DOWNLOAD_THRESHOLD {
+            // Descargar archivo completo en una solicitud
+            tracing::info!("📥 Descargando archivo completo: {} bytes", file_size);
+            let data = drive_client.download_chunk(gdrive_id, 0, file_size as u32).await?;
+            
+            // Escribir a caché
+            let mut file = tokio::fs::File::create(cache_path).await?;
+            file.write_all(&data).await?;
+            file.flush().await?;
+            
+            // Registrar en DB como completamente cacheado
+            db.add_cached_chunk(inode, 0, file_size - 1).await?;
+            
+            tracing::info!("✅ Archivo multimedia completo cacheado: {} bytes", file_size);
+            return Ok(());
+        }
         
-        // Registrar en DB como completamente cacheado
-        db.add_cached_chunk(inode, 0, file_size - 1).await?;
+        // Para archivos grandes, descargar en chunks paralelos
+        const CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2MB chunks para descarga paralela
+        const MAX_CONCURRENT: usize = 4; // Máximo 4 descargas simultáneas
         
-        tracing::info!("✅ Archivo multimedia completo cacheado: {} bytes", file_size);
+        tracing::info!("📥 Descargando archivo grande en chunks paralelos: {} bytes", file_size);
+        
+        // Crear el archivo de caché vacío primero
+        tokio::fs::File::create(cache_path).await?;
+        
+        // Calcular rangos de chunks
+        let mut chunks: Vec<(u64, u64)> = Vec::new();
+        let mut offset = 0u64;
+        while offset < file_size {
+            let end = (offset + CHUNK_SIZE - 1).min(file_size - 1);
+            chunks.push((offset, end));
+            offset = end + 1;
+        }
+        
+        // Descargar en lotes paralelos
+        for batch in chunks.chunks(MAX_CONCURRENT) {
+            let download_tasks: Vec<_> = batch.iter().map(|&(start, end)| {
+                let drive_client = drive_client.clone();
+                let gdrive_id = gdrive_id.to_string();
+                let db = db.clone();
+                let cache_path = cache_path.to_path_buf();
+                
+                tokio::spawn(async move {
+                    let chunk_size = (end - start + 1) as u32;
+                    let data = drive_client.download_chunk(&gdrive_id, start, chunk_size).await?;
+                    
+                    // Escribir en la posición correcta del archivo
+                    let mut file = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&cache_path)
+                        .await?;
+                    file.seek(std::io::SeekFrom::Start(start)).await?;
+                    file.write_all(&data).await?;
+                    file.flush().await?;
+                    
+                    // Registrar chunk en DB
+                    db.add_cached_chunk(inode, start, end).await?;
+                    
+                    Ok::<_, anyhow::Error>(())
+                })
+            }).collect();
+            
+            // Esperar a que el lote complete
+            for result in futures_util::future::join_all(download_tasks).await {
+                match result {
+                    Ok(Ok(_)) => {},
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => return Err(anyhow::anyhow!("Task panicked: {}", e)),
+                }
+            }
+        }
+        
+        tracing::info!("✅ Archivo multimedia grande cacheado: {} bytes", file_size);
         Ok(())
     }
 

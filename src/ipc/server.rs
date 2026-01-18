@@ -206,13 +206,33 @@ async fn resolve_path_to_inode_and_gdrive_id(
 /// Consulta el estado de sincronización en sync_state
 async fn get_sync_state(
     db: &MetadataRepository,
-    cache_dir: &std::path::Path,
+    _cache_dir: &std::path::Path,
     inode: u64,
-    gdrive_id: &str,
+    _gdrive_id: &str,
 ) -> Result<SyncStatus> {
-    // Verificar si el archivo tiene cache local
-    let cache_path = cache_dir.join(gdrive_id);
-    let has_local_cache = cache_path.exists();
+    // Obtener el tamaño esperado del archivo desde la base de datos
+    let expected_size: Option<i64> = sqlx::query_scalar(
+        "SELECT size FROM attrs WHERE inode = ?"
+    )
+    .bind(inode as i64)
+    .fetch_optional(db.pool())
+    .await?;
+    
+    // Verificar si el archivo está COMPLETAMENTE cacheado usando file_cache_chunks
+    // Esta es la forma correcta ya que usamos caché por chunks, no archivos completos
+    let has_complete_cache = if let Some(expected) = expected_size {
+        if expected == 0 {
+            // Archivos vacíos siempre están "completos"
+            true
+        } else {
+            // Verificar si hay rangos faltantes en todo el archivo
+            let missing_ranges = db.get_missing_ranges(inode, 0, (expected - 1) as u64).await?;
+            missing_ranges.is_empty()
+        }
+    } else {
+        // Si no hay tamaño esperado, asumimos no cacheado
+        false
+    };
     
     // Consultar si está dirty
     let result = sqlx::query_as::<_, (bool, Option<i64>)>(
@@ -230,20 +250,20 @@ async fn get_sync_state(
             } else if dirty {
                 // Cambios locales pendientes de subir
                 Ok(SyncStatus::LocalOnly)
-            } else if has_local_cache {
-                // Sincronizado y disponible localmente
+            } else if has_complete_cache {
+                // Sincronizado y completamente disponible localmente
                 Ok(SyncStatus::Synced)
             } else {
-                // En Drive pero no descargado localmente
+                // En Drive pero no descargado completamente
                 Ok(SyncStatus::CloudOnly)
             }
         }
         None => {
             // Sin registro en sync_state
-            if has_local_cache {
+            if has_complete_cache {
                 Ok(SyncStatus::Synced)
             } else {
-                // Archivo solo en la nube
+                // Archivo solo en la nube o parcialmente cacheado
                 Ok(SyncStatus::CloudOnly)
             }
         }

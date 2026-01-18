@@ -92,6 +92,67 @@ impl MetadataRepository {
         .execute(&self.pool)
         .await?;
 
+        // 4. Migración: Corregir PRIMARY KEY de dentry_deleted
+        // Verificar si la tabla tiene la PK incorrecta
+        let has_old_pk = sqlx::query(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='dentry_deleted'"
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .and_then(|row: sqlx::sqlite::SqliteRow| {
+            use sqlx::Row;
+            let sql: String = row.get("sql");
+            Some(sql.contains("PRIMARY KEY (parent_inode, name)"))
+        })
+        .unwrap_or(false);
+
+        if has_old_pk {
+            tracing::info!("Aplicando migración: Corrigiendo PRIMARY KEY de dentry_deleted");
+            
+            // Renombrar tabla vieja
+            sqlx::query("ALTER TABLE dentry_deleted RENAME TO dentry_deleted_old")
+                .execute(&self.pool)
+                .await?;
+            
+            // Crear nueva tabla con PK correcto
+            sqlx::query(
+                r#"
+                CREATE TABLE dentry_deleted (
+                    parent_inode INTEGER NOT NULL,
+                    child_inode INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    deleted_at INTEGER NOT NULL,
+                    PRIMARY KEY (child_inode)
+                )
+                "#
+            )
+            .execute(&self.pool)
+            .await?;
+            
+            // Migrar datos (eliminando duplicados por child_inode)
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO dentry_deleted (parent_inode, child_inode, name, deleted_at)
+                SELECT parent_inode, child_inode, name, deleted_at
+                FROM dentry_deleted_old
+                "#
+            )
+            .execute(&self.pool)
+            .await?;
+            
+            // Eliminar tabla vieja
+            sqlx::query("DROP TABLE dentry_deleted_old")
+                .execute(&self.pool)
+                .await?;
+            
+            // Recrear índice
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_tombstone_deleted_at ON dentry_deleted(deleted_at)")
+                .execute(&self.pool)
+                .await?;
+            
+            tracing::info!("Migración de dentry_deleted completada");
+        }
+
         Ok(())
     }
 
@@ -403,12 +464,14 @@ impl MetadataRepository {
             .execute(&self.pool)
             .await?;
 
-        // 3. Marcar deleted_at en sync_state
+        // 3. Marcar deleted_at en sync_state Y dirty=1 para forzar sync
         sqlx::query(
             r#"
             INSERT INTO sync_state (inode, dirty, version, deleted_at)
-            VALUES (?, 0, 0, ?)
-            ON CONFLICT(inode) DO UPDATE SET deleted_at = excluded.deleted_at
+            VALUES (?, 1, 0, ?)
+            ON CONFLICT(inode) DO UPDATE SET 
+                deleted_at = excluded.deleted_at,
+                dirty = 1
             "#
         )
         .bind(inode as i64)

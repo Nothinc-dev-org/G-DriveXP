@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS dentry_deleted (
     child_inode INTEGER NOT NULL,
     name TEXT NOT NULL,
     deleted_at INTEGER NOT NULL,
-    PRIMARY KEY (parent_inode, name)
+    PRIMARY KEY (child_inode)
 );
 CREATE INDEX IF NOT EXISTS idx_tombstone_deleted_at ON dentry_deleted(deleted_at);
 
