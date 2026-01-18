@@ -5,6 +5,9 @@ pub enum DriveError {
     #[error("Permisos insuficientes: {0}")]
     InsufficientPermissions(String),
     
+    #[error("Archivo no encontrado: {0}")]
+    NotFound(String),
+    
     #[error("Error de red: {0}")]
     Network(#[from] reqwest::Error),
     
@@ -22,6 +25,6 @@ impl DriveError {
     /// Retorna true si el error es permanente (no vale la pena reintentar)
     #[allow(dead_code)] // Método auxiliar para uso futuro
     pub fn is_permanent(&self) -> bool {
-        matches!(self, DriveError::InsufficientPermissions(_))
+        matches!(self, DriveError::InsufficientPermissions(_) | DriveError::NotFound(_))
     }
 }

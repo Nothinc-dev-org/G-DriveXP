@@ -64,3 +64,14 @@ CREATE INDEX IF NOT EXISTS idx_tombstone_deleted_at ON dentry_deleted(deleted_at
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
+-- Directorios locales a sincronizar con Google Drive
+CREATE TABLE IF NOT EXISTS local_sync_dirs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_path TEXT UNIQUE NOT NULL,       -- Ruta local absoluta (ej: /home/user/Documentos)
+    gdrive_folder_id TEXT,                 -- ID de la carpeta en GDrive (nullable si no existe aún)
+    enabled BOOLEAN DEFAULT 1,             -- Switch para activar/desactivar
+    last_sync INTEGER DEFAULT 0,           -- Timestamp de la última sincronización completa
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_local_sync_enabled ON local_sync_dirs(enabled) WHERE enabled=1;
+

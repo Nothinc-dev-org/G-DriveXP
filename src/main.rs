@@ -92,6 +92,9 @@ pub fn run_backend(
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cargando base de datos...".to_string()));
         let db = Arc::new(db::MetadataRepository::new(&config.db_path).await?);
         
+        // Enviar DB a la GUI para que pueda gestionar directorios locales
+        ui_sender.input(gui::app_model::AppMsg::SetDatabase(db.clone()));
+        
         // Inicializar cliente de Google Drive
         let authenticator = oauth_manager.get_authenticator().await?;
         let drive_client = Arc::new(gdrive::client::DriveClient::new(authenticator));
@@ -138,6 +141,11 @@ pub fn run_backend(
         );
         let _ipc_handle = ipc_server.spawn();
         
+
+        
+        // Fase 2.6: Local Watcher ELIMINADO (Reemplazado por estrategia de Symlinks)
+        tracing::info!("Local Watcher desactivado (usando enlaces simbólicos)");
+        
         // CRITICAL: Limpiar punto de montaje huérfano antes de intentar montar
         utils::mount::cleanup_if_needed(&config.mount_point)
             .context("Error al limpiar punto de montaje huérfano")?;
@@ -166,6 +174,19 @@ pub fn run_backend(
         
         tracing::info!("✅ Sistema de archivos montado exitosamente");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Sistema de archivos montado y activo".to_string()));
+
+        // Fase 2.5: LocalSyncManager (sincronización bidireccional de carpetas locales)
+        // INICIO DIFERIDO: Se inicia después de que el montaje FUSE está activo para evitar race conditions
+        tracing::info!("Iniciando LocalSyncManager...");
+        let (local_sync_manager, local_sync_sender) = sync::local_sync_manager::LocalSyncManager::new(
+            db.clone(),
+            config.mount_point.clone(),
+        );
+        let _local_sync_handle = local_sync_manager.spawn();
+        
+        // Enviar el sender al GUI para que pueda disparar sincronizaciones
+        ui_sender.input(gui::app_model::AppMsg::SetLocalSyncSender(local_sync_sender));
+
         
         // Esperar a que termine la sesión O sea interrumpida por Ctrl+C
         tokio::select! {

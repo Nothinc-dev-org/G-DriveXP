@@ -26,6 +26,40 @@ impl DriveClient {
         Self { hub }
     }
 
+    /// Obtiene el ID canónico de la carpeta 'root' (My Drive)
+    pub async fn get_root_file_id(&self) -> Result<String> {
+        let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
+            .await
+            .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
+            .context("No se obtuvo ningún token válido")?;
+
+        let client = reqwest::Client::new();
+        let url = "https://www.googleapis.com/drive/v3/files/root?fields=id";
+
+        let response = client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .context("Error de red al obtener root id")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!("Error API Drive get_root_id: {} - {}", status, body);
+            anyhow::bail!("Error API Drive get_root_id: {} - {}", status, body);
+        }
+
+        #[derive(serde::Deserialize)]
+        struct FileId {
+            id: String,
+        }
+
+        let file: FileId = response.json().await?;
+        tracing::info!("Drive Root ID identificado como: {}", file.id);
+        Ok(file.id)
+    }
+
     /// Descarga un chunk específico de un archivo usando Range Header
     pub async fn download_chunk(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>> {
         let end = offset + size as u64 - 1;
@@ -423,10 +457,115 @@ impl DriveClient {
                 ));
             }
             
+            // Detectar error 404 de archivo no encontrado
+            if status == 404 {
+                return Err(super::DriveError::NotFound(
+                    format!("Archivo no existe en Drive: {}", file_id)
+                ));
+            }
+            
             return Err(super::DriveError::ApiError(format!("{} - {}", status, body)));
         }
 
         tracing::info!("✅ Archivo movido a papelera: {}", file_id);
+        Ok(())
+    }
+    /// Obtiene metadatos completos de un archivo (para detectar cambios de nombre/padre y contenido)
+    pub async fn get_file_metadata(&self, file_id: &str) -> Result<google_drive3::api::File> {
+        let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
+            .await
+            .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
+            .context("No se obtuvo ningún token válido")?;
+
+        let client = reqwest::Client::new();
+        // Solicitamos name, parents y md5Checksum
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType",
+            file_id
+        );
+
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .context("Error de red al obtener metadata")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!("Error API Drive get_file_metadata: {} - {}", status, body);
+            anyhow::bail!("Error API Drive get_file_metadata: {} - {}", status, body);
+        }
+
+        let file: google_drive3::api::File = response.json()
+            .await
+            .context("Error al parsear respuesta de get_file_metadata")?;
+
+        Ok(file)
+    }
+
+    /// Actualiza solo los metadatos de un archivo (nombre, padres, modifiedTime)
+    pub async fn update_file_metadata(
+        &self,
+        file_id: &str,
+        new_name: Option<&str>,
+        add_parent: Option<&str>,
+        remove_parent: Option<&str>,
+        new_mtime: Option<google_drive3::chrono::DateTime<google_drive3::chrono::Utc>>,
+    ) -> Result<()> {
+        tracing::info!("📝 Actualizando metadatos de archivo: {} (name={:?}, mtime={:?})", 
+                       file_id, new_name, new_mtime);
+
+        let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
+            .await
+            .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
+            .context("No se obtuvo ningún token válido")?;
+
+        let mut url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
+        
+        // Query params
+        let mut params = Vec::new();
+        if let Some(parent) = add_parent {
+            params.push(format!("addParents={}", parent));
+        }
+        if let Some(parent) = remove_parent {
+            params.push(format!("removeParents={}", parent));
+        }
+        
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+
+        // Body with explicit fields to update
+        let mut json_map = serde_json::Map::new();
+        if let Some(name) = new_name {
+            json_map.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+        }
+        if let Some(mtime) = new_mtime {
+            // Google Drive espera RFC3339
+            use google_drive3::chrono::SecondsFormat;
+            json_map.insert("modifiedTime".to_string(), serde_json::Value::String(mtime.to_rfc3339_opts(SecondsFormat::Secs, true)));
+        }
+
+        let client = reqwest::Client::new();
+        let response = client
+            .patch(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&json_map)
+            .send()
+            .await
+            .context("Error de red al actualizar metadatos")?;
+
+        if !response.status().is_success() {
+             let status = response.status();
+             let body = response.text().await.unwrap_or_default();
+             tracing::error!("Error API Drive update_file_metadata: {} - {}", status, body);
+             anyhow::bail!("Error API Drive update_file_metadata: {} - {}", status, body);
+        }
+
+        tracing::info!("✅ Metadatos actualizados para: {}", file_id);
         Ok(())
     }
 }

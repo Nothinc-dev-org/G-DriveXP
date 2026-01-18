@@ -220,13 +220,14 @@ impl Uploader {
     async fn update_file(&self, inode: u64, gdrive_id: &str) -> Result<()> {
         info!("📤 Actualizando archivo en GDrive: {} (inode={})", gdrive_id, inode);
         
-        // 1. Obtener MD5 remoto conocido de la DB
+        // 1. Obtener Metadatos remotos completos (Name, Parent, MD5)
+        let remote_meta = self.client.get_file_metadata(gdrive_id).await?;
+        let current_remote_md5 = remote_meta.md5_checksum;
+        let current_remote_name = remote_meta.name.unwrap_or_default();
+
         let known_md5 = self.db.get_remote_md5(inode).await?;
         
-        // 2. Consultar MD5 actual del servidor
-        let current_remote_md5 = self.client.get_file_md5(gdrive_id).await?;
-        
-        // 3. Detectar conflicto: si ambos existen y son diferentes
+        // 2. Detectar conflicto: si ambos existen y son diferentes
         if let (Some(known), Some(current)) = (&known_md5, &current_remote_md5) {
             if known != current {
                 warn!("⚠️ CONFLICTO DETECTADO: archivo remoto cambió desde la última sync");
@@ -236,15 +237,103 @@ impl Uploader {
             }
         }
         
+        // 3. Detectar Cambio de Nombre (Rename) y MTime local vs remoto
+        let local_name = self.get_file_name(inode).await?;
+        let local_mtime: i64 = sqlx::query_scalar("SELECT mtime FROM attrs WHERE inode = ?")
+            .bind(inode as i64)
+            .fetch_optional(self.db.pool())
+            .await?
+            .unwrap_or(0);
+        
+        let mut metadata_updated = false;
+        let mut new_name: Option<&str> = None;
+        let mut new_mtime: Option<google_drive3::chrono::DateTime<google_drive3::chrono::Utc>> = None;
+
+        if local_name != current_remote_name {
+            info!("🔄 Detectado cambio de nombre: '{}' -> '{}'", current_remote_name, local_name);
+            new_name = Some(local_name.as_str());
+            metadata_updated = true;
+        }
+
+        if let Some(remote_mtime) = remote_meta.modified_time {
+             let remote_secs = remote_mtime.timestamp();
+             // Tolerancia de 2 segundos para evitar loops por diferencias de precisión
+             if (local_mtime - remote_secs).abs() > 2 {
+                 info!("🔄 Detectado cambio de fecha: Remote={} vs Local={}", remote_secs, local_mtime);
+                 use google_drive3::chrono::TimeZone;
+                 let dt = google_drive3::chrono::Utc.timestamp_opt(local_mtime, 0).single()
+                     .ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+                 new_mtime = Some(dt);
+                 metadata_updated = true;
+             }
+        }
+
+        if metadata_updated {
+             self.client.update_file_metadata(gdrive_id, new_name, None, None, new_mtime).await?;
+        }
+
         // 4. Ruta del archivo en caché
         let cache_path = self.cache_dir.join(gdrive_id);
         
         if !cache_path.exists() {
+            // Si solo cambiamos metadata (nombre) y el archivo no está en caché, es un RENOMBRADO válido.
+            if metadata_updated {
+                info!("✅ Renombrado completado sin cambios de contenido (sin caché).");
+                // Marcar como limpio
+                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                    .bind(inode as i64)
+                    .execute(self.db.pool())
+                    .await?;
+                self.history.log(ActionType::Sync, format!("Renombrado: {}", local_name));
+                return Ok(());
+            }
+
             warn!("Archivo de caché no existe para actualización: {:?}", cache_path);
-            return Ok(()); // Skip
+            
+            // FIX: Si el archivo está marcado como dirty pero no tiene caché local,
+            // está en un estado inconsistente. Limpiamos dirty para desbloquear el estado
+            // y permitir que se muestre como CloudOnly/Synced.
+            info!("⚠️ Corrigiendo estado inconsistente: dirty=1 pero sin caché local. Reseteando a dirty=0.");
+            
+            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await?;
+                
+            self.history.log(ActionType::Sync, format!("Estado corregido (sin caché): {}", gdrive_id));
+
+            return Ok(()); 
         }
         
-        // 5. Actualizar contenido usando la API
+        // 5. OPTIMIZACIÓN: Verificar si el contenido local es idéntico al remoto
+        // Esto evita re-subir archivos que solo fueron "tocados" o migrados sin cambios reales
+        match crate::utils::hash::compute_file_md5(&cache_path).await {
+            Ok(local_md5) => {
+                // Verificar contra el MD5 remoto actual (si existe)
+                if let Some(remote_md5) = &current_remote_md5 {
+                     if &local_md5 == remote_md5 {
+                         info!("✨ OPTIMIZACIÓN: El contenido local de {} es idéntico al remoto. Saltando subida.", gdrive_id);
+                         
+                         // Actualizar estado para reflejar que está sincronizado
+                         self.db.set_remote_md5(inode, remote_md5).await?;
+                         
+                         sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                            .bind(inode as i64)
+                            .execute(self.db.pool())
+                            .await?;
+                            
+                         self.history.log(ActionType::Sync, format!("Verificado sin cambios: {}", gdrive_id));
+                         return Ok(());
+                     }
+                }
+            }
+            Err(e) => {
+                warn!("No se pudo calcular MD5 local para optimización: {:?}", e);
+                // Continuar con la subida normal
+            }
+        }
+
+        // 6. Actualizar contenido usando la API
         self.client.update_file_content(gdrive_id, &cache_path).await
             .context("Error actualizando archivo")?;
         
@@ -302,6 +391,12 @@ impl Uploader {
                     );
                     
                     return Ok(());
+                }
+                Err(crate::gdrive::DriveError::NotFound(_)) => {
+                    // Archivo ya no existe en Drive: limpiar estado local y continuar
+                    info!("ℹ️ Archivo ya eliminado en Drive: {}. Limpiando estado local.", gdrive_id);
+                    self.history.log(ActionType::Delete, format!("Archivo ya eliminado en Drive: {}", gdrive_id));
+                    // Continuar para limpiar dirty flag abajo
                 }
                 Err(e) => {
                     // Otros errores transitorios: propagar para reintentar

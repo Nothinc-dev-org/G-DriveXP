@@ -1,5 +1,6 @@
 use relm4::prelude::*;
 use gtk::prelude::*;
+use gtk::glib;
 use libadwaita as adw;
 use adw::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -13,6 +14,9 @@ pub struct AppModel {
     pub mount_point: Option<std::path::PathBuf>,
     pub sync_paused: Arc<AtomicBool>,
     pub history: ActionHistory,
+    pub local_dirs: Vec<crate::db::LocalSyncDir>,
+    pub db: Option<Arc<crate::db::MetadataRepository>>,
+    pub local_sync_sender: Option<crate::sync::local_sync_manager::LocalSyncCommandSender>,
 }
 
 #[derive(Debug)]
@@ -20,6 +24,7 @@ pub enum AppMsg {
     UpdateStatus(String),
     SetConnected(bool),
     SetMountPoint(std::path::PathBuf),
+    SetDatabase(Arc<crate::db::MetadataRepository>),
     OpenInNautilus,
     TogglePauseSync,
     Logout,
@@ -28,6 +33,13 @@ pub enum AppMsg {
     ShowWindow,
     // Mensajes para el historial
     LogAction(ActionType, String),
+    // Mensajes para sincronización local
+    AddLocalDir,
+    RemoveLocalDir(i64),
+    ToggleLocalDir(i64, bool),
+    RefreshLocalDirs,
+    SetLocalDirs(Vec<crate::db::LocalSyncDir>),
+    SetLocalSyncSender(crate::sync::local_sync_manager::LocalSyncCommandSender),
 }
 
 #[relm4::component(pub)]
@@ -134,6 +146,44 @@ impl Component for AppModel {
                                 },
                             },
 
+                            // Sección Sincronización Local
+                            append = &adw::PreferencesGroup {
+                                set_title: "Sincronización Local",
+                                set_description: Some("Sincronice carpetas locales con Google Drive"),
+
+                                #[wrap(Some)]
+                                set_header_suffix = &gtk::Button {
+                                    set_icon_name: "list-add-symbolic",
+                                    set_valign: gtk::Align::Center,
+                                    add_css_class: "flat",
+                                    set_tooltip_text: Some("Añadir directorio"),
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(AppMsg::AddLocalDir);
+                                    },
+                                },
+
+                                // Mostrar lista de directorios configurados
+                                add = &adw::ActionRow {
+                                    #[watch]
+                                    set_title: &if model.local_dirs.is_empty() {
+                                        "No hay directorios configurados".to_string()
+                                    } else {
+                                        format!("{} directorio(s) configurado(s)", model.local_dirs.len())
+                                    },
+                                    
+                                    #[watch]
+                                    set_subtitle: &model.local_dirs.iter()
+                                        .map(|d| d.local_path.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+
+                                    add_prefix = &gtk::Image {
+                                        set_icon_name: Some("folder-symbolic"),
+                                    },
+                                },
+                            },
+
                             // Sección Cuenta
                             append = &adw::PreferencesGroup {
                                 set_title: "Account",
@@ -176,6 +226,9 @@ impl Component for AppModel {
             mount_point: None,
             sync_paused: sync_paused.clone(),
             history: history.clone(),
+            local_dirs: Vec::new(),
+            db: None,
+            local_sync_sender: None,
         };
 
         // Iniciar icono de bandeja
@@ -214,7 +267,7 @@ impl Component for AppModel {
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>, root: &Self::Root) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match msg {
             AppMsg::UpdateStatus(msg) => {
                 self.status_message = msg;
@@ -276,6 +329,163 @@ impl Component for AppModel {
             AppMsg::ShowWindow => {
                 root.present();
             }
+            AppMsg::SetDatabase(db) => {
+                self.db = Some(db);
+                // Cargar directorios al recibir la base de datos
+                sender.input(AppMsg::RefreshLocalDirs);
+            }
+            AppMsg::AddLocalDir => {
+                #[allow(deprecated)]
+                let dialog = gtk::FileChooserDialog::new(
+                    Some("Seleccionar directorio"),
+                    gtk::Window::NONE,
+                    gtk::FileChooserAction::SelectFolder,
+                    &[("Cancelar", gtk::ResponseType::Cancel), ("Añadir", gtk::ResponseType::Accept)],
+                );
+
+                let sender_clone = sender.clone();
+                let db_clone = self.db.clone();
+                let local_sync_sender_clone = self.local_sync_sender.clone();
+                let existing_dirs = self.local_dirs.iter()
+                    .map(|d| std::path::PathBuf::from(&d.local_path))
+                    .collect::<Vec<_>>();
+
+                #[allow(deprecated)]
+                dialog.connect_response(move |dialog, response| {
+                    if response == gtk::ResponseType::Accept {
+                        #[allow(deprecated)]
+                        if let Some(file) = dialog.file() {
+                            if let Some(path) = file.path() {
+                                // Validar anidamiento
+                                if let Err(e) = validate_local_dir(&path, &existing_dirs) {
+                                    tracing::error!("Validación falló: {}", e);
+                                    return;
+                                }
+
+                                // Añadir a la base de datos (async)
+                                if let Some(db) = &db_clone {
+                                    let db_clone2 = db.clone();
+                                    let sender_clone2 = sender_clone.clone();
+                                    let path_clone = path.clone();
+                                    let local_sync_sender_inner = local_sync_sender_clone.clone();
+                                    
+                                    glib::spawn_future_local(async move {
+                                        match db_clone2.add_local_sync_dir(&path_clone).await {
+                                            Ok(id) => {
+                                                tracing::info!("Directorio añadido: {} (id={})", path_clone.display(), id);
+                                                
+                                                // Disparar inicialización en GDrive mediante el LocalSyncManager
+                                                if let Some(sync_sender) = &local_sync_sender_inner {
+                                                    let cmd = crate::sync::local_sync_manager::LocalSyncCommand::InitializeFolder {
+                                                        sync_dir_id: id,
+                                                        local_path: path_clone.clone(),
+                                                    };
+                                                    if let Err(e) = sync_sender.send(cmd).await {
+                                                        tracing::error!("Error enviando comando de inicialización: {:?}", e);
+                                                    }
+                                                }
+                                                
+                                                sender_clone2.input(AppMsg::RefreshLocalDirs);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Error al añadir directorio: {:?}", e);
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    dialog.close();
+                });
+
+                dialog.set_modal(true);
+                dialog.set_visible(true);
+            }
+            AppMsg::RemoveLocalDir(id) => {
+                let dir = self.local_dirs.iter().find(|d| d.id == id);
+                if let Some(dir) = dir {
+                    let dialog = adw::AlertDialog::new(
+                        Some("¿Eliminar directorio?"),
+                        Some(&format!(
+                            "¿Desea eliminar '{}' de la sincronización?\n\nEsto NO eliminará los archivos locales.",
+                            dir.local_path
+                        )),
+                    );
+                    dialog.add_response("cancel", "Cancelar");
+                    dialog.add_response("remove", "Eliminar");
+                    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("cancel"));
+
+                    let sender_clone = sender.clone();
+                    let db_clone = self.db.clone();
+
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "remove" {
+                            if let Some(db) = &db_clone {
+                                let db_clone2 = db.clone();
+                                let sender_clone2 = sender_clone.clone();
+
+                                glib::spawn_future_local(async move {
+                                    match db_clone2.remove_local_sync_dir(id).await {
+                                        Ok(()) => {
+                                            sender_clone2.input(AppMsg::RefreshLocalDirs);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Error al eliminar directorio: {:?}", e);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+
+                   dialog.present(Some(root));
+                }
+            }
+            AppMsg::ToggleLocalDir(id, enabled) => {
+                if let Some(db) = &self.db {
+                    let db_clone = db.clone();
+                    let sender_clone = sender.clone();
+
+                    glib::spawn_future_local(async move {
+                        match db_clone.toggle_local_sync_dir(id, enabled).await {
+                            Ok(()) => {
+                                sender_clone.input(AppMsg::RefreshLocalDirs);
+                            }
+                            Err(e) => {
+                                tracing::error!("Error al toggle directorio: {:?}", e);
+                            }
+                        }
+                    });
+                }
+            }
+            AppMsg::RefreshLocalDirs => {
+                if let Some(db) = &self.db {
+                    let db_clone = db.clone();
+                    let sender_clone = sender.clone();
+
+                    glib::spawn_future_local(async move {
+                        match db_clone.get_local_sync_dirs().await {
+                            Ok(dirs) => {
+                                tracing::debug!("Directorios locales: {}", dirs.len());
+                                sender_clone.input(AppMsg::SetLocalDirs(dirs));
+                            }
+                            Err(e) => {
+                                tracing::error!("Error al cargar directorios: {:?}", e);
+                            }
+                        }
+                    });
+                }
+            }
+            AppMsg::SetLocalDirs(dirs) => {
+                tracing::info!("📋 Actualizando lista de directorios: {} elementos", dirs.len());
+                self.local_dirs = dirs;
+            }
+            AppMsg::SetLocalSyncSender(sync_sender) => {
+                tracing::info!("🔗 LocalSyncSender configurado");
+                self.local_sync_sender = Some(sync_sender);
+            }
             AppMsg::Quit => {
                 tracing::info!("Cerrando aplicación...");
                 
@@ -290,4 +500,30 @@ impl Component for AppModel {
             }
         }
     }
+}
+
+/// Valida que un directorio nuevo no esté anidado con los existentes
+fn validate_local_dir(
+    new_path: &std::path::Path,
+    existing: &[std::path::PathBuf],
+) -> Result<(), String> {
+    // 1. Verificar que no sea subdirectorio de uno existente
+    for existing_path in existing {
+        if new_path.starts_with(existing_path) {
+            return Err(format!(
+                "'{}' ya está contenido en '{}'",
+                new_path.display(),
+                existing_path.display()
+            ));
+        }
+        // 2. Verificar que ninguno existente sea subdirectorio del nuevo
+        if existing_path.starts_with(new_path) {
+            return Err(format!(
+                "'{}' contiene a '{}' que ya está sincronizado",
+                new_path.display(),
+                existing_path.display()
+            ));
+        }
+    }
+    Ok(())
 }

@@ -1,2 +1,2 @@
 pub mod repository;
-pub use repository::MetadataRepository;
+pub use repository::{MetadataRepository, LocalSyncDir};

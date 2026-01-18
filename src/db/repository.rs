@@ -3,6 +3,7 @@ use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use std::path::Path;
 
 /// Repositorio principal de metadatos basado en SQLite
+#[derive(Debug)]
 pub struct MetadataRepository {
     pool: SqlitePool,
 }
@@ -326,7 +327,17 @@ impl MetadataRepository {
     }
 
     /// Inserta o actualiza una entrada de directorio
+    /// IMPORTANTE: Un archivo solo puede tener UN parent. Antes de insertar,
+    /// eliminamos cualquier dentry existente para este child_inode.
     pub async fn upsert_dentry(&self, parent_inode: u64, child_inode: u64, name: &str) -> Result<()> {
+        // 1. Eliminar cualquier dentry anterior para este child_inode
+        //    (un archivo solo puede estar en un directorio a la vez)
+        sqlx::query("DELETE FROM dentry WHERE child_inode = ?")
+            .bind(child_inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        // 2. Insertar el nuevo dentry
         sqlx::query(
             r#"
             INSERT INTO dentry (parent_inode, child_inode, name)
@@ -560,30 +571,63 @@ impl MetadataRepository {
         let count = inodes_to_purge.len() as u64;
 
         for inode in &inodes_to_purge {
-            // Eliminar de todas las tablas relacionadas
-            sqlx::query("DELETE FROM dentry_deleted WHERE child_inode = ?")
-                .bind(inode)
-                .execute(&self.pool)
-                .await?;
-            
-            sqlx::query("DELETE FROM sync_state WHERE inode = ?")
-                .bind(inode)
-                .execute(&self.pool)
-                .await?;
-            
-            sqlx::query("DELETE FROM attrs WHERE inode = ?")
-                .bind(inode)
-                .execute(&self.pool)
-                .await?;
-            
-            sqlx::query("DELETE FROM inodes WHERE inode = ?")
-                .bind(inode)
-                .execute(&self.pool)
-                .await?;
+            self.hard_delete_inode(*inode as u64).await?;
         }
 
         tracing::info!("Purgados {} tombstones expirados (grace_days={})", count, grace_days);
         Ok(count)
+    }
+
+    /// Elimina permanentemente un inode y todos sus registros asociados
+    async fn hard_delete_inode(&self, inode: u64) -> Result<()> {
+        let inode_i64 = inode as i64;
+
+        // Eliminar de todas las tablas relacionadas
+        sqlx::query("DELETE FROM dentry WHERE child_inode = ?")
+            .bind(inode_i64)
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("DELETE FROM dentry_deleted WHERE child_inode = ?")
+            .bind(inode_i64)
+            .execute(&self.pool)
+            .await?;
+        
+        sqlx::query("DELETE FROM sync_state WHERE inode = ?")
+            .bind(inode_i64)
+            .execute(&self.pool)
+            .await?;
+        
+        sqlx::query("DELETE FROM attrs WHERE inode = ?")
+            .bind(inode_i64)
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("DELETE FROM file_cache_chunks WHERE inode = ?")
+            .bind(inode_i64)
+            .execute(&self.pool)
+            .await?;
+        
+        sqlx::query("DELETE FROM inodes WHERE inode = ?")
+            .bind(inode_i64)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::debug!("Hard delete completado para inode={}", inode);
+        Ok(())
+    }
+
+    /// Hard delete por gdrive_id: elimina permanentemente un archivo de la DB
+    /// Usado cuando un archivo es eliminado permanentemente de Google Drive
+    pub async fn hard_delete_by_gdrive_id(&self, gdrive_id: &str) -> Result<bool> {
+        let inode = match self.get_inode_by_gdrive_id(gdrive_id).await? {
+            Some(i) => i,
+            None => return Ok(false), // No existe, nada que eliminar
+        };
+
+        self.hard_delete_inode(inode).await?;
+        tracing::info!("Hard delete aplicado: gdrive_id={}, inode={}", gdrive_id, inode);
+        Ok(true)
     }
 
     // ============================================================
@@ -667,4 +711,115 @@ impl MetadataRepository {
 
         Ok(())
     }
+
+    // ============================================================
+    // Métodos para Local Sync Directories
+    // ============================================================
+
+    /// Añade un directorio local a la lista de sincronización
+    pub async fn add_local_sync_dir(&self, local_path: &Path) -> Result<i64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let path_str = local_path.to_string_lossy().to_string();
+
+        let id = sqlx::query(
+            r#"
+            INSERT INTO local_sync_dirs (local_path, enabled, created_at)
+            VALUES (?, 1, ?)
+            "#
+        )
+        .bind(&path_str)
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        tracing::info!("Directorio local añadido: {} (id={})", path_str, id);
+        Ok(id)
+    }
+
+    /// Elimina un directorio local de la sincronización
+    pub async fn remove_local_sync_dir(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM local_sync_dirs WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::info!("Directorio local eliminado: id={}", id);
+        Ok(())
+    }
+
+    /// Activa/desactiva la sincronización de un directorio local
+    pub async fn toggle_local_sync_dir(&self, id: i64, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE local_sync_dirs SET enabled = ? WHERE id = ?")
+            .bind(enabled)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::debug!("Directorio local {} (id={})", if enabled { "activado" } else { "desactivado" }, id);
+        Ok(())
+    }
+
+    /// Obtiene todos los directorios locales configurados
+    pub async fn get_local_sync_dirs(&self) -> Result<Vec<LocalSyncDir>> {
+        let dirs = sqlx::query_as::<_, LocalSyncDir>(
+            "SELECT id, local_path, gdrive_folder_id, enabled, last_sync, created_at FROM local_sync_dirs ORDER BY created_at"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(dirs)
+    }
+
+    /// Obtiene solo los directorios locales habilitados
+    pub async fn get_enabled_local_sync_dirs(&self) -> Result<Vec<LocalSyncDir>> {
+        let dirs = sqlx::query_as::<_, LocalSyncDir>(
+            "SELECT id, local_path, gdrive_folder_id, enabled, last_sync, created_at FROM local_sync_dirs WHERE enabled = 1 ORDER BY created_at"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(dirs)
+    }
+
+    /// Establece el gdrive_folder_id para un directorio local
+    pub async fn set_gdrive_folder_id(&self, id: i64, gdrive_id: &str) -> Result<()> {
+        sqlx::query("UPDATE local_sync_dirs SET gdrive_folder_id = ? WHERE id = ?")
+            .bind(gdrive_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::debug!("GDrive folder ID {} asociado a local_sync_dir id={}", gdrive_id, id);
+        Ok(())
+    }
+
+    /// Actualiza el timestamp de última sincronización
+    pub async fn update_last_sync(&self, id: i64) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        sqlx::query("UPDATE local_sync_dirs SET last_sync = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// Struct que representa un directorio local sincronizado
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LocalSyncDir {
+    pub id: i64,
+    pub local_path: String,
+    pub gdrive_folder_id: Option<String>,
+    pub enabled: bool,
+    pub last_sync: i64,
+    pub created_at: i64,
 }

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use tokio::sync::RwLock;
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
@@ -30,6 +31,7 @@ pub struct BackgroundSyncer {
     interval: Duration,
     history: ActionHistory,
     sync_paused: Arc<AtomicBool>,
+    root_id_cache: Arc<RwLock<Option<String>>>,
 }
 
 impl BackgroundSyncer {
@@ -47,6 +49,7 @@ impl BackgroundSyncer {
             interval: Duration::from_secs(interval_secs),
             history,
             sync_paused,
+            root_id_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -97,6 +100,9 @@ impl BackgroundSyncer {
     /// Ejecuta un ciclo de sincronización
     /// Retorna el número de cambios procesados
     async fn sync_once(&self) -> Result<usize> {
+        // Asegurarnos de tener el ID del root
+        let root_id = self.get_cached_root_id().await?;
+
         // 1. Obtener page_token guardado o solicitar uno nuevo
         let page_token = match self.db.get_sync_meta(SYNC_META_PAGE_TOKEN).await? {
             Some(token) => token,
@@ -116,7 +122,7 @@ impl BackgroundSyncer {
         
         // 3. Procesar cada cambio
         for change in changes {
-            if let Err(e) = self.process_change(change).await {
+            if let Err(e) = self.process_change(change, &root_id).await {
                 tracing::warn!("Error procesando cambio individual: {:?}", e);
                 // Continuamos con los demás
             }
@@ -137,15 +143,32 @@ impl BackgroundSyncer {
         Ok(changes_count)
     }
 
+    /// Obtiene el root_id cacheado o lo descarga
+    async fn get_cached_root_id(&self) -> Result<String> {
+        {
+            let guard = self.root_id_cache.read().await;
+            if let Some(id) = &*guard {
+                return Ok(id.clone());
+            }
+        }
+        tracing::info!("Obteniendo ID canónico de Google Drive root...");
+        let id = self.client.get_root_file_id().await?;
+        let mut guard = self.root_id_cache.write().await;
+        *guard = Some(id.clone());
+        Ok(id)
+    }
+
     /// Procesa un cambio individual de la API
-    async fn process_change(&self, change: google_drive3::api::Change) -> Result<()> {
+    async fn process_change(&self, change: google_drive3::api::Change, root_id: &str) -> Result<()> {
         let file_id = change.file_id.as_deref()
             .context("Cambio sin file_id")?;
 
-        // Caso 1: Archivo eliminado/trashed
+        // Caso 1: Archivo eliminado permanentemente (ya no existe en Drive)
         if change.removed == Some(true) {
-            tracing::debug!("Cambio detectado: REMOVED file_id={}", file_id);
-            self.db.soft_delete_by_gdrive_id(file_id).await?;
+            tracing::debug!("Cambio detectado: REMOVED (hard delete) file_id={}", file_id);
+            // El archivo fue eliminado permanentemente de Drive (incluyendo papelera vacía)
+            // → Hard delete: eliminar completamente de la DB local
+            self.db.hard_delete_by_gdrive_id(file_id).await?;
             return Ok(());
         }
 
@@ -190,7 +213,9 @@ impl BackgroundSyncer {
             // Actualizar dentry (árbol de directorios)
             if let Some(parents) = &file.parents {
                 for parent_id in parents {
-                    let parent_inode = if parent_id == "root" {
+                    // Google Drive usa "root" o el ID canónico (root_id) para el "My Drive" del usuario
+                    // Ambos deben mapearse al inode 1 (root del filesystem local)
+                    let parent_inode = if parent_id == "root" || parent_id == root_id {
                         1u64
                     } else {
                         self.db.get_or_create_inode(parent_id).await?
