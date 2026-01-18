@@ -153,7 +153,8 @@ pub fn run_backend(
         mount_options
             .uid(uid)
             .gid(gid)
-            .fs_name("fedoradrive");
+            .fs_name("fedoradrive")
+            .custom_options("exec"); // CRÍTICO: Permitir ejecución de binarios y .desktop
             
         tracing::info!("Montando sistema de archivos en {:?}...", config.mount_point);
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus(format!("Montando en {:?}...", config.mount_point)));

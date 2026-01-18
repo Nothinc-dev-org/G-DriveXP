@@ -248,19 +248,48 @@ impl Uploader {
         if gdrive_id.starts_with("temp_") {
             debug!("Archivo temporal nunca subido, marcando como limpio directamente");
         } else {
-            // Mover a papelera en GDrive
-            self.client.trash_file(gdrive_id).await
-                .context("Error moviendo archivo a papelera")?;
+            // Intentar mover a papelera en GDrive
+            match self.client.trash_file(gdrive_id).await {
+                Ok(()) => {
+                    info!("✅ Archivo eliminado en GDrive: {}", gdrive_id);
+                    self.history.log(ActionType::Delete, format!("Archivo eliminado: {}", gdrive_id));
+                }
+                Err(crate::gdrive::DriveError::InsufficientPermissions(msg)) => {
+                    // Error permanente: no podemos eliminar archivos compartidos
+                    warn!("⚠️ No se puede eliminar archivo compartido: {}", msg);
+                    warn!("   Restaurando archivo localmente para mantener consistencia con Drive");
+                    
+                    // RESTAURAR: deshacer el soft delete (eliminar deleted_at)
+                    sqlx::query("UPDATE sync_state SET deleted_at = NULL WHERE inode = ?")
+                        .bind(inode as i64)
+                        .execute(self.db.pool())
+                        .await?;
+                    
+                    // Marcar como limpio (no reintentar)
+                    sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                        .bind(inode as i64)
+                        .execute(self.db.pool())
+                        .await?;
+                    
+                    self.history.log(
+                        ActionType::Sync, 
+                        format!("Archivo compartido restaurado: {} (sin permisos de eliminación)", gdrive_id)
+                    );
+                    
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Otros errores transitorios: propagar para reintentar
+                    return Err(anyhow::anyhow!("Error moviendo archivo a papelera: {:?}", e));
+                }
+            }
         }
         
-        // Marcar como limpio
+        // Marcar como limpio (eliminación exitosa)
         sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
             .bind(inode as i64)
             .execute(self.db.pool())
             .await?;
-        
-        info!("✅ Archivo eliminado en GDrive: {} (inode={})", gdrive_id, inode);
-        self.history.log(ActionType::Delete, format!("Archivo eliminado: {}", gdrive_id));
         
         Ok(())
     }

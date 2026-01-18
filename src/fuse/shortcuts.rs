@@ -1,6 +1,8 @@
-/// Utilidades para generar accesos directos .desktop para archivos de Google Workspace
+/// Utilidades para generar accesos directos HTML para archivos de Google Workspace
+/// NOTA: Usamos HTML con meta-refresh en lugar de .desktop porque Nautilus 3.30+
+/// no ejecuta archivos .desktop desde montajes FUSE por políticas de seguridad.
 
-/// Genera el contenido de un archivo .desktop para un documento de Google Workspace
+/// Genera el contenido de un archivo HTML redirector para un documento de Google Workspace
 pub fn generate_desktop_entry(file_id: &str, name: &str, mime_type: &str) -> String {
     // Determinar la URL base según el tipo de documento
     let url = match mime_type {
@@ -25,25 +27,22 @@ pub fn generate_desktop_entry(file_id: &str, name: &str, mime_type: &str) -> Str
         }
     };
 
-    // Determinar el icono apropiado según el tipo
-    let icon = match mime_type {
-        "application/vnd.google-apps.document" => "x-office-document",
-        "application/vnd.google-apps.spreadsheet" => "x-office-spreadsheet",
-        "application/vnd.google-apps.presentation" => "x-office-presentation",
-        "application/vnd.google-apps.form" => "text-html",
-        "application/vnd.google-apps.drawing" => "image-x-generic",
-        _ => "text-html",
-    };
-
-    // Formato estándar FreeDesktop.org Desktop Entry
+    // Archivo HTML con meta-refresh que abre el navegador automáticamente
     format!(
-        "[Desktop Entry]\n\
-         Version=1.0\n\
-         Type=Link\n\
-         Name={}\n\
-         Icon={}\n\
-         URL={}\n",
-        name, icon, url
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="0; url={}">
+<title>{}</title>
+</head>
+<body>
+<p>Abriendo <a href="{}">{}</a>...</p>
+<script>window.location.href="{}";</script>
+</body>
+</html>
+"#,
+        url, name, url, name, url
     )
 }
 
@@ -65,21 +64,19 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_desktop_entry_document() {
+    fn test_generate_html_redirect_document() {
         let entry = generate_desktop_entry("ABC123", "Mi Documento", "application/vnd.google-apps.document");
         
-        assert!(entry.contains("[Desktop Entry]"));
-        assert!(entry.contains("Type=Link"));
-        assert!(entry.contains("Name=Mi Documento"));
+        assert!(entry.contains("<!DOCTYPE html>"));
+        assert!(entry.contains("<meta http-equiv=\"refresh\""));
         assert!(entry.contains("https://docs.google.com/document/d/ABC123/edit"));
-        assert!(entry.contains("Icon=x-office-document"));
+        assert!(entry.contains("<title>Mi Documento</title>"));
     }
 
     #[test]
-    fn test_generate_desktop_entry_spreadsheet() {
+    fn test_generate_html_redirect_spreadsheet() {
         let entry = generate_desktop_entry("XYZ789", "Hoja de Cálculo", "application/vnd.google-apps.spreadsheet");
         
         assert!(entry.contains("https://docs.google.com/spreadsheets/d/XYZ789/edit"));
-        assert!(entry.contains("Icon=x-office-spreadsheet"));
     }
 }

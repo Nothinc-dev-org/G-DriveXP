@@ -47,6 +47,15 @@ impl TokenStorage {
         let entry = Entry::new(&self.service, "refresh_token");
         entry.map(|e| e.get_password().is_ok()).unwrap_or(false)
     }
+    
+    /// Limpia todas las credenciales del keyring
+    #[allow(dead_code)] // Método auxiliar, usado indirectamente por clear_all_auth_data()
+    pub fn clear_all_credentials(&self) -> Result<()> {
+        let entry = Entry::new(&self.service, "refresh_token")?;
+        let _ = entry.delete_credential(); // Ignorar error si no existe
+        tracing::info!("Credenciales eliminadas del keyring");
+        Ok(())
+    }
 }
 
 impl Default for TokenStorage {

@@ -25,7 +25,7 @@ impl FileAttributes {
             mtime: Timestamp::new(self.mtime as i64, 0),
             ctime: Timestamp::new(self.ctime as i64, 0),
             kind: if self.is_dir { FileType::Directory } else { FileType::RegularFile },
-            perm: self.mode as u16,
+            perm: (self.mode & 0o7777) as u16,
             nlink: 1,
             uid: unsafe { libc::getuid() }, 
             gid: unsafe { libc::getgid() },

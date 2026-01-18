@@ -116,10 +116,15 @@ impl Filesystem for GDriveFS {
         // trace is enough for lookup
         tracing::trace!("lookup: parent={} name={}", parent, name_str);
 
+        // Para archivos Workspace, el usuario busca con .html pero en DB está sin extensión
+        let (lookup_name, is_html_lookup) = if name_str.ends_with(".html") {
+            (name_str.trim_end_matches(".html"), true)
+        } else {
+            (name_str, false)
+        };
+
         // Consultar la base de datos
-        // NOTA: Implementación temporal simulando que todo existe en SQLite
-        // En producción esto consultará realmente la DB
-        let inode = self.db.lookup(parent, name_str)
+        let inode = self.db.lookup(parent, lookup_name)
             .await
             .map_err(|e| {
                 error!("Error en lookup: {}", e);
@@ -135,9 +140,24 @@ impl Filesystem for GDriveFS {
                 Errno::from(libc::EIO)
             })?;
 
+        let mut file_attr = attrs.to_file_attr();
+
+        // Si es lookup de archivo Workspace (.html), ajustar tamaño al HTML generado
+        if is_html_lookup {
+            if let Some(ref mime) = attrs.mime_type {
+                if shortcuts::is_workspace_file(mime) {
+                    let gdrive_id = self.get_gdrive_id(inode).await
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    let html_content = shortcuts::generate_desktop_entry(&gdrive_id, lookup_name, mime);
+                    file_attr.size = html_content.len() as u64;
+                    file_attr.perm = 0o644;
+                }
+            }
+        }
+
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
-            attr: attrs.to_file_attr(),
+            attr: file_attr,
             generation: 0,
         })
     }
@@ -158,7 +178,7 @@ impl Filesystem for GDriveFS {
                 Errno::from(libc::ENOENT)
             })?;
 
-        // Si es archivo Workspace, ajustar el tamaño reportado al tamaño del .desktop
+        // Si es archivo Workspace, ajustar el tamaño reportado al tamaño del HTML
         let mut file_attr = attrs.to_file_attr();
         
         if let Some(ref mime) = attrs.mime_type {
@@ -168,12 +188,15 @@ impl Filesystem for GDriveFS {
                 let gdrive_id = self.get_gdrive_id(inode).await
                     .unwrap_or_else(|_| "unknown".to_string());
                     
-                let desktop_content = shortcuts::generate_desktop_entry(
+                let html_content = shortcuts::generate_desktop_entry(
                     &gdrive_id,
                     &name,
                     mime
                 );
-                file_attr.size = desktop_content.len() as u64;
+                file_attr.size = html_content.len() as u64;
+                // HTML no requiere permisos ejecutables
+                file_attr.perm = 0o644;
+                debug!("Workspace File (getattr): inode={} size={}", inode, file_attr.size);
             }
         }
 
@@ -523,11 +546,18 @@ impl Filesystem for GDriveFS {
                         }.to_file_attr()
                     };
 
-                    // Ajustar tamaño para archivos Workspace si tenemos los datos necesarios
-                    if let (Some(m), Some(gid)) = (mime, gdrive_id) {
-                        if shortcuts::is_workspace_file(&m) {
-                            let desktop_content = shortcuts::generate_desktop_entry(&gid, &name, &m);
-                            attr.size = desktop_content.len() as u64;
+                    // Ajustar nombre y tamaño para archivos Workspace - SOLO para ARCHIVOS, no carpetas
+                    // Añadimos .html porque Nautilus 3.30+ abre .desktop desde FUSE como texto
+                    let mut display_name = name.clone();
+                    if !is_dir {
+                        if let (Some(m), Some(gid)) = (&mime, &gdrive_id) {
+                            if shortcuts::is_workspace_file(m) {
+                                display_name = format!("{}.html", name);
+                                let html_content = shortcuts::generate_desktop_entry(gid, &name, m);
+                                attr.size = html_content.len() as u64;
+                                attr.perm = 0o644; // HTML no necesita +x
+                                debug!("Workspace File (readdirplus): inode={} name={} size={}", inode, display_name, attr.size);
+                            }
                         }
                     }
 
@@ -535,7 +565,7 @@ impl Filesystem for GDriveFS {
                         inode,
                         generation: 0,
                         kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
-                        name: name.into(),
+                        name: display_name.into(),
                         offset: (offset as i64 + index as i64 + 1),
                         attr,
                         entry_ttl: Duration::from_secs(1),

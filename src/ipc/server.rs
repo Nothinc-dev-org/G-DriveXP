@@ -210,6 +210,19 @@ async fn get_sync_state(
     inode: u64,
     _gdrive_id: &str,
 ) -> Result<SyncStatus> {
+    // Obtener atributos para verificar si es directorio
+    let is_dir: Option<bool> = sqlx::query_scalar(
+        "SELECT is_dir FROM attrs WHERE inode = ?"
+    )
+    .bind(inode as i64)
+    .fetch_optional(db.pool())
+    .await?;
+    
+    // Los directorios siempre se consideran "sincronizados" (solo contienen metadata)
+    if is_dir == Some(true) {
+        return Ok(SyncStatus::Synced);
+    }
+    
     // Obtener el tamaño esperado del archivo desde la base de datos
     let expected_size: Option<i64> = sqlx::query_scalar(
         "SELECT size FROM attrs WHERE inode = ?"

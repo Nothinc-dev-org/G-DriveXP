@@ -359,13 +359,13 @@ impl DriveClient {
     }
 
     /// Mueve un archivo a la papelera
-    pub async fn trash_file(&self, file_id: &str) -> Result<()> {
+    pub async fn trash_file(&self, file_id: &str) -> Result<(), super::DriveError> {
         tracing::info!("🗑️ Moviendo a papelera: {}", file_id);
 
         let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
             .await
-            .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
-            .context("No se obtuvo ningún token válido para trash")?;
+            .map_err(|e| super::DriveError::Auth(format!("{}", e)))?
+            .ok_or_else(|| super::DriveError::Auth("No token available".into()))?;
 
         let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
         let client = reqwest::Client::new();
@@ -375,14 +375,21 @@ impl DriveClient {
             .header("Authorization", format!("Bearer {}", token))
             .json(&serde_json::json!({ "trashed": true }))
             .send()
-            .await
-            .context("Error de red al mover a papelera")?;
+            .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             tracing::error!("Error API Drive trash: {} - {}", status, body);
-            anyhow::bail!("Error API Drive trash: {} - {}", status, body);
+            
+            // Detectar error 403 de permisos insuficientes
+            if status == 403 && body.contains("insufficientFilePermissions") {
+                return Err(super::DriveError::InsufficientPermissions(
+                    format!("No se puede eliminar archivo compartido: {}", file_id)
+                ));
+            }
+            
+            return Err(super::DriveError::ApiError(format!("{} - {}", status, body)));
         }
 
         tracing::info!("✅ Archivo movido a papelera: {}", file_id);

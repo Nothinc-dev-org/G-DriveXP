@@ -77,7 +77,17 @@ impl OAuth2Manager {
     #[allow(dead_code)] // Feature para logout futuro
     pub async fn logout(&self) -> Result<()> {
         tracing::info!("Cerrando sesión y eliminando tokens");
+        
+        // 1. Eliminar del keyring
         self.token_storage.delete_refresh_token().await?;
+        
+        // 2. Eliminar tokens.json del disco
+        let home = std::env::var("HOME").context("No se pudo obtener HOME")?;
+        let token_path = format!("{}/.config/fedoradrive/tokens.json", home);
+        if std::path::Path::new(&token_path).exists() {
+            std::fs::remove_file(&token_path)?;
+            tracing::info!("Archivo de tokens eliminado: {}", token_path);
+        }
         
         // TODO: Revocar el token en los servidores de Google
         // usando la API de revocación: https://oauth2.googleapis.com/revoke
@@ -90,4 +100,25 @@ impl OAuth2Manager {
     pub async fn is_authenticated(&self) -> bool {
         self.token_storage.has_stored_token().await
     }
+}
+
+/// Función independiente para limpiar todos los datos de autenticación
+/// Útil para llamar desde la GUI sin necesidad de instancia de OAuth2Manager
+pub fn clear_all_auth_data() -> Result<()> {
+    let home = std::env::var("HOME").context("No se pudo obtener HOME")?;
+    
+    // 1. Eliminar tokens.json
+    let token_path = format!("{}/.config/fedoradrive/tokens.json", home);
+    if std::path::Path::new(&token_path).exists() {
+        std::fs::remove_file(&token_path)?;
+        tracing::info!("Archivo de tokens eliminado");
+    }
+    
+    // 2. Eliminar del keyring
+    if let Ok(entry) = keyring::Entry::new("org.gnome.FedoraDrive", "refresh_token") {
+        let _ = entry.delete_credential();
+        tracing::info!("Credenciales eliminadas del keyring");
+    }
+    
+    Ok(())
 }

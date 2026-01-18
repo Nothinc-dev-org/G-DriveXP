@@ -254,16 +254,17 @@ impl Component for AppModel {
             AppMsg::Logout => {
                 tracing::info!("🚪 Cerrando sesión...");
                 
-                // Eliminar tokens del keyring
-                if let Ok(entry) = keyring::Entry::new("org.gnome.FedoraDrive", "oauth_token") {
-                    let _ = entry.delete_credential();
+                // Limpiar todos los datos de autenticación
+                if let Err(e) = crate::auth::clear_all_auth_data() {
+                    tracing::error!("Error al limpiar datos de autenticación: {:?}", e);
                 }
                 
-                // Desmontar si es posible y salir
+                // Desmontar el filesystem FUSE
                 if let Some(ref mount_point) = self.mount_point {
                     let _ = crate::utils::mount::unmount(mount_point);
                 }
                 
+                // Terminar la aplicación
                 std::process::exit(0);
             }
             AppMsg::LogAction(action_type, description) => {
