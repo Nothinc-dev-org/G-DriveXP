@@ -312,6 +312,40 @@ impl DriveClient {
         Ok(file_id)
     }
 
+    /// Crea una nueva carpeta en Google Drive
+    pub async fn create_folder(
+        &self,
+        name: &str,
+        parent_id: &str,
+    ) -> Result<String> {
+        tracing::info!("📂 Creando carpeta: {}", name);
+
+        let mut file_metadata = google_drive3::api::File::default();
+        file_metadata.name = Some(name.to_string());
+        file_metadata.mime_type = Some("application/vnd.google-apps.folder".to_string());
+        
+        if parent_id != "root" {
+            file_metadata.parents = Some(vec![parent_id.to_string()]);
+        }
+
+        let result = self.hub
+            .files()
+            .create(file_metadata)
+            .supports_all_drives(true)
+            .ignore_default_visibility(true)
+            .upload(
+                std::io::Cursor::new(vec![]),
+                "application/vnd.google-apps.folder".parse().unwrap(),
+            )
+            .await
+            .context("Error creando carpeta en API")?;
+
+        let file_id = result.1.id.ok_or_else(|| anyhow::anyhow!("No se recibió file_id para carpeta"))?;
+        
+        tracing::info!("✅ Carpeta creada: {}", file_id);
+        Ok(file_id)
+    }
+
     /// Actualiza el contenido de un archivo existente
     pub async fn update_file_content(
         &self,

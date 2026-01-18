@@ -156,6 +156,31 @@ impl Uploader {
         let name = self.get_file_name(inode).await?;
         let parent_gdrive_id = self.get_parent_gdrive_id(inode).await?;
         
+        // Validar si es una carpeta
+        if attrs.is_dir {
+            // Caso carpeta: crear solo con metadatos
+            let real_gdrive_id = self.client.create_folder(
+                &name,
+                &parent_gdrive_id,
+            ).await.context("Error creando carpeta")?;
+
+            // Actualizar DB y retornar
+            sqlx::query("UPDATE inodes SET gdrive_id = ? WHERE inode = ?")
+                .bind(&real_gdrive_id)
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await?;
+            
+            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await?;
+            
+            info!("✅ Carpeta creada en GDrive: {} (inode={})", real_gdrive_id, inode);
+            self.history.log(ActionType::Create, format!("Carpeta creada: {}", name));
+            return Ok(());
+        }
+
         // Ruta del archivo en caché
         let cache_path = self.cache_dir.join(temp_gdrive_id);
         

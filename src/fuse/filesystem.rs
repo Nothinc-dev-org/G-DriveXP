@@ -655,6 +655,79 @@ impl Filesystem for GDriveFS {
         })
     }
 
+    // Crear un nuevo directorio
+    async fn mkdir(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+    ) -> Result<ReplyEntry> {
+        let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
+        debug!("📂 mkdir: parent={} name={} mode={:o}", parent, name_str, mode);
+
+        // Generar un gdrive_id temporal
+        let temp_gdrive_id = format!("temp_{}", uuid::Uuid::new_v4());
+        
+        // Crear inode en la DB
+        let inode = self.db.get_or_create_inode(&temp_gdrive_id).await
+            .map_err(|e| {
+                error!("Error creando inode para directorio: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Timestamp actual
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+    
+        // Insertar metadatos del directorio
+        // NOTA: Para directorios mode suele ser S_IFDIR | 0755
+        let dir_mode = libc::S_IFDIR as u32 | 0o755;
+
+        self.db.upsert_file_metadata(
+            inode,
+            0, // size 0 para directorios
+            now,
+            dir_mode,
+            true, // is_dir = true
+            Some("application/vnd.google-apps.folder"),
+        ).await.map_err(|e| {
+            error!("Error insertando metadatos de directorio: {}", e);
+            Errno::from(libc::EIO)
+        })?;
+
+        // Agregar al dentry
+        self.db.upsert_dentry(parent, inode, name_str).await
+            .map_err(|e| {
+                error!("Error insertando dentry de directorio: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        // Marcar como dirty (pendiente de creación en GDrive)
+        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await
+            .map_err(|e| {
+                error!("Error marcando directorio como dirty: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+
+        let attrs = self.db.get_attrs(inode).await
+            .map_err(|_| Errno::from(libc::EIO))?;
+
+        debug!("✅ Directorio creado: inode={} nombre={}", inode, name_str);
+
+        Ok(ReplyEntry {
+            ttl: Duration::from_secs(1),
+            attr: attrs.to_file_attr(),
+            generation: 0,
+        })
+    }
+
     // Escribir datos en un archivo
     async fn write(
         &self,
