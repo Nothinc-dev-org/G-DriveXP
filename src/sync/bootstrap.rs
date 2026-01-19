@@ -80,13 +80,21 @@ pub async fn sync_all_metadata(
             // Modo POSIX básico
             let mode = if is_dir { 0o755 } else { 0o644 };
 
+            let can_move = file.capabilities.as_ref()
+                .and_then(|c| c.can_move_item_within_drive)
+                .unwrap_or(true);
+
+            let shared = file.shared.unwrap_or(false);
+
             db.upsert_file_metadata(
                 inode,
                 size,
                 mtime,
                 mode,
                 is_dir,
-                file.mime_type.as_deref()
+                file.mime_type.as_deref(),
+                can_move,
+                shared
             ).await?;
         }
     }

@@ -209,6 +209,40 @@ impl MetadataRepository {
                 .await?;
         }
 
+        // 7. Verificar si la columna can_move existe en attrs
+        let has_can_move = sqlx::query("PRAGMA table_info(attrs)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "can_move"
+            });
+
+        if !has_can_move {
+            sqlx::query("ALTER TABLE attrs ADD COLUMN can_move BOOLEAN DEFAULT 1")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // 8. Verificar si la columna shared existe en attrs
+        let has_shared = sqlx::query("PRAGMA table_info(attrs)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "shared"
+            });
+
+        if !has_shared {
+            sqlx::query("ALTER TABLE attrs ADD COLUMN shared BOOLEAN DEFAULT 0")
+                .execute(&self.pool)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -367,6 +401,35 @@ impl MetadataRepository {
         Ok(Some(current_inode))
     }
 
+    /// Resuelve un inode a su path relativo reconstruyendo la jerarquía
+    pub async fn resolve_inode_to_relative_path(&self, inode: u64) -> Result<Option<String>> {
+        if inode == 1 {
+            return Ok(Some("".to_string()));
+        }
+
+        let mut current_inode = inode;
+        let mut path_parts = Vec::new();
+
+        while current_inode != 1 {
+            let row = sqlx::query_as::<_, (i64, String)>(
+                "SELECT parent_inode, name FROM dentry WHERE child_inode = ?"
+            )
+            .bind(current_inode as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some((parent_inode, name)) = row {
+                path_parts.push(name);
+                current_inode = parent_inode as u64;
+            } else {
+                return Ok(None); // Inodo huérfano
+            }
+        }
+
+        path_parts.reverse();
+        Ok(Some(path_parts.join("/")))
+    }
+
     /// Listar contenido de un directorio (para readdir simple)
     pub async fn list_children(&self, parent_inode: u64) -> Result<Vec<(u64, String, bool)>> {
         let children = sqlx::query_as::<_, (i64, String, bool)>(
@@ -444,17 +507,21 @@ impl MetadataRepository {
         mode: u32,
         is_dir: bool,
         mime_type: Option<&str>,
+        can_move: bool,
+        shared: bool,
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO attrs (inode, size, mtime, ctime, mode, is_dir, mime_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO attrs (inode, size, mtime, ctime, mode, is_dir, mime_type, can_move, shared)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(inode) DO UPDATE SET
                 size = excluded.size,
                 mtime = excluded.mtime,
                 mode = excluded.mode,
                 is_dir = excluded.is_dir,
-                mime_type = excluded.mime_type
+                mime_type = excluded.mime_type,
+                can_move = excluded.can_move,
+                shared = excluded.shared
             "#
         )
         .bind(inode as i64)
@@ -464,6 +531,8 @@ impl MetadataRepository {
         .bind(mode as i32)
         .bind(is_dir)
         .bind(mime_type)
+        .bind(can_move)
+        .bind(shared)
         .execute(&self.pool)
         .await?;
 

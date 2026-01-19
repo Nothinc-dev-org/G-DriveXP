@@ -117,7 +117,7 @@ impl DriveClient {
         let client = reqwest::Client::new();
 
         loop {
-            let mut url = "https://www.googleapis.com/drive/v3/files?trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version)".to_string();
+            let mut url = "https://www.googleapis.com/drive/v3/files?trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,capabilities(canMoveItemWithinDrive))".to_string();
             
             if let Some(ref token_str) = page_token {
                 url.push_str(&format!("&pageToken={}", token_str));
@@ -211,7 +211,7 @@ impl DriveClient {
         
         // pageToken es requerido, fields especifica qué queremos recibir
         let url = format!(
-            "https://www.googleapis.com/drive/v3/changes?pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed))",
+            "https://www.googleapis.com/drive/v3/changes?pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed,shared,capabilities(canMoveItemWithinDrive)))",
             page_token
         );
 
@@ -478,9 +478,9 @@ impl DriveClient {
             .context("No se obtuvo ningún token válido")?;
 
         let client = reqwest::Client::new();
-        // Solicitamos name, parents y md5Checksum
+        // Solicitamos name, parents, md5Checksum y capabilities para verificar permisos
         let url = format!(
-            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType",
+            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType,shared,capabilities&supportsAllDrives=true",
             file_id
         );
 
@@ -498,8 +498,10 @@ impl DriveClient {
             anyhow::bail!("Error API Drive get_file_metadata: {} - {}", status, body);
         }
 
-        let file: google_drive3::api::File = response.json()
-            .await
+        let body = response.text().await.context("Error leyendo body")?;
+        tracing::debug!("🔍 RAW METADATA ({}): {}", file_id, body);
+
+        let file: google_drive3::api::File = serde_json::from_str(&body)
             .context("Error al parsear respuesta de get_file_metadata")?;
 
         Ok(file)
@@ -526,6 +528,9 @@ impl DriveClient {
         
         // Query params
         let mut params = Vec::new();
+        // IMPORTANTE: supportsAllDrives=true asegura que veamos/editemos la jerarquía completa
+        params.push("supportsAllDrives=true".to_string());
+
         if let Some(parent) = add_parent {
             params.push(format!("addParents={}", parent));
         }

@@ -102,6 +102,11 @@ pub fn run_backend(
         let authenticator = oauth_manager.get_authenticator().await?;
         let drive_client = Arc::new(gdrive::client::DriveClient::new(authenticator));
         
+        // Obtener Root ID para optimizaciones del Uploader
+        ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Obteniendo ID de carpeta raíz...".to_string()));
+        let root_id = drive_client.get_root_file_id().await
+            .context("Error crítico obteniendo Root ID de Google Drive")?;
+        
         // Inicializar sistema de archivos
         let fs = GDriveFS::new(db.clone(), drive_client.clone(), &config.cache_dir);
         
@@ -129,7 +134,9 @@ pub fn run_backend(
             drive_client.clone(),
             30, // Intervalo: 30 segundos
             &config.cache_dir,
+            &config.mirror_path,
             history.clone(),
+            root_id.clone(),
         );
         let _uploader_handle = uploader.spawn();
         

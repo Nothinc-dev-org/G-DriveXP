@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS attrs (
     mode INTEGER NOT NULL,
     is_dir BOOLEAN NOT NULL,
     mime_type TEXT,
+    can_move BOOLEAN DEFAULT 1,
     FOREIGN KEY (inode) REFERENCES inodes(inode)
 );
 

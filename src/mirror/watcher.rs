@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebouncedEvent, Debouncer};
+use notify_debouncer_full::{new_debouncer, DebouncedEvent, Debouncer, FileIdMap};
+use notify::{RecursiveMode, Watcher};
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -7,8 +8,8 @@ use tracing::{error, info};
 
 /// Estructura que mantiene vivo el watcher
 pub struct MirrorWatcher {
-    // Mantener el debouncer vivo es suficiente para que el watcher siga corriendo
-    _debouncer: Debouncer<notify::RecommendedWatcher>,
+    // Mantener el debouncer vivo es suficiente para asegurar vigilancia
+    _debouncer: Debouncer<notify::RecommendedWatcher, FileIdMap>,
 }
 
 impl MirrorWatcher {
@@ -20,10 +21,9 @@ impl MirrorWatcher {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         
-        // Configurar debouncer
-        // 500ms de debounce para agrupar escrituras secuenciales
         let mut debouncer = new_debouncer(
             Duration::from_millis(500),
+            None, // tick_rate default
             move |res: std::result::Result<Vec<DebouncedEvent>, _>| {
                 match res {
                     Ok(events) => {
@@ -31,14 +31,14 @@ impl MirrorWatcher {
                         let _ = event_tx.blocking_send(events);
                     }
                     Err(e) => {
-                        error!("Error en watcher de sistema de archivos: {:?}", e);
+                        error!("Error en watcher de sistema de archivos (Full): {:?}", e);
                     }
                 }
             },
-        ).context("Error creando debouncer")?;
+        ).context("Error creando debouncer full")?;
 
         // Iniciar vigilancia recursiva
-        info!("👀 Iniciando vigilancia recursiva en: {:?}", path);
+        info!("👀 Iniciando vigilancia recursiva (Full+Rename) en: {:?}", path);
         debouncer
             .watcher()
             .watch(&path, RecursiveMode::Recursive)

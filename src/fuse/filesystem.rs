@@ -543,6 +543,8 @@ impl Filesystem for GDriveFS {
                             mode: if is_dir { 0o755 } else { 0o644 },
                             is_dir,
                             mime_type: None,
+                            can_move: true,
+                            shared: false,
                         }.to_file_attr()
                     };
 
@@ -619,6 +621,8 @@ impl Filesystem for GDriveFS {
             mode,
             false, // no es directorio
             Some("application/octet-stream"),
+            true, // can_move
+            false, // shared (inicialmente falso)
         ).await.map_err(|e| {
             error!("Error insertando metadatos: {}", e);
             Errno::from(libc::EIO)
@@ -694,6 +698,8 @@ impl Filesystem for GDriveFS {
             dir_mode,
             true, // is_dir = true
             Some("application/vnd.google-apps.folder"),
+            true, // can_move
+            false, // shared
         ).await.map_err(|e| {
             error!("Error insertando metadatos de directorio: {}", e);
             Errno::from(libc::EIO)
@@ -973,6 +979,16 @@ impl Filesystem for GDriveFS {
         let inode = self.db.lookup(parent, name_str).await
             .map_err(|_| Errno::from(libc::EIO))?
             .ok_or(Errno::from(libc::ENOENT))?;
+
+        // VERIFICACIÓN DE PERMISOS (Blocking at Source)
+        // Verificar si tenemos permiso para mover este archivo en Google Drive
+        let attrs = self.db.get_attrs(inode).await
+            .map_err(|_| Errno::from(libc::EIO))?;
+
+        if !attrs.can_move {
+            tracing::warn!("⛔ Bloqueando movimiento de archivo de solo lectura (Shared): {}", name_str);
+            return Err(Errno::from(libc::EACCES));
+        }
 
         // Si existe un archivo destino, eliminarlo primero (overwite)
         if let Ok(Some(existing_inode)) = self.db.lookup(new_parent, new_name_str).await {

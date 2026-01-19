@@ -24,7 +24,9 @@ pub struct Uploader {
     client: Arc<DriveClient>,
     interval: Duration,
     cache_dir: std::path::PathBuf,
+    mirror_path: std::path::PathBuf,
     history: ActionHistory,
+    root_id: String,
 }
 
 impl Uploader {
@@ -34,14 +36,18 @@ impl Uploader {
         client: Arc<DriveClient>,
         interval_secs: u64,
         cache_dir: impl AsRef<Path>,
+        mirror_path: impl AsRef<Path>,
         history: ActionHistory,
+        root_id: String,
     ) -> Self {
         Self {
             db,
             client,
             interval: Duration::from_secs(interval_secs),
             cache_dir: cache_dir.as_ref().to_path_buf(),
+            mirror_path: mirror_path.as_ref().to_path_buf(),
             history,
+            root_id,
         }
     }
 
@@ -264,7 +270,40 @@ impl Uploader {
         let mut add_parent: Option<String> = None;
         let mut remove_parent: Option<String> = None;
 
+        // --- VERIFICACIÓN DE PERMISOS ---
+        let capabilities = remote_meta.capabilities.as_ref();
+        let can_rename = capabilities.map(|c| c.can_rename.unwrap_or(false)).unwrap_or(true); // Asumir true si no hay info (seguridad por defecto: drive suele enviar capabilities)
+        let can_move = capabilities.map(|c| c.can_move_item_within_drive.unwrap_or(false)).unwrap_or(true);
+        let can_add_my_drive = capabilities.map(|c| c.can_add_my_drive_parent.unwrap_or(false)).unwrap_or(true);
+        let can_edit = capabilities.map(|c| c.can_edit.unwrap_or(false)).unwrap_or(true);
+        // --------------------------------
+
+        // Persistir capacidades actualizadas en la DB (para que MirrorManager/FUSE las conozcan)
+        if let Err(e) = sqlx::query("UPDATE attrs SET can_move = ? WHERE inode = ?")
+            .bind(can_move)
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await {
+            error!("Error actualizando can_move en DB: {:?}", e);
+        }
+
         if local_name != current_remote_name {
+            if !can_rename {
+                warn!("⛔ PERMISO DENEGADO: No se puede renombrar '{}'. Revertiendo cambio local.", current_remote_name);
+                // Rollback nombre
+                sqlx::query("UPDATE dentry SET name = ? WHERE child_inode = ?")
+                    .bind(&current_remote_name)
+                    .bind(inode as i64)
+                    .execute(self.db.pool())
+                    .await?;
+                // Limpiar dirty
+                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                    .bind(inode as i64)
+                    .execute(self.db.pool())
+                    .await?;
+                return Ok(());
+            }
+
             info!("🔄 Detectado cambio de nombre: '{}' -> '{}'", current_remote_name, local_name);
             new_name = Some(local_name.as_str());
             metadata_updated = true;
@@ -299,13 +338,77 @@ impl Uploader {
             remote_parents.contains(&local_parent_id)
         };
 
+
+
         if !is_in_remote {
+            // Verificar permisos de Move ANTES de procesar
+            let permission_ok = if remote_parents.is_empty() {
+                // Caso especial: "Shared with me" (sin padres visibles)
+                // Usualmente requiere can_add_my_drive_parent O can_move_item_within_drive
+                can_add_my_drive || can_move
+            } else {
+                can_move
+            };
+            if !permission_ok {
+                warn!("⛔ PERMISO DENEGADO: No se puede mover el archivo (ReadOnly). Revertiendo cambio local.");
+                // --- ROLLBACK FÍSICO Y DB (Mirror) ---
+                // 1. Obtener la ruta "incorrecta" actual (donde el usuario lo movió)
+                let unauthorized_rel = self.db.resolve_inode_to_relative_path(inode).await?.unwrap_or_default();
+                
+                // 2. Rollback DB: Restaurar el padre remoto en la base de datos local
+                let target_parent_inode = if let Some(parent_id) = remote_parents.first() {
+                     sqlx::query_scalar::<_, i64>("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                        .bind(parent_id)
+                        .fetch_optional(self.db.pool())
+                        .await?
+                        .unwrap_or(1)
+                } else {
+                     1 
+                };
+
+                sqlx::query("UPDATE dentry SET parent_inode = ?, name = ? WHERE child_inode = ?")
+                    .bind(target_parent_inode)
+                    .bind(&current_remote_name) // También restauramos el nombre por si hubo rename simultáneo
+                    .bind(inode as i64)
+                    .execute(self.db.pool())
+                    .await?;
+
+                // 3. Obtener la ruta "correcta" restaurada
+                let correct_rel = self.db.resolve_inode_to_relative_path(inode).await?.unwrap_or_default();
+
+                // 4. Limpiar dirty
+                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                    .bind(inode as i64)
+                    .execute(self.db.pool())
+                    .await?;
+
+                if !unauthorized_rel.is_empty() && !correct_rel.is_empty() && unauthorized_rel != correct_rel {
+                    warn!("🔄 Ejecutando Rollback Físico: {} -> {}", unauthorized_rel, correct_rel);
+                    let old_p = self.mirror_path.join(unauthorized_rel);
+                    let new_p = self.mirror_path.join(correct_rel);
+                    
+                    if let Err(e) = tokio::fs::rename(&old_p, &new_p).await {
+                        error!("Fallo al revertir físicamente el movimiento: {:?}", e);
+                    }
+                }
+
+                self.history.log(ActionType::Sync, format!("Movimiento bloqueado y revertido: {}", current_remote_name));
+                return Ok(());
+            }
+
             info!("🔄 Detectado cambio de ubicación (Move): padre local={}, padres remotos={:?}", 
                   local_parent_id, remote_parents);
             add_parent = Some(local_parent_id.clone());
             // Remover el primer padre remoto que no sea el nuevo
             if let Some(old) = remote_parents.first() {
                 remove_parent = Some(old.clone());
+            } else {
+                // FALLBACK CRÍTICO REVISADO:
+                // Si parents está vacío, es posible que el archivo esté en Root pero la API oculte el parent 
+                // o use el alias "root" en lugar del ID.
+                // Intentamos remover AMBOS para asegurar que liberamos el padre anterior.
+                warn!("⚠️ Parents remoto vacío. Intentando liberar Root ID ({}) y alias 'root'.", self.root_id);
+                remove_parent = Some(format!("{},root", self.root_id));
             }
             metadata_updated = true;
         }
@@ -380,6 +483,25 @@ impl Uploader {
                 warn!("No se pudo calcular MD5 local para optimización: {:?}", e);
                 // Continuar con la subida normal
             }
+        }
+        
+        // Verificar permisos de Edición de Contenido
+        if !can_edit {
+             warn!("⛔ PERMISO DENEGADO: No se puede editar contenido de {}. Revertiendo estado.", gdrive_id);
+             // Como no tenemos hash del contenido original fácilmente restaurable (salvo que lo descargáramos),
+             // lo mejor es marcar dirty=0 para que en la próxima lectura/sync baje la versión remota.
+             // Opcionalmente borrar el caché local para forzar re-descarga.
+             
+             if cache_path.exists() {
+                 tokio::fs::remove_file(&cache_path).await.ok();
+             }
+
+             sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await?;
+             
+             return Ok(());
         }
 
         // 6. Actualizar contenido usando la API

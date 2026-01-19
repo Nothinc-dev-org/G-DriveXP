@@ -13,6 +13,10 @@ pub struct FileAttributes {
     pub mode: i64,
     pub is_dir: bool,
     pub mime_type: Option<String>,
+    #[sqlx(default)]
+    pub can_move: bool,
+    #[sqlx(default)]
+    pub shared: bool,
 }
 
 impl FileAttributes {
@@ -49,6 +53,8 @@ impl FileAttributes {
             mode: 0o755,
             is_dir: true,
             mime_type: Some("application/vnd.google-apps.folder".to_string()),
+            can_move: true,
+            shared: false,
         }
     }
 }

@@ -26,6 +26,8 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     /// Estado de sincronización del archivo solicitado
     FileStatus(SyncStatus),
+    /// Estado extendido del archivo (incluye shared)
+    ExtendedStatus(FileStatusData),
     /// Respuesta a Ping
     Pong,
     /// Disponibilidad del archivo
@@ -34,6 +36,14 @@ pub enum IpcResponse {
     Success,
     /// Error en la operación
     Error { message: String },
+}
+
+/// Datos completos de estado del archivo para el InfoProvider
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileStatusData {
+    pub status: SyncStatus,
+    pub availability: FileAvailability,
+    pub is_shared: bool,
 }
 
 /// Disponibilidad de un archivo en Local Sync

@@ -197,6 +197,12 @@ impl BackgroundSyncer {
                 .unwrap_or(0);
             let mode = if is_dir { 0o755 } else { 0o644 };
 
+            let can_move = file.capabilities.as_ref()
+                .and_then(|c| c.can_move_item_within_drive)
+                .unwrap_or(true);
+
+            let shared = file.shared.unwrap_or(false);
+
             // Obtener o crear inode
             let inode = self.db.get_or_create_inode(file_id).await?;
 
@@ -208,6 +214,8 @@ impl BackgroundSyncer {
                 mode,
                 is_dir,
                 file.mime_type.as_deref(),
+                can_move,
+                shared,
             ).await?;
 
             // Actualizar dentry (árbol de directorios)

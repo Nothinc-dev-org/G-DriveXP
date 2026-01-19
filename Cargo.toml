@@ -48,7 +48,7 @@ percent-encoding = "2.3"
 ksni = "0.2"
 dirs = "5.0"
 notify = { version = "6.1", features = ["serde"] }
-notify-debouncer-mini = "0.4"
+notify-debouncer-full = "0.3"
 mime_guess = "2.0.5"
 md-5 = "0.10"
 

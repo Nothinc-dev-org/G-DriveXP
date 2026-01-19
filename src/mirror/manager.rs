@@ -19,7 +19,8 @@ pub enum MirrorCommand {
 }
 
 use crate::mirror::watcher::MirrorWatcher;
-use notify_debouncer_mini::DebouncedEvent;
+use notify_debouncer_full::DebouncedEvent;
+use notify::{EventKind, event::{ModifyKind, RenameMode}};
 
 #[derive(Clone)]
 struct MirrorContext {
@@ -432,60 +433,177 @@ impl MirrorManager {
 
     /// Procesa eventos del sistema de archivos (Watcher)
     async fn handle_fs_events(&self, events: Vec<DebouncedEvent>) {
-        for event in events {
-            let path = event.path;
+        for debounced_event in events {
+            let event = debounced_event.event;
+            let paths = event.paths;
             
-            // 1. Filtrar eventos fuera de interés
-            // Ignorar .gdrive_tmp_ops
-            if path.to_string_lossy().contains(".gdrive_tmp_ops") {
-                continue;
-            }
-            
-            // Ignorar archivos parciales o temporales comunes
-            if let Some(ext) = path.extension() {
-                let ext_str = ext.to_string_lossy();
-                if ext_str == "part" || ext_str == "tmp" || ext_str == "crdownload" {
+            // Si el evento es un Renamed (Both), tenemos source y dest en paths[0] y paths[1]
+            if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = event.kind {
+                if paths.len() == 2 {
+                    self.handle_local_rename(&paths[0], &paths[1]).await;
                     continue;
                 }
             }
-            
-            // Calcular ruta relativa
-            let relative = match path.strip_prefix(&self.ctx.mirror_path) {
-                Ok(p) => p,
-                Err(_) => continue, // No debería pasar
-            };
-            
-            let relative_str = relative.to_string_lossy();
-            if relative_str.is_empty() { continue; } // Root
 
-            // 2. Determinar tipo de evento y verificar Symlinks
-            // Para eventos CREATE/MODIFY, verificamos si es symlink (Ignorar)
-            match event.kind {
-                notify_debouncer_mini::DebouncedEventKind::Any => {
-                    // Check existence and type
-                    match tokio::fs::symlink_metadata(&path).await {
-                        Ok(meta) => {
-                            if meta.is_symlink() {
-                                // Es un symlink (OnlineOnly), ignorar cambios
-                                // El MirrorManager es el único que crea symlinks aquí
-                                continue;
-                            }
-                            // Es archivo real o directorio -> Procesar como Modificación/Creación
-                            self.handle_local_change(&path, &relative_str, meta.is_dir()).await;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // Archivo borrado -> Procesar eliminación
-                            self.handle_local_delete(&relative_str).await;
-                        }
-                        Err(e) => {
-                            error!("Error leyendo metadata para evento FS: {:?}", e);
-                        }
+            // Para otros eventos (Create, Modify, Remove), iteramos sobre los paths afectados
+            for path in paths {
+                // 1. Filtrar eventos fuera de interés
+                // Ignorar .gdrive_tmp_ops
+                if path.to_string_lossy().contains(".gdrive_tmp_ops") {
+                    continue;
+                }
+                
+                // Ignorar archivos parciales o temporales comunes
+                if let Some(ext) = path.extension() {
+                    let ext_str = ext.to_string_lossy();
+                    if ext_str == "part" || ext_str == "tmp" || ext_str == "crdownload" {
+                        continue;
                     }
                 }
-                _ => {} // DebouncedEventKind usually is just Any in mini? No, it has generic.
-                        // wait, DebounceEvent struct has `kind`.
+                
+                // Calcular ruta relativa
+                let relative = match path.strip_prefix(&self.ctx.mirror_path) {
+                    Ok(p) => p,
+                    Err(_) => continue, // No debería pasar
+                };
+                
+                let relative_str = relative.to_string_lossy();
+                if relative_str.is_empty() { continue; } // Root
+
+                // 2. Determinar tipo de evento
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) => {
+                         // Check existence and type using tokio fs
+                        match tokio::fs::symlink_metadata(&path).await {
+                            Ok(meta) => {
+                                if meta.is_symlink() {
+                                    // Es un symlink (OnlineOnly), ignorar cambios
+                                    continue;
+                                }
+                                // Es archivo real o directorio -> Procesar como Modificación/Creación
+                                self.handle_local_change(&path, &relative_str, meta.is_dir()).await;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                // Podría ser un delete que llegó como modify? Raro, pero posible.
+                                // Ignoramos si no existe, el evento Remove lo capturará si aplica.
+                            }
+                            Err(e) => {
+                                error!("Error leyendo metadata para evento FS: {:?}", e);
+                            }
+                        }
+                    }
+                    EventKind::Remove(_) => {
+                         self.handle_local_delete(&relative_str).await;
+                    }
+                    _ => {} 
+                }
             }
         }
+    }
+
+    async fn handle_local_rename(&self, old_path: &PathBuf, new_path: &PathBuf) {
+        tracing::info!("🔄 DETECTADO RENOMBRADO INTELIGENTE: {:?} -> {:?}", old_path, new_path);
+        
+        // 1. Calcular relativas
+        let old_relative = match old_path.strip_prefix(&self.ctx.mirror_path) {
+            Ok(p) => p.to_string_lossy(),
+            Err(_) => return,
+        };
+        let new_relative = match new_path.strip_prefix(&self.ctx.mirror_path) {
+            Ok(p) => p.to_string_lossy(),
+            Err(_) => return,
+        };
+
+        let db = &self.ctx.db;
+
+        // 2. Resolver Inode Origen (que ya no existe en disco en old_path, pero sí en DB)
+        let inode = match db.resolve_relative_path_to_inode(&old_relative).await {
+            Ok(Some(i)) => i,
+            Ok(None) => {
+                warn!("Origen de renombrado no encontrado en DB: {}", old_relative);
+                // Fallback: tratar como Create en destino
+                if let Ok(meta) = tokio::fs::metadata(new_path).await {
+                     self.handle_local_change(new_path, &new_relative, meta.is_dir()).await;
+                }
+                return;
+            }
+            Err(e) => {
+                error!("Error resolviendo origen rename: {:?}", e);
+                return;
+            }
+        };
+
+        // 2.5 VERIFICACIÓN DE PERMISOS (Blocking at Source - Mirror)
+        // Si no tenemos permiso para moverlo en Drive, revertimos el movimiento físico de inmediato
+        if let Ok(attrs) = db.get_attrs(inode).await {
+            if !attrs.can_move {
+                warn!("⛔ Bloqueando movimiento de archivo compartido (ReadOnly). Revirtiendo físicamente: {:?} -> {:?}", new_path, old_path);
+                
+                // Intentar moverlo de vuelta físicamente
+                if let Err(e) = tokio::fs::rename(new_path, old_path).await {
+                    error!("Fallo crítico al intentar revertir movimiento físico: {:?}", e);
+                }
+                
+                // Opcional: Notificar a Nautilus/UI (por ahora solo log)
+                return;
+            }
+        }
+
+        // 3. Resolver Nuevo Padre
+        let new_parent_path_buf = new_path.parent().unwrap_or(std::path::Path::new(""));
+        let new_parent_relative = match new_parent_path_buf.strip_prefix(&self.ctx.mirror_path) {
+             Ok(p) => p.to_string_lossy(),
+             Err(_) => "".into(),
+        };
+
+        let new_parent_inode = if new_parent_relative.is_empty() {
+            1
+        } else {
+            match db.resolve_relative_path_to_inode(&new_parent_relative).await {
+                Ok(Some(i)) => i,
+                _ => {
+                    warn!("Padre destino no encontrado: {}", new_parent_relative);
+                    return;
+                }
+            }
+        };
+
+        // 4. Obtener Nuevo Nombre
+        let new_name = match new_path.file_name() {
+             Some(n) => n.to_string_lossy(),
+             None => return,
+        };
+
+        // 5. ACTUALIZACIÓN ATÓMICA EN DB
+        // Actualizamos dentry para apuntar al nuevo padre y nombre
+        // El inode se mantiene, por lo que el gdrive_id se mantiene.
+        
+        info!("📝 Ejecutando Move en DB: inode={} -> new_parent={}, new_name={}", inode, new_parent_inode, new_name);
+
+        let update_sql = "UPDATE dentry SET parent_inode = ?, name = ? WHERE child_inode = ?";
+        if let Err(e) = sqlx::query(update_sql)
+            .bind(new_parent_inode as i64)
+            .bind(new_name.to_string())
+            .bind(inode as i64)
+            .execute(db.pool())
+            .await 
+        {
+             error!("Error actualizando dentry en Rename: {:?}", e);
+             return;
+        }
+
+        // 6. Marcar DIRTY para que el Uploader verifique metadata
+        let dirty_sql = "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 1, 0, 'local_online') 
+                         ON CONFLICT(inode) DO UPDATE SET dirty=1";
+        if let Err(e) = sqlx::query(dirty_sql)
+             .bind(inode as i64)
+             .execute(db.pool())
+             .await 
+        {
+             error!("Error marcando dirty tras Rename: {:?}", e);
+        }
+        
+        info!("✅ Renombrado local procesado exitosamente.");
     }
 
     async fn handle_local_change(&self, path: &PathBuf, relative_path: &str, is_dir: bool) {
@@ -553,7 +671,7 @@ impl MirrorManager {
             // Detectar MIME type básico
             let mime = mime_guess::from_path(path).first().map(|m| m.essence_str().to_string());
 
-            if let Err(e) = db.upsert_file_metadata(inode, size, mtime, mode, is_dir, mime.as_deref()).await {
+            if let Err(e) = db.upsert_file_metadata(inode, size, mtime, mode, is_dir, mime.as_deref(), true, false).await {
                 error!("Error actualizando metadata en DB: {:?}", e);
             }
         }

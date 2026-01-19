@@ -103,112 +103,121 @@ async fn handle_client(
     // Buffer para leer el request (max 4KB)
     let mut buf = vec![0u8; 4096];
     
-    // Leer longitud del mensaje (4 bytes, big-endian)
-    stream.read_exact(&mut buf[..4]).await?;
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    
-    if len > 4096 {
-        anyhow::bail!("Mensaje IPC demasiado grande: {} bytes", len);
+    // Loop principal para conexión persistente
+    loop {
+        // Leer longitud del mensaje (4 bytes, big-endian)
+        // Usamos read_exact pero manejamos EOF gracefulmente
+        match stream.read_exact(&mut buf[..4]).await {
+            Ok(_) => {}, // Continuamos
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // El cliente cerró la conexión
+                return Ok(());
+            },
+            Err(e) => return Err(e.into()),
+        }
+
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        
+        if len > 4096 {
+            anyhow::bail!("Mensaje IPC demasiado grande: {} bytes", len);
+        }
+        
+        // Leer el mensaje
+        if let Err(e) = stream.read_exact(&mut buf[..len]).await {
+            // Si falla la lectura del contenido pero leímos el header, es un error real
+            anyhow::bail!("Error leyendo cuerpo del mensaje IPC: {}", e);
+        }
+        
+        // Deserializar request
+        let request: IpcRequest = bincode::deserialize(&buf[..len])
+            .context("Error deserializando request IPC")?;
+        
+        // Log de entrada (solo nivel trace para no saturar con el loop)
+        tracing::trace!("📥 IPC Request: {:?}", request);
+        
+        // Procesar request
+        let response = match request {
+            IpcRequest::Ping => IpcResponse::Pong,
+            IpcRequest::GetFileStatus { path } => {
+                let data = get_extended_file_status(&db, &mirror_path, &cache_dir, &path).await;
+                IpcResponse::ExtendedStatus(data)
+            }
+            IpcRequest::GetFileAvailability { path } => {
+                let avail = get_file_availability(&db, &mirror_path, &path).await;
+                IpcResponse::Availability(avail)
+            }
+            IpcRequest::SetOnlineOnly { path } => {
+                match set_availability(&mirror_tx, &path, "online_only").await {
+                    Ok(()) => IpcResponse::Success,
+                    Err(e) => IpcResponse::Error { message: e.to_string() },
+                }
+            }
+            IpcRequest::SetLocalOnline { path } => {
+                match set_availability(&mirror_tx, &path, "local_online").await {
+                    Ok(()) => IpcResponse::Success,
+                    Err(e) => IpcResponse::Error { message: e.to_string() },
+                }
+            }
+        };
+        
+        // Log de salida (trace)
+        tracing::trace!("📤 IPC Response: {:?}", response);
+        
+        // Serializar respuesta
+        let response_bytes = bincode::serialize(&response)
+            .context("Error serializando respuesta IPC")?;
+        
+        // Escribir longitud + respuesta
+        let len_bytes = (response_bytes.len() as u32).to_be_bytes();
+        stream.write_all(&len_bytes).await?;
+        stream.write_all(&response_bytes).await?;
     }
-    
-    // Leer el mensaje
-    stream.read_exact(&mut buf[..len]).await?;
-    
-    // Deserializar request
-    let request: IpcRequest = bincode::deserialize(&buf[..len])
-        .context("Error deserializando request IPC")?;
-    
-    // Log de entrada
-    tracing::info!("📥 IPC Request: {:?}", request);
-    
-    // Procesar request
-    let response = match request {
-        IpcRequest::Ping => IpcResponse::Pong,
-        IpcRequest::GetFileStatus { path } => {
-            let status = get_file_status(&db, &mirror_path, &cache_dir, &path).await;
-            IpcResponse::FileStatus(status)
-        }
-        IpcRequest::GetFileAvailability { path } => {
-            let avail = get_file_availability(&db, &mirror_path, &path).await;
-            IpcResponse::Availability(avail)
-        }
-        IpcRequest::SetOnlineOnly { path } => {
-            match set_availability(&mirror_tx, &path, "online_only").await {
-                Ok(()) => IpcResponse::Success,
-                Err(e) => IpcResponse::Error { message: e.to_string() },
-            }
-        }
-        IpcRequest::SetLocalOnline { path } => {
-            match set_availability(&mirror_tx, &path, "local_online").await {
-                Ok(()) => IpcResponse::Success,
-                Err(e) => IpcResponse::Error { message: e.to_string() },
-            }
-        }
-    };
-    
-    // Log de salida
-    tracing::info!("📤 IPC Response: {:?}", response);
-    
-    // Serializar respuesta
-    let response_bytes = bincode::serialize(&response)
-        .context("Error serializando respuesta IPC")?;
-    
-    // Escribir longitud + respuesta
-    let len_bytes = (response_bytes.len() as u32).to_be_bytes();
-    stream.write_all(&len_bytes).await?;
-    stream.write_all(&response_bytes).await?;
-    
-    Ok(())
 }
 
-/// Obtiene el estado de sincronización de un archivo dado su path
-async fn get_file_status(
+/// Obtiene el estado extendido de un archivo (sincronización, disponibilidad, compartido)
+async fn get_extended_file_status(
     db: &MetadataRepository,
     mirror_path: &std::path::Path,
     cache_dir: &std::path::Path,
     file_path: &str,
-) -> SyncStatus {
-    // Convertir URI file:// a path si es necesario y decodificar URL encoding
-    let raw_path = if file_path.starts_with("file://") {
-        file_path.strip_prefix("file://").unwrap_or(file_path)
-    } else {
-        file_path
-    };
+) -> super::FileStatusData {
+    // Decodificar URI
+    let path_str = decode_file_uri(file_path);
+    let _path = std::path::Path::new(&path_str);
     
-    // Decodificar caracteres URL-encoded (espacios=%20, paréntesis=%28%29, etc.)
-    let path = match percent_decode_str(raw_path).decode_utf8() {
-        Ok(decoded) => decoded.into_owned(),
-        Err(_) => return SyncStatus::Unknown,
+    // Default safe response
+    let mut data = super::FileStatusData {
+        status: SyncStatus::Unknown,
+        availability: FileAvailability::NotTracked,
+        is_shared: false,
     };
+
+    // 1. Determinar Disponibilidad
+    data.availability = get_file_availability(db, mirror_path, file_path).await;
     
-    // Verificar si el archivo está dentro del mirror path
-    let mirror_str = mirror_path.to_string_lossy();
-    if !path.starts_with(mirror_str.as_ref()) {
-        return SyncStatus::Unknown;
+    // 2. Determinar SyncStatus
+    if data.availability != FileAvailability::NotTracked {
+        // Resolver inode para obtener status y shared
+        let mirror_str = mirror_path.to_string_lossy();
+        if path_str.starts_with(mirror_str.as_ref()) {
+            if let Some(relative_path) = path_str.strip_prefix(mirror_str.as_ref()) {
+                let rel = relative_path.trim_start_matches('/');
+                if let Ok(Some((inode, gdrive_id))) = resolve_path_to_inode_and_gdrive_id(db, rel).await {
+                    // Obtener status
+                    data.status = get_sync_state(db, cache_dir, inode, &gdrive_id, &path_str)
+                        .await
+                        .unwrap_or(SyncStatus::Unknown);
+                    
+                    // Obtener flag de compartido
+                    if let Ok(attrs) = db.get_attrs(inode).await {
+                        data.is_shared = attrs.shared;
+                    }
+                }
+            }
+        }
     }
-    
-    // Extraer path relativo dentro del mirror path
-    let relative_path = match path.strip_prefix(mirror_str.as_ref()) {
-        Some(p) => p.trim_start_matches('/'),
-        None => return SyncStatus::Unknown,
-    };
-    
-    // Buscar el archivo en la base de datos por nombre
-    // Recorremos el path para encontrar el inode
-    let (inode, gdrive_id) = match resolve_path_to_inode_and_gdrive_id(db, relative_path).await {
-        Ok(Some(result)) => result,
-        Ok(None) => return SyncStatus::Unknown,
-        Err(_) => return SyncStatus::Unknown,
-    };
-    
-    // Consultar estado de sincronización, pasando info de cache y el path absoluto para verificación física
-    match get_sync_state(db, cache_dir, inode, &gdrive_id, &path).await {
-        Ok(state) => state,
-        Err(e) => {
-            tracing::warn!("Error obteniendo sync state para {}: {:?}", path, e);
-            SyncStatus::Unknown
-        },
-    }
+
+    data
 }
 
 /// Resuelve un path relativo a su inode y gdrive_id
