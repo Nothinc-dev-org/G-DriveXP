@@ -18,6 +18,9 @@ pub enum MirrorCommand {
     Refresh,
 }
 
+use crate::mirror::watcher::MirrorWatcher;
+use notify_debouncer_mini::DebouncedEvent;
+
 #[derive(Clone)]
 struct MirrorContext {
     db: Arc<MetadataRepository>,
@@ -30,6 +33,9 @@ struct MirrorContext {
 pub struct MirrorManager {
     ctx: Arc<MirrorContext>,
     command_rx: mpsc::Receiver<MirrorCommand>,
+    watcher_rx: mpsc::Receiver<Vec<DebouncedEvent>>,
+    watcher_tx: mpsc::Sender<Vec<DebouncedEvent>>, // Needed to spawn watcher
+    watcher: Option<MirrorWatcher>,
 }
 
 impl MirrorManager {
@@ -39,6 +45,7 @@ impl MirrorManager {
         fuse_mount_path: PathBuf,
     ) -> (Self, mpsc::Sender<MirrorCommand>) {
         let (tx, rx) = mpsc::channel(32);
+        let (w_tx, w_rx) = mpsc::channel(100);
         
         let ctx = Arc::new(MirrorContext {
             db,
@@ -49,6 +56,9 @@ impl MirrorManager {
         let manager = Self {
             ctx,
             command_rx: rx,
+            watcher_rx: w_rx,
+            watcher_tx: w_tx,
+            watcher: None,
         };
         
         (manager, tx)
@@ -65,6 +75,28 @@ impl MirrorManager {
             info!("🪞 MirrorManager iniciado (Deferred & Async Bootstrap)");
             info!("   Mirror: {:?}", self.ctx.mirror_path);
             info!("   FUSE:   {:?}", self.ctx.fuse_mount_path);
+
+            // Iniciar Watcher
+            let w_tx = self.watcher_tx.clone();
+            let mirror_path = self.ctx.mirror_path.clone();
+            
+            info!("👷 Despachando inicialización del Watcher a thread pool dedicado (blocking)...");
+            let watcher_result = tokio::task::spawn_blocking(move || {
+                MirrorWatcher::new(&mirror_path, w_tx)
+            }).await;
+
+            match watcher_result {
+                Ok(Ok(w)) => {
+                    info!("👀 Watcher activado exitosamente");
+                    self.watcher = Some(w);
+                },
+                Ok(Err(e)) => {
+                    error!("❌ Error inicializando watcher (Lógica): {:?}", e);
+                },
+                Err(e) => {
+                    error!("❌ Error fatal en task::spawn_blocking del watcher: {:?}", e);
+                }
+            }
 
             // Initial Scan / Bootstrap DESACOPLADO
             // Ejecutamos bootstrap en su propia task para no bloquear el procesamiento de mensajes IPC
@@ -97,7 +129,7 @@ impl MirrorManager {
             // Asegurar que el directorio padre existe
             if let Some(parent) = mirror_file.parent() {
                 if !parent.exists() {
-                   let _ = tokio::fs::create_dir_all(parent).await;
+                    let _ = tokio::fs::create_dir_all(parent).await;
                 }
             }
             
@@ -130,22 +162,30 @@ impl MirrorManager {
     }
 
     async fn run_loop(&mut self) {
-        while let Some(cmd) = self.command_rx.recv().await {
-            tracing::info!("🪞 MirrorManager recibió comando: {:?}", cmd);
-            match cmd {
-                MirrorCommand::SetOnlineOnly { path } => {
-                    Self::static_handle_set_online_only(&self.ctx, &path).await;
+        loop {
+            tokio::select! {
+                Some(cmd) = self.command_rx.recv() => {
+                    tracing::info!("🪞 MirrorManager recibió comando: {:?}", cmd);
+                    match cmd {
+                        MirrorCommand::SetOnlineOnly { path } => {
+                            Self::static_handle_set_online_only(&self.ctx, &path).await;
+                        }
+                        MirrorCommand::SetLocalOnline { path } => {
+                            Self::static_handle_set_local_online(&self.ctx, &path).await;
+                        }
+                        MirrorCommand::Refresh => {
+                             let ctx_refresh = self.ctx.clone();
+                             tokio::spawn(async move {
+                                 let _ = Self::run_bootstrap(ctx_refresh).await;
+                             });
+                        }
+                    }
                 }
-                MirrorCommand::SetLocalOnline { path } => {
-                    Self::static_handle_set_local_online(&self.ctx, &path).await;
+                Some(events) = self.watcher_rx.recv() => {
+                    self.handle_fs_events(events).await;
                 }
-                MirrorCommand::Refresh => {
-                    // Trigger manual bootstrap?
-                    // Requeriría spawnear de nuevo la task de bootstrap
-                     let ctx_refresh = self.ctx.clone();
-                     tokio::spawn(async move {
-                         let _ = Self::run_bootstrap(ctx_refresh).await;
-                     });
+                else => {
+                    break;
                 }
             }
         }
@@ -389,4 +429,188 @@ impl MirrorManager {
               });
         }
     }
+
+    /// Procesa eventos del sistema de archivos (Watcher)
+    async fn handle_fs_events(&self, events: Vec<DebouncedEvent>) {
+        for event in events {
+            let path = event.path;
+            
+            // 1. Filtrar eventos fuera de interés
+            // Ignorar .gdrive_tmp_ops
+            if path.to_string_lossy().contains(".gdrive_tmp_ops") {
+                continue;
+            }
+            
+            // Ignorar archivos parciales o temporales comunes
+            if let Some(ext) = path.extension() {
+                let ext_str = ext.to_string_lossy();
+                if ext_str == "part" || ext_str == "tmp" || ext_str == "crdownload" {
+                    continue;
+                }
+            }
+            
+            // Calcular ruta relativa
+            let relative = match path.strip_prefix(&self.ctx.mirror_path) {
+                Ok(p) => p,
+                Err(_) => continue, // No debería pasar
+            };
+            
+            let relative_str = relative.to_string_lossy();
+            if relative_str.is_empty() { continue; } // Root
+
+            // 2. Determinar tipo de evento y verificar Symlinks
+            // Para eventos CREATE/MODIFY, verificamos si es symlink (Ignorar)
+            match event.kind {
+                notify_debouncer_mini::DebouncedEventKind::Any => {
+                    // Check existence and type
+                    match tokio::fs::symlink_metadata(&path).await {
+                        Ok(meta) => {
+                            if meta.is_symlink() {
+                                // Es un symlink (OnlineOnly), ignorar cambios
+                                // El MirrorManager es el único que crea symlinks aquí
+                                continue;
+                            }
+                            // Es archivo real o directorio -> Procesar como Modificación/Creación
+                            self.handle_local_change(&path, &relative_str, meta.is_dir()).await;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // Archivo borrado -> Procesar eliminación
+                            self.handle_local_delete(&relative_str).await;
+                        }
+                        Err(e) => {
+                            error!("Error leyendo metadata para evento FS: {:?}", e);
+                        }
+                    }
+                }
+                _ => {} // DebouncedEventKind usually is just Any in mini? No, it has generic.
+                        // wait, DebounceEvent struct has `kind`.
+            }
+        }
+    }
+
+    async fn handle_local_change(&self, path: &PathBuf, relative_path: &str, is_dir: bool) {
+        tracing::debug!("📝 Cambio local detectado: {} (dir={})", relative_path, is_dir);
+        
+        let db = &self.ctx.db;
+        
+        // 1. Resolver padre
+        let parent_path = match PathBuf::from(relative_path).parent() {
+            Some(p) => p.to_string_lossy().to_string(),
+            None => "".to_string(),
+        };
+        
+        let parent_inode = if parent_path.is_empty() {
+            1 // Root
+        } else {
+            match db.resolve_relative_path_to_inode(&parent_path).await {
+                Ok(Some(i)) => i,
+                Ok(None) => {
+                    warn!("Padre no encontrado en DB para cambio local: {}", relative_path);
+                    return;
+                }
+                Err(e) => {
+                    error!("Error resolviendo padre: {:?}", e);
+                    return;
+                }
+            }
+        };
+
+        // 2. Obtener nombre
+        let name = match PathBuf::from(relative_path).file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => return,
+        };
+
+        // 3. Verificar si ya existe (Update vs Create)
+        let existing_inode = match db.lookup(parent_inode, &name).await {
+            Ok(i) => i,
+            Err(_) => None,
+        };
+
+        let inode = if let Some(i) = existing_inode {
+            // UPDATE
+            i
+        } else {
+            // CREATE - Generar ID temporal
+            let temp_id = format!("temp_{}", uuid::Uuid::new_v4());
+            match db.get_or_create_inode(&temp_id).await {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("Error creando inode temporal: {:?}", e);
+                    return;
+                }
+            }
+        };
+
+        // 4. Actualizar Metadatos (Size, Mtime)
+        // Leemos del disco real
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            use std::os::unix::fs::MetadataExt;
+            let size = meta.len() as i64;
+            let mtime = meta.mtime();
+            let mode = meta.mode();
+            
+            // Detectar MIME type básico
+            let mime = mime_guess::from_path(path).first().map(|m| m.essence_str().to_string());
+
+            if let Err(e) = db.upsert_file_metadata(inode, size, mtime, mode, is_dir, mime.as_deref()).await {
+                error!("Error actualizando metadata en DB: {:?}", e);
+            }
+        }
+
+        // 5. Vincular al directorio (Dentry)
+        if let Err(e) = db.upsert_dentry(parent_inode, inode, &name).await {
+             error!("Error actualizando dentry: {:?}", e);
+        }
+
+        // 6. Marcar DIRTY y LocalOnline
+        // Usamos raw SQL porque no tenemos metodo "mark_dirty_local" facil expuesto
+        // También ponemos availability = local_online
+        let sql = "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 1, 0, 'local_online') 
+                   ON CONFLICT(inode) DO UPDATE SET dirty=1, availability='local_online'";
+        
+        if let Err(e) = sqlx::query(sql)
+            .bind(inode as i64)
+            .execute(db.pool())
+            .await 
+        {
+             error!("Error marcando dirty: {:?}", e);
+        }
+        
+        info!("✅ Cambio local registrado: {} (inode={})", relative_path, inode);
+    }
+    
+    async fn handle_local_delete(&self, relative_path: &str) {
+        tracing::debug!("🗑️ Eliminación local detectada: {}", relative_path);
+        let db = &self.ctx.db;
+        
+        // Resolver inode antes de que desaparezca de nuestra memoria lógica
+        // (Aunque físicamente ya no está, en la DB sí)
+        if let Ok(Some(inode)) = db.resolve_relative_path_to_inode(relative_path).await {
+            // Obtener gdrive_id para soft delete
+            let gdrive_id: Option<String> = sqlx::query_scalar("SELECT gdrive_id FROM inodes WHERE inode = ?")
+                .bind(inode as i64)
+                .fetch_optional(db.pool())
+                .await
+                .unwrap_or(None);
+            
+            if let Some(gid) = gdrive_id {
+                if let Err(e) = db.soft_delete_by_gdrive_id(&gid).await {
+                    error!("Error realizando soft delete en DB: {:?}", e);
+                } else {
+                    info!("✅ Eliminación registrada: {} (id={})", relative_path, gid);
+                }
+            } else {
+                 // Archivo sin gdrive_id (temporal local), hard delete
+                 info!("Eliminando archivo temporal local: {}", relative_path);
+                 // TODO: Hard delete inode implementado en repo?
+                 // No expuesto publicamente soft_delete_inode, pero podemos marcar en sync_state manual
+                 // O usar soft_delete con un ID falso? No.
+                 // Mejor ignorar o limpiar.
+            }
+        } else {
+            // Ya no existe en DB? Entonces no importa.
+        }
+    }
 }
+

@@ -47,7 +47,8 @@ uuid = { version = "1.11", features = ["v4"] }
 percent-encoding = "2.3"
 ksni = "0.2"
 dirs = "5.0"
-notify = { version = "6.1", default-features = false, features = ["macos_kqueue"] }
+notify = { version = "6.1", features = ["serde"] }
+notify-debouncer-mini = "0.4"
 mime_guess = "2.0.5"
 md-5 = "0.10"
 
