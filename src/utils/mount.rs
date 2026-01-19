@@ -80,6 +80,51 @@ pub fn unmount<P: AsRef<Path>>(path: P) -> Result<()> {
             .arg("-l") // lazy
             .arg(path_str.as_ref())
             .status();
+        
+        // Fallback final: abortar conexiones FUSE si todo lo demás falla
+        tracing::warn!("Desmontaje normal falló, intentando abort de conexiones FUSE...");
+        let _ = abort_fuse_connections();
+    }
+    
+    Ok(())
+}
+
+/// Aborta conexiones FUSE huérfanas para liberar hilos bloqueados
+/// 
+/// Esta función es un último recurso cuando el desmontaje normal falla.
+/// Escribe "1" en los archivos de abort del subsistema FUSE para forzar
+/// la terminación de conexiones bloqueadas.
+/// 
+/// **ADVERTENCIA**: Esto puede causar pérdida de datos en operaciones pendientes.
+/// Solo usar cuando el desmontaje normal ha fallado.
+pub fn abort_fuse_connections() -> Result<()> {
+    let connections_dir = std::path::Path::new("/sys/fs/fuse/connections");
+    
+    if !connections_dir.exists() {
+        tracing::debug!("Directorio de conexiones FUSE no existe");
+        return Ok(());
+    }
+    
+    tracing::warn!("⚠️ Abortando conexiones FUSE residuales...");
+    
+    for entry in std::fs::read_dir(connections_dir)? {
+        let entry = entry?;
+        let abort_path = entry.path().join("abort");
+        
+        if abort_path.exists() {
+            match std::fs::write(&abort_path, "1") {
+                Ok(_) => {
+                    tracing::info!("✅ Abortada conexión FUSE: {:?}", entry.file_name());
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "No se pudo abortar {:?}: {} (puede requerir privilegios)",
+                        abort_path,
+                        e
+                    );
+                }
+            }
+        }
     }
     
     Ok(())

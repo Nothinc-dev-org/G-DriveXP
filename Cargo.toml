@@ -50,6 +50,7 @@ dirs = "5.0"
 notify = { version = "6.1", default-features = false, features = ["macos_kqueue"] }
 mime_guess = "2.0.5"
 md-5 = "0.10"
+ctrlc = "3.4"
 
 [profile.release]
 opt-level = 3

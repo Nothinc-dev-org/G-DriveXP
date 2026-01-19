@@ -17,6 +17,7 @@ pub struct AppModel {
     pub local_dirs: Vec<crate::db::LocalSyncDir>,
     pub db: Option<Arc<crate::db::MetadataRepository>>,
     pub local_sync_sender: Option<crate::sync::local_sync_manager::LocalSyncCommandSender>,
+    pub shutdown_requested: bool,
 }
 
 #[derive(Debug)]
@@ -31,6 +32,7 @@ pub enum AppMsg {
     Hide,
     Quit,
     ShowWindow,
+    PrepareShutdown,
     // Mensajes para el historial
     LogAction(ActionType, String),
     // Mensajes para sincronización local
@@ -240,6 +242,7 @@ impl Component for AppModel {
             local_dirs: Vec::new(),
             db: None,
             local_sync_sender: None,
+            shutdown_requested: false,
         };
 
         // Iniciar icono de bandeja
@@ -355,6 +358,12 @@ impl Component for AppModel {
                 sender.input(AppMsg::RefreshLocalDirs);
             }
             AppMsg::AddLocalDir => {
+                // No permitir diálogos si estamos en cierre
+                if self.shutdown_requested {
+                    tracing::warn!("Operación bloqueada: aplicación en proceso de cierre");
+                    return;
+                }
+                
                 #[allow(deprecated)]
                 let dialog = gtk::FileChooserDialog::new(
                     Some("Seleccionar directorio"),
@@ -506,8 +515,18 @@ impl Component for AppModel {
                 tracing::info!("🔗 LocalSyncSender configurado");
                 self.local_sync_sender = Some(sync_sender);
             }
+            AppMsg::PrepareShutdown => {
+                self.shutdown_requested = true;
+                tracing::info!("🛑 Shutdown preparado, deteniendo operaciones de UI...");
+                
+                // El backend está esperando nuestra confirmación para proceder
+                // Todas las operaciones de GTK que puedan acceder a FUSE se bloquean ahora
+            }
             AppMsg::Quit => {
                 tracing::info!("Cerrando aplicación...");
+                
+                // Marcar shutdown para bloquear nuevas operaciones
+                self.shutdown_requested = true;
                 
                 // Intentar desmontar si tenemos el mount point
                 if let Some(ref mount_point) = self.mount_point {

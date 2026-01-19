@@ -23,6 +23,10 @@ fn main() -> Result<()> {
     init_logging()?;
     
     tracing::info!("🚀 Iniciando FedoraDrive-rs v{}", env!("CARGO_PKG_VERSION"));
+    
+    // Registrar manejadores de señales para cierre graceful
+    utils::shutdown::register_shutdown_handlers();
+    tracing::info!("🛡️ Signal handlers registrados");
 
     // Iniciar la aplicación Relm4
     tracing::info!("🖥️ Iniciando interfaz gráfica...");
@@ -200,13 +204,25 @@ pub fn run_backend(
             }
         }
         
+        tracing::info!("🛑 Iniciando secuencia de cierre ordenado...");
+        ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Preparando cierre...".to_string()));
+        
+        // CRITICAL: Notificar a GTK que detenga operaciones PRIMERO
+        ui_sender.input(gui::app_model::AppMsg::PrepareShutdown);
+        
+        // Esperar a que GTK procese el mensaje y detenga operaciones
+        // Este timeout permite que hilos de Pango/GTK terminen accesos a FUSE
+        tracing::info!("Esperando a que GTK confirme cierre...");
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        
+        // Ahora es seguro desmontar FUSE (los hilos de GTK no deben estar accediendo)
         tracing::info!("🛑 Desmontando sistema de archivos y cerrando...");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Desmontando...".to_string()));
         
         // El drop de 'handle' debería intentar desmontar, pero lo forzamos por seguridad
         let _ = utils::mount::unmount(&config.mount_point);
         
-        // Forzar salida del proceso (GTK no responde a señales del backend)
+        // Forzar salida del proceso
         tracing::info!("👋 Cerrando aplicación...");
         std::process::exit(0);
     })
