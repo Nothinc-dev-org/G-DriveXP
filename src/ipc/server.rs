@@ -11,7 +11,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use crate::db::MetadataRepository;
-use super::{IpcRequest, IpcResponse, SyncStatus};
+use crate::sync::local_sync_manager::LocalSyncCommandSender;
+use super::{IpcRequest, IpcResponse, SyncStatus, FileAvailability};
 
 /// Servidor IPC para comunicación con extensiones externas
 pub struct IpcServer {
@@ -19,6 +20,7 @@ pub struct IpcServer {
     db: Arc<MetadataRepository>,
     mount_point: PathBuf,
     cache_dir: PathBuf,
+    local_sync_tx: Option<LocalSyncCommandSender>,
 }
 
 impl IpcServer {
@@ -34,7 +36,14 @@ impl IpcServer {
             db,
             mount_point,
             cache_dir,
+            local_sync_tx: None,
         }
+    }
+
+    /// Establece el canal de comandos para LocalSyncManager
+    pub fn with_local_sync(mut self, tx: LocalSyncCommandSender) -> Self {
+        self.local_sync_tx = Some(tx);
+        self
     }
 
     /// Inicia el servidor IPC en un task de Tokio separado
@@ -65,9 +74,10 @@ impl IpcServer {
                     let db = self.db.clone();
                     let mount_point = self.mount_point.clone();
                     let cache_dir = self.cache_dir.clone();
+                    let local_sync_tx = self.local_sync_tx.clone();
                     
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, db, mount_point, cache_dir).await {
+                        if let Err(e) = handle_client(stream, db, mount_point, cache_dir, local_sync_tx).await {
                             tracing::debug!("Error manejando cliente IPC: {:?}", e);
                         }
                     });
@@ -86,6 +96,7 @@ async fn handle_client(
     db: Arc<MetadataRepository>,
     mount_point: PathBuf,
     cache_dir: PathBuf,
+    local_sync_tx: Option<LocalSyncCommandSender>,
 ) -> Result<()> {
     // Buffer para leer el request (max 4KB)
     let mut buf = vec![0u8; 4096];
@@ -111,6 +122,22 @@ async fn handle_client(
         IpcRequest::GetFileStatus { path } => {
             let status = get_file_status(&db, &mount_point, &cache_dir, &path).await;
             IpcResponse::FileStatus(status)
+        }
+        IpcRequest::GetFileAvailability { path } => {
+            let avail = get_file_availability(&db, &path).await;
+            IpcResponse::Availability(avail)
+        }
+        IpcRequest::SetOnlineOnly { path } => {
+            match set_availability(&db, &local_sync_tx, &path, "online_only").await {
+                Ok(()) => IpcResponse::Success,
+                Err(e) => IpcResponse::Error { message: e.to_string() },
+            }
+        }
+        IpcRequest::SetLocalOnline { path } => {
+            match set_availability(&db, &local_sync_tx, &path, "local_online").await {
+                Ok(()) => IpcResponse::Success,
+                Err(e) => IpcResponse::Error { message: e.to_string() },
+            }
         }
     };
     
@@ -281,6 +308,73 @@ async fn get_sync_state(
             }
         }
     }
+}
+
+/// Obtiene la disponibilidad de un archivo en Local Sync
+async fn get_file_availability(
+    db: &MetadataRepository,
+    file_path: &str,
+) -> FileAvailability {
+    // Decodificar URI file://
+    let path = decode_file_uri(file_path);
+    
+    // Buscar en local_sync_files por path absoluto
+    match db.find_local_sync_file_by_absolute_path(&path).await {
+        Ok(Some(file)) => {
+            match file.availability.as_str() {
+                "local_online" => FileAvailability::LocalOnline,
+                "online_only" => FileAvailability::OnlineOnly,
+                _ => FileAvailability::NotTracked,
+            }
+        }
+        _ => FileAvailability::NotTracked,
+    }
+}
+
+/// Cambia la disponibilidad de un archivo
+async fn set_availability(
+    db: &MetadataRepository,
+    local_sync_tx: &Option<LocalSyncCommandSender>,
+    file_path: &str,
+    availability: &str,
+) -> Result<()> {
+    use crate::sync::local_sync_manager::LocalSyncCommand;
+    
+    let path = decode_file_uri(file_path);
+    
+    // Resolver path a sync_dir_id y relative_path
+    let (sync_dir_id, relative_path) = db.resolve_local_sync_path(&path).await?;
+    
+    // Obtener el canal de comandos
+    let tx = local_sync_tx.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("LocalSyncManager no disponible"))?;
+    
+    // Enviar comando al LocalSyncManager
+    let cmd = match availability {
+        "online_only" => LocalSyncCommand::SetOnlineOnly {
+            sync_dir_id,
+            relative_path,
+        },
+        "local_online" => LocalSyncCommand::SetLocalOnline {
+            sync_dir_id,
+            relative_path,
+        },
+        _ => return Err(anyhow::anyhow!("Availability desconocida: {}", availability)),
+    };
+    
+    tx.send(cmd).await
+        .map_err(|e| anyhow::anyhow!("Error enviando comando: {}", e))?;
+    
+    Ok(())
+}
+
+/// Decodifica un URI file:// a path absoluto
+fn decode_file_uri(uri: &str) -> String {
+    let raw_path = uri.strip_prefix("file://").unwrap_or(uri);
+    percent_decode_str(raw_path)
+        .decode_utf8()
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| raw_path.to_string())
 }
 
 impl Drop for IpcServer {

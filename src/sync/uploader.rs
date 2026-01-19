@@ -81,18 +81,12 @@ impl Uploader {
     /// Ejecuta un ciclo de upload
     /// Retorna el número de archivos subidos
     async fn upload_cycle(&self) -> Result<usize> {
-        // 1. Obtener archivos dirty
+        // 1. Obtener archivos dirty de FUSE
         let dirty_files = self.get_dirty_files().await?;
-        
-        if dirty_files.is_empty() {
-            return Ok(0);
-        }
-        
-        debug!("📋 Encontrados {} archivos dirty para subir", dirty_files.len());
         
         let mut uploaded_count = 0;
         
-        // 2. Procesar cada archivo
+        // 2. Procesar archivos FUSE
         for (inode, gdrive_id, is_delete) in dirty_files {
             match self.upload_file(inode, &gdrive_id, is_delete).await {
                 Ok(()) => {
@@ -103,6 +97,18 @@ impl Uploader {
                     // Continuamos con los demás
                 }
             }
+        }
+        
+        // 3. Procesar archivos de Local Sync
+        match self.upload_local_sync_files().await {
+            Ok(count) => uploaded_count += count,
+            Err(e) => {
+                warn!("Error en upload de local sync files: {:?}", e);
+            }
+        }
+        
+        if uploaded_count > 0 {
+            debug!("📋 Total subidos en este ciclo: {}", uploaded_count);
         }
         
         Ok(uploaded_count)
@@ -565,5 +571,158 @@ impl Uploader {
         .await?;
         
         Ok(parent_gdrive_id)
+    }
+
+    // ============================================================
+    // Local Sync Upload Methods
+    // ============================================================
+
+    /// Sube archivos dirty de local_sync_files
+    async fn upload_local_sync_files(&self) -> Result<usize> {
+        let dirty_files = self.db.get_dirty_local_sync_files().await?;
+        
+        if dirty_files.is_empty() {
+            return Ok(0);
+        }
+        
+        debug!("📋 Encontrados {} archivos local sync dirty", dirty_files.len());
+        
+        let mut uploaded = 0;
+        
+        for file in dirty_files {
+            // Solo subir si está en modo local_online
+            if file.availability != "local_online" {
+                debug!("Saltando archivo online_only: {}", file.relative_path);
+                continue;
+            }
+            
+            // Obtener path absoluto
+            let base_dir = match self.db.get_local_sync_dir(file.sync_dir_id).await {
+                Ok(dir) => dir,
+                Err(e) => {
+                    warn!("Error obteniendo sync_dir_id={}: {:?}", file.sync_dir_id, e);
+                    continue;
+                }
+            };
+            
+            let local_path = std::path::PathBuf::from(&base_dir.local_path).join(&file.relative_path);
+            
+            // Verificar que el archivo existe y NO es symlink
+            if !local_path.exists() || local_path.is_symlink() {
+                debug!("Archivo no disponible localmente: {}", file.relative_path);
+                continue;
+            }
+            
+            // Procesar según si tiene gdrive_id o no
+            match self.upload_local_file(&file, &local_path, &base_dir).await {
+                Ok(()) => {
+                    uploaded += 1;
+                }
+                Err(e) => {
+                    warn!("Error subiendo {}: {:?}", file.relative_path, e);
+                }
+            }
+        }
+        
+        if uploaded > 0 {
+            info!("✅ Subidos {} archivos de local sync", uploaded);
+        }
+        
+        Ok(uploaded)
+    }
+
+    /// Sube un archivo individual de local sync
+    async fn upload_local_file(
+        &self,
+        file: &crate::db::LocalSyncFile,
+        local_path: &std::path::Path,
+        base_dir: &crate::db::LocalSyncDir,
+    ) -> Result<()> {
+        if file.is_dir {
+            // Los directorios se manejan por creación automática
+            self.db.clear_local_file_dirty(file.id).await?;
+            return Ok(());
+        }
+        
+        // Determinar el padre en Drive
+        let parent_gdrive_id = match &file.relative_path.rsplit_once('/') {
+            Some((parent_rel_path, _)) => {
+                // Buscar el gdrive_id del directorio padre
+                match self.db.get_local_sync_file(file.sync_dir_id, parent_rel_path).await? {
+                    Some(parent_file) if parent_file.gdrive_id.is_some() => {
+                        parent_file.gdrive_id.unwrap()
+                    }
+                    _ => {
+                        // Si no tiene padre conocido, usar la raíz del sync dir
+                        base_dir.gdrive_folder_id.clone()
+                            .unwrap_or_else(|| "root".to_string())
+                    }
+                }
+            }
+            None => {
+                // Archivo en la raíz del sync dir
+                base_dir.gdrive_folder_id.clone()
+                    .unwrap_or_else(|| "root".to_string())
+            }
+        };
+        
+        let file_name = local_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        
+        // Detectar MIME type
+        let mime_type = mime_guess::from_path(local_path)
+            .first()
+            .map(|m| m.essence_str().to_string());
+        
+        match &file.gdrive_id {
+            None => {
+                // Archivo nuevo: subir a Drive
+                info!("📤 Creando archivo local sync en Drive: {}", file.relative_path);
+                
+                let gdrive_id = self.client.upload_file(
+                    local_path,
+                    file_name,
+                    mime_type.as_deref(),
+                    &parent_gdrive_id,
+                ).await.context("Error subiendo archivo local sync")?;
+                
+                // Actualizar BD
+                self.db.set_local_file_gdrive_id(file.id, &gdrive_id).await?;
+                self.db.clear_local_file_dirty(file.id).await?;
+                
+                // Actualizar remote_md5
+                if let Some(md5) = self.client.get_file_md5(&gdrive_id).await? {
+                    self.db.update_local_file_from_remote(file.id, Some(&md5), None).await?;
+                }
+                
+                info!("✅ Archivo local sync creado: {}", gdrive_id);
+                self.history.log(ActionType::Create, format!("Local sync: {}", file.relative_path));
+                
+                Ok(())
+            }
+            Some(gdrive_id) => {
+                // Archivo existente: actualizar contenido
+                info!("📤 Actualizando archivo local sync: {}", file.relative_path);
+                
+                // TODO: Implementar detección de conflictos similar a update_file
+                
+                self.client.update_file_content(gdrive_id, local_path).await
+                    .context("Error actualizando archivo local sync")?;
+                
+                // Actualizar BD
+                self.db.clear_local_file_dirty(file.id).await?;
+                
+                // Actualizar remote_md5
+                if let Some(md5) = self.client.get_file_md5(gdrive_id).await? {
+                    self.db.update_local_file_from_remote(file.id, Some(&md5), None).await?;
+                }
+                
+                info!("✅ Archivo local sync actualizado: {}", gdrive_id);
+                self.history.log(ActionType::Upload, format!("Local sync: {}", file.relative_path));
+                
+                Ok(())
+            }
+        }
     }
 }

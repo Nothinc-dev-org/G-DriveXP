@@ -13,6 +13,12 @@ pub enum IpcRequest {
     GetFileStatus { path: String },
     /// Ping para verificar conexión
     Ping,
+    /// Cambiar archivo a modo "Just Online" (liberar espacio local)
+    SetOnlineOnly { path: String },
+    /// Cambiar archivo a modo "Local & Online" (descargar y mantener local)
+    SetLocalOnline { path: String },
+    /// Obtener disponibilidad actual de un archivo
+    GetFileAvailability { path: String },
 }
 
 /// Respuesta del servidor IPC
@@ -22,8 +28,23 @@ pub enum IpcResponse {
     FileStatus(SyncStatus),
     /// Respuesta a Ping
     Pong,
+    /// Disponibilidad del archivo
+    Availability(FileAvailability),
+    /// Operación exitosa
+    Success,
     /// Error en la operación
     Error { message: String },
+}
+
+/// Disponibilidad de un archivo en Local Sync
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileAvailability {
+    /// Archivo real en disco, sincronizado con Drive
+    LocalOnline,
+    /// Symlink a FUSE, solo disponible online
+    OnlineOnly,
+    /// No es un archivo de Local Sync
+    NotTracked,
 }
 
 /// Estado de sincronización de un archivo

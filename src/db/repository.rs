@@ -154,6 +154,43 @@ impl MetadataRepository {
             tracing::info!("Migración de dentry_deleted completada");
         }
 
+        // 5. Crear tabla local_sync_files para Local Sync híbrido
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS local_sync_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_dir_id INTEGER NOT NULL REFERENCES local_sync_dirs(id) ON DELETE CASCADE,
+                relative_path TEXT NOT NULL,
+                is_dir INTEGER NOT NULL DEFAULT 0,
+                
+                availability TEXT NOT NULL DEFAULT 'local_online',
+                
+                local_mtime INTEGER,
+                local_size INTEGER,
+                local_md5 TEXT,
+                
+                gdrive_id TEXT,
+                remote_md5 TEXT,
+                remote_mtime INTEGER,
+                
+                dirty INTEGER NOT NULL DEFAULT 1,
+                last_synced INTEGER,
+                
+                UNIQUE(sync_dir_id, relative_path)
+            )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_local_sync_files_dirty ON local_sync_files(dirty) WHERE dirty = 1")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_local_sync_files_gdrive ON local_sync_files(gdrive_id)")
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 
@@ -811,6 +848,258 @@ impl MetadataRepository {
 
         Ok(())
     }
+
+    // ============================================================
+    // Métodos para Local Sync Files (Hybrid Local Sync)
+    // ============================================================
+
+    /// Inserta o actualiza un archivo en local_sync_files
+    pub async fn upsert_local_sync_file(
+        &self,
+        sync_dir_id: i64,
+        relative_path: &str,
+        is_dir: bool,
+        availability: &str,
+        local_mtime: Option<i64>,
+        local_size: Option<i64>,
+        local_md5: Option<&str>,
+    ) -> Result<i64> {
+        let id = sqlx::query(
+            r#"
+            INSERT INTO local_sync_files 
+                (sync_dir_id, relative_path, is_dir, availability, local_mtime, local_size, local_md5, dirty)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(sync_dir_id, relative_path) DO UPDATE SET
+                is_dir = excluded.is_dir,
+                availability = excluded.availability,
+                local_mtime = excluded.local_mtime,
+                local_size = excluded.local_size,
+                local_md5 = excluded.local_md5,
+                dirty = 1
+            "#
+        )
+        .bind(sync_dir_id)
+        .bind(relative_path)
+        .bind(is_dir)
+        .bind(availability)
+        .bind(local_mtime)
+        .bind(local_size)
+        .bind(local_md5)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        Ok(id)
+    }
+
+    /// Obtiene archivos dirty para subir
+    pub async fn get_dirty_local_sync_files(&self) -> Result<Vec<LocalSyncFile>> {
+        let files = sqlx::query_as::<_, LocalSyncFile>(
+            "SELECT * FROM local_sync_files WHERE dirty = 1 ORDER BY id"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(files)
+    }
+
+    /// Obtiene un archivo local por sync_dir_id y relative_path
+    pub async fn get_local_sync_file(&self, sync_dir_id: i64, relative_path: &str) -> Result<Option<LocalSyncFile>> {
+        let file = sqlx::query_as::<_, LocalSyncFile>(
+            "SELECT * FROM local_sync_files WHERE sync_dir_id = ? AND relative_path = ?"
+        )
+        .bind(sync_dir_id)
+        .bind(relative_path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(file)
+    }
+
+    /// Busca un archivo local por gdrive_id
+    pub async fn find_local_sync_file_by_gdrive_id(&self, gdrive_id: &str) -> Result<Option<LocalSyncFile>> {
+        let file = sqlx::query_as::<_, LocalSyncFile>(
+            "SELECT * FROM local_sync_files WHERE gdrive_id = ?"
+        )
+        .bind(gdrive_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(file)
+    }
+
+    /// Obtiene un directorio local por ID
+    pub async fn get_local_sync_dir(&self, id: i64) -> Result<LocalSyncDir> {
+        let dir = sqlx::query_as::<_, LocalSyncDir>(
+            "SELECT * FROM local_sync_dirs WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(dir)
+    }
+
+    /// Cambia el modo de disponibilidad de un archivo
+    pub async fn set_file_availability(&self, sync_dir_id: i64, relative_path: &str, availability: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE local_sync_files SET availability = ? WHERE sync_dir_id = ? AND relative_path = ?"
+        )
+        .bind(availability)
+        .bind(sync_dir_id)
+        .bind(relative_path)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Actualiza metadatos locales de un archivo
+    pub async fn update_local_file_metadata(
+        &self,
+        sync_dir_id: i64,
+        relative_path: &str,
+        availability: &str,
+        local_size: i64,
+        local_mtime: i64,
+        local_md5: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE local_sync_files 
+            SET availability = ?, local_size = ?, local_mtime = ?, local_md5 = ?
+            WHERE sync_dir_id = ? AND relative_path = ?
+            "#
+        )
+        .bind(availability)
+        .bind(local_size)
+        .bind(local_mtime)
+        .bind(local_md5)
+        .bind(sync_dir_id)
+        .bind(relative_path)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Actualiza metadatos remotos desde un cambio de Drive
+    pub async fn update_local_file_from_remote(
+        &self,
+        file_id: i64,
+        remote_md5: Option<&str>,
+        remote_mtime: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE local_sync_files SET remote_md5 = ?, remote_mtime = ?, dirty = 0 WHERE id = ?"
+        )
+        .bind(remote_md5)
+        .bind(remote_mtime)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Actualiza solo metadatos remotos (para archivos online_only)
+    pub async fn update_local_file_remote_metadata(&self, file_id: i64, remote_md5: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE local_sync_files SET remote_md5 = ? WHERE id = ?"
+        )
+        .bind(remote_md5)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Limpia el flag dirty de un archivo después de una subida exitosa
+    pub async fn clear_local_file_dirty(&self, file_id: i64) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        sqlx::query(
+            "UPDATE local_sync_files SET dirty = 0, last_synced = ? WHERE id = ?"
+        )
+        .bind(now)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Establece el gdrive_id para un archivo local después de crearlo en Drive
+    pub async fn set_local_file_gdrive_id(&self, file_id: i64, gdrive_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE local_sync_files SET gdrive_id = ? WHERE id = ?"
+        )
+        .bind(gdrive_id)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Busca un archivo de local sync por su path absoluto del filesystem
+    /// Útil para comandos IPC que reciben file:// URIs de Nautilus
+    pub async fn find_local_sync_file_by_absolute_path(
+        &self,
+        absolute_path: &str,
+    ) -> Result<Option<LocalSyncFile>> {
+        // Obtener todas las carpetas locales habilitadas
+        let sync_dirs = self.get_enabled_local_sync_dirs().await?;
+        
+        // Intentar encontrar qué carpeta contiene este path
+        for dir in sync_dirs {
+            let base_path = &dir.local_path;
+            
+            // Si el absolute_path empieza con este base_path
+            if absolute_path.starts_with(base_path) {
+                // Calcular relative_path
+                let relative_path = absolute_path
+                    .strip_prefix(base_path)
+                    .unwrap_or("")
+                    .trim_start_matches('/');
+                
+                // Buscar el archivo en la DB
+                if let Some(file) = self.get_local_sync_file(dir.id, relative_path).await? {
+                    return Ok(Some(file));
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    /// Resuelve un path absoluto a (sync_dir_id, relative_path)
+    /// Lanza error si el path no pertenece a ninguna carpeta Local Sync
+    pub async fn resolve_local_sync_path(
+        &self,
+        absolute_path: &str,
+    ) -> Result<(i64, String)> {
+        let sync_dirs = self.get_enabled_local_sync_dirs().await?;
+        
+        for dir in sync_dirs {
+            let base_path = &dir.local_path;
+            
+            if absolute_path.starts_with(base_path) {
+                let relative_path = absolute_path
+                    .strip_prefix(base_path)
+                    .unwrap_or("")
+                    .trim_start_matches('/')
+                    .to_string();
+                
+                return Ok((dir.id, relative_path));
+            }
+        }
+        
+        Err(anyhow::anyhow!("Path no pertenece a ninguna carpeta Local Sync: {}", absolute_path))
+    }
 }
 
 /// Struct que representa un directorio local sincronizado
@@ -822,4 +1111,26 @@ pub struct LocalSyncDir {
     pub enabled: bool,
     pub last_sync: i64,
     pub created_at: i64,
+}
+
+/// Struct que representa un archivo individual en Local Sync
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LocalSyncFile {
+    pub id: i64,
+    pub sync_dir_id: i64,
+    pub relative_path: String,
+    pub is_dir: bool,
+    
+    pub availability: String,  // 'local_online' | 'online_only'
+    
+    pub local_mtime: Option<i64>,
+    pub local_size: Option<i64>,
+    pub local_md5: Option<String>,
+    
+    pub gdrive_id: Option<String>,
+    pub remote_md5: Option<String>,
+    pub remote_mtime: Option<i64>,
+    
+    pub dirty: bool,
+    pub last_synced: Option<i64>,
 }

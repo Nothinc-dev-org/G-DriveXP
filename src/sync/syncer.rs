@@ -228,7 +228,7 @@ impl BackgroundSyncer {
             }
 
             // Actualizar remote_md5 si está disponible (para detección de conflictos)
-            if let Some(md5) = file.md5_checksum {
+            if let Some(md5) = file.md5_checksum.clone() {
                 self.db.set_remote_md5(inode, &md5).await?;
             }
 
@@ -236,6 +236,81 @@ impl BackgroundSyncer {
                 "Cambio detectado: UPSERT file_id={}, name={}, is_dir={}",
                 file_id, name, is_dir
             );
+
+            // NUEVO: Verificar si este archivo pertenece a un Local Sync Directory
+            if let Err(e) = self.process_local_sync_change(&file,file_id).await {
+                tracing::warn!("Error procesando cambio local sync para {}: {:?}", file_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Procesa cambios remotos para archivos que pertenecen a Local Sync
+    async fn process_local_sync_change(
+        &self,
+        file: &google_drive3::api::File,
+        file_id: &str,
+    ) -> Result<()> {
+        // Buscar si este archivo está en local_sync_files
+        let local_file = match self.db.find_local_sync_file_by_gdrive_id(file_id).await? {
+            Some(f) => f,
+            None => return Ok(()), // No es un archivo de local sync
+        };
+
+        let base_dir = self.db.get_local_sync_dir(local_file.sync_dir_id).await?;
+        let local_path = std::path::PathBuf::from(&base_dir.local_path).join(&local_file.relative_path);
+
+        tracing::debug!("Procesando cambio local sync: {}", local_file.relative_path);
+
+        match local_file.availability.as_str() {
+            "local_online" => {
+                // Descargar contenido actualizado al path local
+                if !file.mime_type.as_deref().map(|m| m.contains("folder")).unwrap_or(false) {
+                    tracing::info!("📥 Descargando actualización para: {}", local_file.relative_path);
+                    
+                    // Descargar archivo usando chunks
+                    let file_size = file.size.unwrap_or(0) as u64;
+                    let mut content = Vec::with_capacity(file_size as usize);
+                    
+                    const CHUNK_SIZE: u32 = 10 * 1024 * 1024; // 10 MB
+                    let mut offset = 0u64;
+                    
+                    while offset < file_size {
+                        let size = std::cmp::min(CHUNK_SIZE, (file_size - offset) as u32);
+                        let chunk = self.client.download_chunk(file_id, offset, size).await?;
+                        content.extend_from_slice(&chunk);
+                        offset += chunk.len() as u64;
+                    }
+                    
+                    // Asegurar que el directorio padre existe
+                    if let Some(parent) = local_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    
+                    // Escribir archivo
+                    tokio::fs::write(&local_path, &content).await?;
+                    
+                    // Actualizar metadatos en DB
+                    let md5 = file.md5_checksum.as_deref();
+                    let mtime = file.modified_time.as_ref().map(|t| t.timestamp());
+                    
+                    self.db.update_local_file_from_remote(
+                        local_file.id,
+                        md5,
+                        mtime,
+                    ).await?;
+                    
+                    tracing::info!("✅ Archivo actualizado localmente: {}", local_file.relative_path);
+                }
+            }
+            "online_only" => {
+                // Solo actualizar metadatos (el symlink accederá a FUSE)
+                let md5 = file.md5_checksum.as_deref();
+                self.db.update_local_file_remote_metadata(local_file.id, md5).await?;
+                tracing::debug!("Metadatos remotos actualizados para online_only: {}", local_file.relative_path);
+            }
+            _ => {}
         }
 
         Ok(())

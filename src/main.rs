@@ -130,7 +130,16 @@ pub fn run_backend(
         );
         let _uploader_handle = uploader.spawn();
         
-        // Fase 2.4: Servidor IPC para extensiones externas (Nautilus)
+        // Fase 2.4: LocalSyncManager (sincronización bidireccional de carpetas locales)
+        // NOTA: Se crea ANTES del IPC Server para pasar el sender
+        tracing::info!("Iniciando LocalSyncManager...");
+        let (local_sync_manager, local_sync_sender) = sync::local_sync_manager::LocalSyncManager::new(
+            db.clone(),
+            config.mount_point.clone(),
+        );
+        let _local_sync_handle = local_sync_manager.spawn();
+        
+        // Fase 2.5: Servidor IPC para extensiones externas (Nautilus)
         tracing::info!("Iniciando servidor IPC...");
         let socket_path = ipc::get_socket_path();
         let ipc_server = ipc::server::IpcServer::new(
@@ -138,11 +147,10 @@ pub fn run_backend(
             db.clone(),
             config.mount_point.clone(),
             config.cache_dir.clone(),
-        );
+        )
+        .with_local_sync(local_sync_sender.clone());
         let _ipc_handle = ipc_server.spawn();
-        
 
-        
         // Fase 2.6: Local Watcher ELIMINADO (Reemplazado por estrategia de Symlinks)
         tracing::info!("Local Watcher desactivado (usando enlaces simbólicos)");
         
@@ -175,15 +183,6 @@ pub fn run_backend(
         tracing::info!("✅ Sistema de archivos montado exitosamente");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Sistema de archivos montado y activo".to_string()));
 
-        // Fase 2.5: LocalSyncManager (sincronización bidireccional de carpetas locales)
-        // INICIO DIFERIDO: Se inicia después de que el montaje FUSE está activo para evitar race conditions
-        tracing::info!("Iniciando LocalSyncManager...");
-        let (local_sync_manager, local_sync_sender) = sync::local_sync_manager::LocalSyncManager::new(
-            db.clone(),
-            config.mount_point.clone(),
-        );
-        let _local_sync_handle = local_sync_manager.spawn();
-        
         // Enviar el sender al GUI para que pueda disparar sincronizaciones
         ui_sender.input(gui::app_model::AppMsg::SetLocalSyncSender(local_sync_sender));
 
