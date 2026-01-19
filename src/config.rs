@@ -7,8 +7,11 @@ use std::path::PathBuf;
 /// Configuración persistente de la aplicación
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Punto de montaje del sistema de archivos FUSE
-    pub mount_point: PathBuf,
+    /// Punto de montaje del sistema de archivos FUSE (Oculto)
+    pub fuse_mount_path: PathBuf,
+
+    /// Directorio espejo visible para el usuario (~/GoogleDrive)
+    pub mirror_path: PathBuf,
     
     /// Directorio de caché para contenido de archivos
     pub cache_dir: PathBuf,
@@ -29,7 +32,8 @@ impl Config {
         let home = env::var("HOME")?;
         
         Ok(Self {
-            mount_point: PathBuf::from(format!("{}/GoogleDrive", home)),
+            fuse_mount_path: PathBuf::from(format!("{}/.local/share/g-drive-xp/cloud_mount", home)),
+            mirror_path: PathBuf::from(format!("{}/GoogleDrive", home)),
             cache_dir: PathBuf::from(format!("{}/.cache/fedoradrive", home)),
             db_path: PathBuf::from(format!("{}/.config/fedoradrive/metadata.db", home)),
             sync_interval_secs: 60,
@@ -82,20 +86,23 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         
-        // Crear el punto de montaje si no existe
+        // Crear el directorio espejo (visible) si no existe
+        fs::create_dir_all(&self.mirror_path)?;
+
+        // Crear el punto de montaje FUSE (oculto) si no existe
         // Si ya existe (incluso en estado stale por crash anterior), ignorar el error EEXIST
-        match fs::create_dir_all(&self.mount_point) {
+        match fs::create_dir_all(&self.fuse_mount_path) {
             Ok(()) => {},
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                tracing::debug!("Punto de montaje ya existe, continuando...");
+                tracing::debug!("Punto de montaje oculto ya existe, continuando...");
             },
             Err(e) => {
                 // Verificar si es accesible (stale mount devuelve error al acceder)
-                if fs::read_dir(&self.mount_point).is_err() {
+                if fs::read_dir(&self.fuse_mount_path).is_err() {
                     tracing::warn!(
                         "Punto de montaje {:?} existe pero no es accesible. \
                          Por favor ejecute: fusermount3 -u {:?}",
-                        self.mount_point, self.mount_point
+                        self.fuse_mount_path, self.fuse_mount_path
                     );
                 }
                 return Err(e.into());

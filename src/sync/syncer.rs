@@ -232,7 +232,7 @@ impl BackgroundSyncer {
                 self.db.set_remote_md5(inode, &md5).await?;
             }
 
-            tracing::debug!(
+            tracing::trace!(
                 "Cambio detectado: UPSERT file_id={}, name={}, is_dir={}",
                 file_id, name, is_dir
             );

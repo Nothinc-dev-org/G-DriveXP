@@ -37,7 +37,7 @@ impl Filesystem for GDriveFS {
 
     // Inicialización del sistema de archivos
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
-        debug!("Sistema de archivos inicializado");
+        tracing::info!("Sistema de archivos inicializado");
         Ok(ReplyInit {
             max_write: NonZeroU32::new(1024 * 1024).unwrap(), // 1MB
         })
@@ -171,7 +171,7 @@ impl Filesystem for GDriveFS {
             .map_err(|e| {
                 // Si el inodo es 1 (root) y no está en DB, devolver valores por defecto
                 if inode == 1 {
-                    debug!("Devolviendo atributos raíz por defecto");
+                    tracing::trace!("Devolviendo atributos raíz por defecto");
                     return Errno::from(libc::ENOENT);
                 }
                 error!("Error en getattr para inode {}: {}", inode, e);
@@ -196,7 +196,7 @@ impl Filesystem for GDriveFS {
                 file_attr.size = html_content.len() as u64;
                 // HTML no requiere permisos ejecutables
                 file_attr.perm = 0o644;
-                debug!("Workspace File (getattr): inode={} size={}", inode, file_attr.size);
+                tracing::trace!("Workspace File (getattr): inode={} size={}", inode, file_attr.size);
             }
         }
 
@@ -234,7 +234,7 @@ impl Filesystem for GDriveFS {
 
     // Abrir archivo (open)
     async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
-        debug!("open: inode={}", inode);
+        tracing::trace!("open: inode={}", inode);
         
         // Validar que existe en DB y obtener metadatos
         let attrs = self.db.get_attrs(inode).await
@@ -318,7 +318,7 @@ impl Filesystem for GDriveFS {
                                 }
                             });
                         } else {
-                            tracing::info!("✅ Prefetch cabeceras+cola completado");
+                            tracing::debug!("✅ Prefetch cabeceras+cola completado");
                         }
                     }
                 }
@@ -338,7 +338,7 @@ impl Filesystem for GDriveFS {
         _lock_owner: u64,
         _flush: bool,
     ) -> Result<()> {
-        debug!("release");
+        tracing::trace!("release");
         Ok(())
     }
 
@@ -350,7 +350,7 @@ impl Filesystem for GDriveFS {
         _fh: u64,
         _lock_owner: u64,
     ) -> Result<()> {
-        debug!("flush: inode={}", inode);
+        tracing::trace!("flush: inode={}", inode);
         // Los datos ya se persisten sincrónicamente en write(),
         // el upload a GDrive es asíncrono vía uploader
         Ok(())
@@ -364,7 +364,7 @@ impl Filesystem for GDriveFS {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        debug!("fsync: inode={}", inode);
+        tracing::trace!("fsync: inode={}", inode);
         // Los datos ya se persisten sincrónicamente en write(),
         // el upload a GDrive es asíncrono vía uploader
         Ok(())
@@ -379,7 +379,7 @@ impl Filesystem for GDriveFS {
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        debug!("read: inode={} offset={} size={}", inode, offset, size);
+        tracing::trace!("read: inode={} offset={} size={}", inode, offset, size);
 
         // 1. Obtener el gdrive_id del archivo, mime_type y tamaño
         let (gdrive_id, mime_type, file_size) = match sqlx::query_as::<_, (String, Option<String>, i64)>(
@@ -556,7 +556,7 @@ impl Filesystem for GDriveFS {
                                 let html_content = shortcuts::generate_desktop_entry(gid, &name, m);
                                 attr.size = html_content.len() as u64;
                                 attr.perm = 0o644; // HTML no necesita +x
-                                debug!("Workspace File (readdirplus): inode={} name={} size={}", inode, display_name, attr.size);
+                                tracing::trace!("Workspace File (readdirplus): inode={} name={} size={}", inode, display_name, attr.size);
                             }
                         }
                     }
@@ -593,7 +593,7 @@ impl Filesystem for GDriveFS {
         flags: u32,
     ) -> Result<ReplyCreated> {
         let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
-        debug!("✏️ create: parent={} name={} mode={:o} flags={}", parent, name_str, mode, flags);
+        tracing::trace!("✏️ create: parent={} name={} mode={:o} flags={}", parent, name_str, mode, flags);
 
         // Generar un gdrive_id temporal (será reemplazado al subir)
         let temp_gdrive_id = format!("temp_{}", uuid::Uuid::new_v4());
@@ -739,7 +739,7 @@ impl Filesystem for GDriveFS {
         _write_flags: u32,
         _flags: u32,
     ) -> Result<ReplyWrite> {
-        debug!("✏️ write: inode={} offset={} size={}", inode, offset, data.len());
+        tracing::trace!("✏️ write: inode={} offset={} size={}", inode, offset, data.len());
 
         // Obtener el gdrive_id del archivo
         let gdrive_id = sqlx::query_scalar::<_, String>("SELECT gdrive_id FROM inodes WHERE inode = ?")

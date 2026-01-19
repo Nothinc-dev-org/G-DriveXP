@@ -7,6 +7,7 @@ mod sync;
 mod gui;
 mod ipc;
 mod utils;
+mod mirror;
 
 use anyhow::{Context, Result};
 use fuse3::MountOptions;
@@ -60,7 +61,9 @@ pub fn run_backend(
         // Guardar configuración
         config.save().context("Error al guardar configuración")?;
         
-        tracing::info!("Punto de montaje: {:?}", config.mount_point);
+        // Mostrar ambas rutas para depuración
+        tracing::info!("Ruta Espejo (Visible): {:?}", config.mirror_path);
+        tracing::info!("Punto de Montaje FUSE (Oculto): {:?}", config.fuse_mount_path);
         tracing::info!("Directorio de caché: {:?}", config.cache_dir);
         tracing::info!("Base de datos: {:?}", config.db_path);
         
@@ -130,36 +133,21 @@ pub fn run_backend(
         );
         let _uploader_handle = uploader.spawn();
         
-        // Fase 2.4: LocalSyncManager (sincronización bidireccional de carpetas locales)
-        // NOTA: Se crea ANTES del IPC Server para pasar el sender
-        tracing::info!("Iniciando LocalSyncManager...");
-        let (local_sync_manager, local_sync_sender) = sync::local_sync_manager::LocalSyncManager::new(
-            db.clone(),
-            config.mount_point.clone(),
-        );
-        let _local_sync_handle = local_sync_manager.spawn();
-        
-        // Fase 2.5: Servidor IPC para extensiones externas (Nautilus)
-        tracing::info!("Iniciando servidor IPC...");
-        let socket_path = ipc::get_socket_path();
-        let ipc_server = ipc::server::IpcServer::new(
-            socket_path,
-            db.clone(),
-            config.mount_point.clone(),
-            config.cache_dir.clone(),
-        )
-        .with_local_sync(local_sync_sender.clone());
-        let _ipc_handle = ipc_server.spawn();
-
-        // Fase 2.6: Local Watcher ELIMINADO (Reemplazado por estrategia de Symlinks)
-        tracing::info!("Local Watcher desactivado (usando enlaces simbólicos)");
+        // Fase 2.4: MirrorManager (Nuevo Sistema Híbrido)
+        // Reemplaza a LocalSyncManager
+        // Fase 2.4: MirrorManager & IPC DEFERRED
+        // Se inician DESPUÉS de montar FUSE para evitar Deadlocks por race condition
+        // (MirrorManager intenta acceder a FUSE antes de que esté listo)
         
         // CRITICAL: Limpiar punto de montaje huérfano antes de intentar montar
-        utils::mount::cleanup_if_needed(&config.mount_point)
+        utils::mount::cleanup_if_needed(&config.fuse_mount_path)
             .context("Error al limpiar punto de montaje huérfano")?;
         
-        // Informar a la GUI del punto de montaje para cleanup
-        ui_sender.input(gui::app_model::AppMsg::SetMountPoint(config.mount_point.clone()));
+        // Informar a la GUI de las rutas (Mirror y FUSE)
+        ui_sender.input(gui::app_model::AppMsg::SetPaths {
+            mirror: config.mirror_path.clone(),
+            fuse: config.fuse_mount_path.clone(),
+        });
         
         // Configurar opciones de montaje
         let uid = unsafe { libc::getuid() };
@@ -172,19 +160,42 @@ pub fn run_backend(
             .fs_name("fedoradrive")
             .custom_options("exec"); // CRÍTICO: Permitir ejecución de binarios y .desktop
             
-        tracing::info!("Montando sistema de archivos en {:?}...", config.mount_point);
-        ui_sender.input(gui::app_model::AppMsg::UpdateStatus(format!("Montando en {:?}...", config.mount_point)));
+        tracing::info!("Montando sistema de archivos en {:?}...", config.fuse_mount_path);
+        ui_sender.input(gui::app_model::AppMsg::UpdateStatus(format!("Montando en {:?}...", config.mirror_path)));
         
         let mut handle = Session::new(mount_options)
-            .mount_with_unprivileged(fs, &config.mount_point)
+            .mount_with_unprivileged(fs, &config.fuse_mount_path)
             .await
             .context("Error al montar sistema de archivos FUSE")?;
+        
+        // Fase 2.4: MirrorManager (Nuevo Sistema Híbrido)
+        // Reemplaza a LocalSyncManager
+        // SE INICIA AHORA, con FUSE ya montado.
+        tracing::info!("Iniciando MirrorManager (Arquitectura Espejo)...");
+        let (mirror_manager, mirror_sender) = mirror::MirrorManager::new(
+            db.clone(),
+            config.mirror_path.clone(),
+            config.fuse_mount_path.clone(),
+        );
+        let _mirror_handle = mirror_manager.spawn();
+        
+        // Fase 2.5: Servidor IPC para extensiones externas (Nautilus)
+        tracing::info!("Iniciando servidor IPC...");
+        let socket_path = ipc::get_socket_path();
+        let ipc_server = ipc::server::IpcServer::new(
+            socket_path,
+            db.clone(),
+            config.mirror_path.clone(), // IPC usa rutas visibles del usuario
+            config.cache_dir.clone(),
+        )
+        .with_mirror_manager(mirror_sender.clone());
+        let _ipc_handle = ipc_server.spawn();
         
         tracing::info!("✅ Sistema de archivos montado exitosamente");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Sistema de archivos montado y activo".to_string()));
 
-        // Enviar el sender al GUI para que pueda disparar sincronizaciones
-        ui_sender.input(gui::app_model::AppMsg::SetLocalSyncSender(local_sync_sender));
+        // TODO: Actualizar GUI para usar MirrorManager Sender
+        // ui_sender.input(gui::app_model::AppMsg::SetLocalSyncSender(local_sync_sender));
 
         
         // Esperar a que termine la sesión O sea interrumpida por Ctrl+C
@@ -204,7 +215,7 @@ pub fn run_backend(
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Desmontando...".to_string()));
         
         // El drop de 'handle' debería intentar desmontar, pero lo forzamos por seguridad
-        let _ = utils::mount::unmount(&config.mount_point);
+        let _ = utils::mount::unmount(&config.fuse_mount_path);
         
         // Forzar salida del proceso (GTK no responde a señales del backend)
         tracing::info!("👋 Cerrando aplicación...");
@@ -217,7 +228,7 @@ fn init_logging() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "g_drive_xp=debug,info".into()),
+                .unwrap_or_else(|_| "g_drive_xp=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

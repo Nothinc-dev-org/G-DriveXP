@@ -191,7 +191,98 @@ impl MetadataRepository {
             .execute(&self.pool)
             .await?;
 
+        // 6. Verificar si la columna availability existe en sync_state
+        let has_availability = sqlx::query("PRAGMA table_info(sync_state)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "availability"
+            });
+
+        if !has_availability {
+            // Default a 'online_only' (nube) para no descargar todo por defecto
+            sqlx::query("ALTER TABLE sync_state ADD COLUMN availability TEXT DEFAULT 'online_only'")
+                .execute(&self.pool)
+                .await?;
+        }
+
         Ok(())
+    }
+
+    /// Obtiene la disponibilidad de un archivo ('online_only' o 'local_online')
+    pub async fn get_availability(&self, inode: u64) -> Result<String> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT availability FROM sync_state WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.unwrap_or_else(|| "online_only".to_string()))
+    }
+
+    /// Establece la disponibilidad de un archivo
+    pub async fn set_availability(&self, inode: u64, availability: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (inode, availability, dirty, version)
+            VALUES (?, ?, 0, 0)
+            ON CONFLICT(inode) DO UPDATE SET availability = excluded.availability
+            "#
+        )
+        .bind(inode as i64)
+        .bind(availability)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Obtiene todos los archivos "vivos" para el Bootstrapping
+    /// Retorna: (inode, path_relativo_desde_root, availability)
+    pub async fn get_all_active_files(&self) -> Result<Vec<(u64, String, String)>> {
+        let rows = sqlx::query_as::<_, (i64, String, String)>(
+            r#"
+            WITH RECURSIVE file_tree AS (
+                -- Caso base: archivos en root (parent_inode = 1)
+                SELECT 
+                    d.child_inode, 
+                    d.name as path, 
+                    a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                WHERE d.parent_inode = 1
+                
+                UNION ALL
+                
+                -- Caso recursivo: hijos de directorios
+                SELECT 
+                    d.child_inode, 
+                    ft.path || '/' || d.name,
+                    a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                JOIN file_tree ft ON d.parent_inode = ft.child_inode
+            )
+            SELECT 
+                ft.child_inode,
+                ft.path,
+                COALESCE(s.availability, 'online_only') as availability
+            FROM file_tree ft
+            LEFT JOIN sync_state s ON ft.child_inode = s.inode
+            WHERE ft.is_dir = 0 -- Solo archivos
+              AND (s.deleted_at IS NULL OR s.deleted_at = 0) -- No eliminados
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        
+        Ok(rows.into_iter()
+            .map(|(inode, path, availability)| (inode as u64, path, availability))
+            .collect())
     }
 
     /// Obtiene el pool de conexiones crudo si es necesario
@@ -258,6 +349,22 @@ impl MetadataRepository {
         Ok(children.into_iter()
             .map(|(inode, name, is_dir, mime, gdrive_id)| (inode as u64, name, is_dir, mime, gdrive_id))
             .collect())
+    }
+
+    /// Resuelve un path relativo (desde el root del mirror) a su inode
+    pub async fn resolve_relative_path_to_inode(&self, relative_path: &str) -> Result<Option<u64>> {
+        let parts: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
+        
+        let mut current_inode = 1u64; // Root inode
+        
+        for part in parts {
+            match self.lookup(current_inode, part).await? {
+                Some(child_inode) => current_inode = child_inode,
+                None => return Ok(None),
+            }
+        }
+        
+        Ok(Some(current_inode))
     }
 
     /// Listar contenido de un directorio (para readdir simple)
