@@ -114,7 +114,7 @@ impl Filesystem for GDriveFS {
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> Result<ReplyEntry> {
         let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
         // trace is enough for lookup
-        tracing::trace!("lookup: parent={} name={}", parent, name_str);
+        // tracing::info!("🔎 LOOKUP called: parent={} name={}", parent, name_str);
 
         // Para archivos Workspace, el usuario busca con .html pero en DB está sin extensión
         let (lookup_name, is_html_lookup) = if name_str.ends_with(".html") {
@@ -155,6 +155,17 @@ impl Filesystem for GDriveFS {
             }
         }
 
+
+
+        // LUCERO DIAGNOSTIC: Log detail for media files to check why OPEN is not called
+        // We restore this to confirm if the kernel even LOOKUPS the file.
+        if name_str.ends_with(".mp3") || name_str.ends_with(".mkv") || name_str.ends_with(".mp4") {
+             tracing::warn!("🔎 LOOKUP MEDIA: name={} inode={} size={} perm={:o} kind={:?}", 
+                           name_str, inode, file_attr.size, file_attr.perm, file_attr.kind);
+        }
+
+        // tracing::info!("✅ LOOKUP success: parent={} name={} -> inode={} size={} perm={:o} kind={:?}", parent, name_str, inode, file_attr.size, file_attr.perm, file_attr.kind);
+
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
             attr: file_attr,
@@ -164,7 +175,7 @@ impl Filesystem for GDriveFS {
 
     // Obtener atributos de un archivo (stat)
     async fn getattr(&self, _req: Request, inode: u64, _fh: Option<u64>, _flags: u32) -> Result<ReplyAttr> {
-        tracing::trace!("getattr: inode={}", inode);
+        // tracing::info!("📋 GETATTR called: inode={}", inode);
 
         let attrs = self.db.get_attrs(inode)
             .await
@@ -177,6 +188,11 @@ impl Filesystem for GDriveFS {
                 error!("Error en getattr para inode {}: {}", inode, e);
                 Errno::from(libc::ENOENT)
             })?;
+
+        let is_audio = attrs.mime_type.as_deref().map(|m| m.starts_with("audio/")).unwrap_or(false);
+        if is_audio {
+            tracing::warn!("📋 GETATTR for AUDIO: inode={} size={} perm={:o}", inode, attrs.size, attrs.mode);
+        }
 
         // Si es archivo Workspace, ajustar el tamaño reportado al tamaño del HTML
         let mut file_attr = attrs.to_file_attr();
@@ -206,8 +222,73 @@ impl Filesystem for GDriveFS {
         })
     }
     
-    // Métodos requeridos adicionales que faltaban (placeholders)
-    async fn forget(&self, _req: Request, _inode: u64, _nlookup: u64) {}
+    // Validar permisos de acceso (access)
+    async fn access(&self, _req: Request, inode: u64, mask: u32) -> Result<()> {
+        if mask == 0 {
+            return Ok(()); // F_OK check, ignore to reduce noise if needed, or log it.
+        }
+        tracing::warn!("🛡️ WARNING access check: inode={} mask={:o}", inode, mask);
+        // Permitimos todo explícitamente para evitar problemas de permisos de kernel/sandbox
+        Ok(())
+    }
+
+    // XATTR Support (Crucial for some players/Nautilus)
+    async fn getxattr(
+        &self,
+        _req: Request,
+        inode: u64,
+        name: &OsStr,
+        _size: u32,
+    ) -> Result<ReplyXAttr> {
+        let name_str = name.to_str().unwrap_or("???");
+        tracing::debug!("🏷️ getxattr called: inode={} name={}", inode, name_str);
+        // Retornar ENODATA (No attribute) en lugar de ENOSYS (Not implemented)
+        // Muchas apps fallan si reciben ENOSYS.
+        Err(Errno::from(libc::ENODATA))
+    }
+
+    async fn listxattr(
+        &self,
+        _req: Request,
+        inode: u64,
+        _size: u32,
+    ) -> Result<ReplyXAttr> {
+        tracing::debug!("🏷️ listxattr called: inode={}", inode);
+        // Retornar lista vacía (0 bytes) - ReplyXAttr es un Enum
+        if _size == 0 {
+             Ok(ReplyXAttr::Size(0))
+        } else {
+             Ok(ReplyXAttr::Data(vec![].into()))
+        }
+    }
+
+    async fn setxattr(
+        &self,
+        _req: Request,
+        inode: u64,
+        name: &OsStr,
+        _value: &[u8],
+        _flags: u32,
+        _position: u32,
+    ) -> Result<()> {
+        let name_str = name.to_str().unwrap_or("???");
+        tracing::warn!("🏷️ setxattr called (IGNORED): inode={} name={}", inode, name_str);
+        // Ignorar silenciosamente o dar error de permiso?
+        // Responder Ok() engaña a la app pensando que guardó metadata.
+        Ok(())
+    }
+
+    async fn removexattr(
+        &self,
+        _req: Request,
+        inode: u64,
+        name: &OsStr,
+    ) -> Result<()> {
+         let name_str = name.to_str().unwrap_or("???");
+         tracing::debug!("🏷️ removexattr called: inode={} name={}", inode, name_str);
+         Err(Errno::from(libc::ENODATA))
+    }
+
 
     // Abrir directorio (requerido antes de readdir)
     async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
@@ -233,93 +314,57 @@ impl Filesystem for GDriveFS {
 
 
     // Abrir archivo (open)
-    async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
-        tracing::trace!("open: inode={}", inode);
-        
+    async fn open(&self, _req: Request, inode: u64, flags: u32) -> Result<ReplyOpen> {
+        // LUCERO DIAGNOSTIC: Log EARLY
+        tracing::warn!("🔓 OPEN request: inode={} flags={}", inode, flags);
+
         // Validar que existe en DB y obtener metadatos
-        let attrs = self.db.get_attrs(inode).await
-            .map_err(|_| Errno::from(libc::ENOENT))?;
-        
-        // OPTIMIZACIÓN MULTIMEDIA: Pre-descargar archivos multimedia pequeños
-        if let Some(ref mime_type) = attrs.mime_type {
-            if Self::is_multimedia_file(mime_type) && !attrs.is_dir {
-                let file_size = attrs.size as u64;
-                
-                // Para archivos < 10MB, pre-descargar completo en background
-                const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
-                
-                if file_size > 0 && file_size < SMALL_FILE_THRESHOLD {
-                    let gdrive_id = self.get_gdrive_id(inode).await
-                        .unwrap_or_else(|_| String::new());
+        let attrs = match self.db.get_attrs(inode).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("❌ OPEN failed: attributes not found for inode {}: {}", inode, e);
+                return Err(Errno::from(libc::ENOENT));
+            }
+        };
+
+        // Filtered detail logging
+        let is_audio = attrs.mime_type.as_deref().map(|m| m.starts_with("audio/")).unwrap_or(false);
+        if is_audio {
+             tracing::warn!("🔓 OPEN details: inode={} mime={:?} size={}", inode, attrs.mime_type, attrs.size);
+        }
+
+        // SMART PREFETCH:
+        // Si es un archivo multimedia, iniciar descarga de cabeceras en background
+        // para mejorar la respuesta de reproductores que leen metadatos al abrir.
+        if let Some(ref mime) = attrs.mime_type {
+            if Self::is_multimedia_file(mime) {
+                // Obtener gdrive_id
+                let gdrive_id = self.get_gdrive_id(inode).await
+                    .unwrap_or_default();
                     
-                    if !gdrive_id.is_empty() {
-                        let cache_path = self.get_cache_path(&gdrive_id);
-                        
-                        // Solo pre-descargar si no está completamente cacheado
-                        if !cache_path.exists() || 
-                           tokio::fs::metadata(&cache_path).await.ok()
-                               .map(|m| m.len() != file_size).unwrap_or(true) {
-                            
-                            debug!("🎬 Prefetching multimedia completo: inode={} size={} mime={}", 
-                                   inode, file_size, mime_type);
-                            
-                            // Spawn background task para pre-descarga
-                            let db = self.db.clone();
-                            let drive_client = self.drive_client.clone();
-                            let gdrive_id_owned = gdrive_id.clone();
-                            let cache_path_owned = cache_path.clone();
-                            
-                            tokio::spawn(async move {
-                                if let Err(e) = Self::prefetch_entire_file(
-                                    &db, 
-                                    &drive_client, 
-                                    inode, 
-                                    &gdrive_id_owned, 
-                                    &cache_path_owned, 
-                                    file_size
-                                ).await {
-                                    error!("Error en prefetch multimedia: {}", e);
-                                }
-                            });
-                        }
-                    }
-                } else if file_size >= SMALL_FILE_THRESHOLD {
-                    // Para archivos grandes multimedia, prefetch COMPLETO en background
-                    // Esto evita la descarga lenta chunk-por-chunk al abrir la imagen
-                    let gdrive_id = self.get_gdrive_id(inode).await
-                        .unwrap_or_else(|_| String::new());
+                if !gdrive_id.is_empty() {
+                    let db = self.db.clone();
+                    let drive_client = self.drive_client.clone();
+                    let cache_path = self.get_cache_path(&gdrive_id);
+                    let file_size = attrs.size as u64;
+                    let inode = inode;
                     
-                    if !gdrive_id.is_empty() {
-                        let cache_path = self.get_cache_path(&gdrive_id);
-                        
-                        // Solo pre-descargar si no está completamente cacheado
-                        if !cache_path.exists() || 
-                           tokio::fs::metadata(&cache_path).await.ok()
-                               .map(|m| m.len() != file_size).unwrap_or(true) {
-                            
-                            debug!("🎬 Prefetching multimedia completo (grande): inode={} size={} mime={}", 
-                                   inode, file_size, mime_type);
-                            
-                            let db = self.db.clone();
-                            let drive_client = self.drive_client.clone();
-                            let gdrive_id_owned = gdrive_id.clone();
-                            let cache_path_owned = cache_path.clone();
-                            
-                            tokio::spawn(async move {
-                                if let Err(e) = Self::prefetch_headers_and_tail(
-                                    &db,
-                                    &drive_client,
-                                    inode,
-                                    &gdrive_id_owned,
-                                    &cache_path_owned,
-                                    file_size
-                                ).await {
-                                    error!("Error en prefetch de cabeceras multimedia: {}", e);
-                                }
-                            });
-                        } else {
-                            tracing::debug!("✅ Prefetch cabeceras+cola completado");
-                        }
+                    // Fire-and-forget task
+                    tokio::spawn(async move {
+                         let _ = Self::prefetch_headers_and_tail(
+                             &db, 
+                             &drive_client, 
+                             inode, 
+                             &gdrive_id, 
+                             &cache_path, 
+                             file_size
+                         ).await;
+                    });
+                    
+                    if is_audio {
+                        tracing::warn!("🚀 Smart prefetch triggers for AUDIO inode={}", inode);
+                    } else {
+                         tracing::info!("🚀 Smart prefetch triggers for inode={}", inode);
                     }
                 }
             }
@@ -379,9 +424,7 @@ impl Filesystem for GDriveFS {
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        tracing::trace!("read: inode={} offset={} size={}", inode, offset, size);
-
-        // 1. Obtener el gdrive_id del archivo, mime_type y tamaño
+        // 1. Obtener el gdrive_id del archivo, mime_type y tamaño PRIMERO para logging
         let (gdrive_id, mime_type, file_size) = match sqlx::query_as::<_, (String, Option<String>, i64)>(
             "SELECT i.gdrive_id, a.mime_type, a.size 
              FROM inodes i 
@@ -398,6 +441,13 @@ impl Filesystem for GDriveFS {
                 return Err(Errno::from(libc::ENOENT));
             }
         };
+
+        let is_audio = mime_type.as_deref().map(|m| m.starts_with("audio/")).unwrap_or(false);
+        if is_audio {
+             tracing::warn!("📖 READ called for AUDIO: inode={} offset={} size={}", inode, offset, size);
+        } else {
+             // tracing::info!("📖 READ called: inode={} offset={} size={}", inode, offset, size);
+        }
 
         // 2. Si es archivo de Google Workspace, generar .desktop file on-the-fly
         if let Some(ref mime) = mime_type {
@@ -1107,15 +1157,34 @@ impl GDriveFS {
 
         let cache_path = self.get_cache_path(gdrive_id);
         
-        // OPTIMIZACIÓN CRÍTICA: Verificar primero si el archivo caché está COMPLETO
-        // Esto evita consultar la DB para archivos ya completamente cacheados
-        if let Ok(metadata) = tokio::fs::metadata(&cache_path).await {
-            if metadata.len() == file_size {
-                // Archivo completo en disco - no necesitamos consultar la DB
-                tracing::debug!("✅ Rango ya cacheado (fast-path): inode={} offset={} size={}", inode, offset, size);
-                return Ok(());
-            }
-        }
+        // NOTA: Se ha eliminado la optimización por tamaño (file_size) porque es insegura
+         // ZOMBIE / CORRUPTION CHECK:
+         // Verificar consistencia entre DB y Archivo Físico.
+         if cache_path.exists() {
+             let has_chunks = self.db.has_any_chunks(inode).await.unwrap_or(false);
+             let meta = tokio::fs::metadata(&cache_path).await;
+             let file_size = meta.map(|m| m.len()).unwrap_or(0);
+             let max_cached = self.db.get_max_cached_offset(inode).await.unwrap_or(0);
+
+             tracing::info!("🔍 Zombie Check: inode={} exists=true size={} max_cached_chunk={} has_chunks={}", 
+                           inode, file_size, max_cached, has_chunks);
+             
+             // Caso 1: Archivo existe pero DB dice que no hay chunks -> Zombie (borrar archivo)
+             if !has_chunks {
+                 tracing::warn!("🧟 Zombie cache detected for inode {}: Deleting corrupt/stale file.", inode);
+                 let _ = tokio::fs::remove_file(&cache_path).await;
+             } 
+             // Caso 2: DB tiene chunks, pero el archivo es más pequeño que el chunk más lejano
+             // Esto indica truncamiento o corrupción (ej: file_size=79KB pero tenemos chunk hasta 1MB)
+             else if has_chunks && file_size < max_cached {
+                  tracing::error!("💀 CORRUPTED cache detected for inode {}: File truncated! (Size={} < DB_Max={}). PURGING.", 
+                                 inode, file_size, max_cached);
+                  let _ = tokio::fs::remove_file(&cache_path).await;
+                  let _ = self.db.clear_chunks(inode).await;
+             }
+         } else {
+              // tracing::info!("🔍 Zombie Check: inode={} exists=false", inode);
+         }
 
         // Solo si el archivo no está completo, consultar la DB para rangos faltantes
         let missing_ranges = self.db.get_missing_ranges(inode, requested_start, requested_end).await?;
@@ -1132,9 +1201,13 @@ impl GDriveFS {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Asegurar que el archivo existe (puede estar vacío o sparse)
+        // Asegurar que el archivo existe (usando OpenOptions para NO truncar si ganó la carrera el prefetch)
         if !cache_path.exists() {
-            tokio::fs::File::create(&cache_path).await?;
+             let _ = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&cache_path)
+                .await;
         }
 
         // OPTIMIZACIÓN: Descargar todos los rangos EN PARALELO
@@ -1205,6 +1278,7 @@ impl GDriveFS {
     }
 
     /// Pre-descarga un archivo completo en background (para archivos pequeños)
+    #[allow(dead_code)]
     async fn prefetch_entire_file(
         db: &Arc<MetadataRepository>,
         drive_client: &Arc<DriveClient>,
@@ -1246,8 +1320,12 @@ impl GDriveFS {
         
         tracing::info!("📥 Descargando archivo grande en chunks paralelos: {} bytes", file_size);
         
-        // Crear el archivo de caché vacío primero
-        tokio::fs::File::create(cache_path).await?;
+        // Crear el archivo de caché (sin truncar si ya existe)
+        let _ = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(cache_path)
+            .await?;
         
         // Calcular rangos de chunks
         let mut chunks: Vec<(u64, u64)> = Vec::new();
@@ -1319,9 +1397,13 @@ impl GDriveFS {
             tokio::fs::create_dir_all(parent).await?;
         }
         
-        // Asegurar que el archivo existe
+        // Asegurar que el archivo existe (usando OpenOptions para NO truncar si ganó la carrera otro hilo)
         if !cache_path.exists() {
-            tokio::fs::File::create(cache_path).await?;
+             let _ = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(cache_path)
+                .await;
         }
         
         // Descargar cabeceras (primeros 1MB)

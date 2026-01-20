@@ -73,8 +73,8 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido para la descarga")?;
 
-        // 2. Construir URL de descarga
-        let url = format!("https://www.googleapis.com/drive/v3/files/{}?alt=media", file_id);
+        // 2. Construir URL de descarga (Incluyendo acknowledgeAbuse=true para evitar 403 en falsos positivos de malware)
+        let url = format!("https://www.googleapis.com/drive/v3/files/{}?alt=media&acknowledgeAbuse=true", file_id);
 
         // 3. Realizar petición con reqwest
         let client = reqwest::Client::new();

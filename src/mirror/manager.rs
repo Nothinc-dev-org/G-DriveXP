@@ -77,7 +77,17 @@ impl MirrorManager {
             info!("   Mirror: {:?}", self.ctx.mirror_path);
             info!("   FUSE:   {:?}", self.ctx.fuse_mount_path);
 
-            // Iniciar Watcher
+            // 1. Initial Scan / Bootstrap (SEQUENTIAL)
+            // Ejecutamos bootstrap ANTES de iniciar el watcher para que las correcciones
+            // (como reparar symlinks) no generen eventos de "Eliminación" que el watcher
+            // malinterprete como acciones del usuario.
+            info!("🔄 Ejecutando Bootstrap (Reparación de estado)...");
+            if let Err(e) = Self::run_bootstrap(self.ctx.clone()).await {
+                error!("Error durante bootstrap: {:?}", e);
+            }
+            info!("✅ Bootstrap completado. Iniciando vigilancia.");
+
+            // 2. Iniciar Watcher
             let w_tx = self.watcher_tx.clone();
             let mirror_path = self.ctx.mirror_path.clone();
             
@@ -98,16 +108,6 @@ impl MirrorManager {
                     error!("❌ Error fatal en task::spawn_blocking del watcher: {:?}", e);
                 }
             }
-
-            // Initial Scan / Bootstrap DESACOPLADO
-            // Ejecutamos bootstrap en su propia task para no bloquear el procesamiento de mensajes IPC
-            // y permitir que la GUI/Nautilus interactúen inmediatamente.
-            let ctx_bootstrap = self.ctx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = Self::run_bootstrap(ctx_bootstrap).await {
-                    error!("Error durante bootstrap: {:?}", e);
-                }
-            });
 
             self.run_loop().await;
         })
@@ -136,8 +136,24 @@ impl MirrorManager {
             
             match availability.as_str() {
                 "online_only" => {
-                    // Si no existe, o es un archivo regular, forzamos symlink
-                    if !mirror_file.exists() && !mirror_file.is_symlink() {
+                    // Verificar si existe y si apunta al lugar correcto
+                    let should_recreate = if mirror_file.is_symlink() {
+                        match tokio::fs::read_link(&mirror_file).await {
+                            Ok(target) => {
+                                // Si no empieza con el path de montaje actual, está roto/obsoleto
+                                !target.starts_with(&ctx.fuse_mount_path)
+                            },
+                            Err(_) => true,
+                        }
+                    } else {
+                        !mirror_file.exists()
+                    };
+
+                    if should_recreate {
+                        // FIX CRÍTICO: No borrar el archivo explícitamente.
+                        // `remove_file` dispara un evento de eliminación que el Watcher captura
+                        // y el Uploader procesa borrando el archivo remoto.
+                        // `static_handle_set_online_only` usa `rename` atómico que sobrescribe el destino.
                         Self::static_handle_set_online_only(&ctx, &mirror_file.to_string_lossy()).await;
                     } else if mirror_file.is_file() && !mirror_file.is_symlink() {
                         // Caso delicado: DB dice OnlineOnly, FS tiene archivo real.
@@ -448,8 +464,9 @@ impl MirrorManager {
             // Para otros eventos (Create, Modify, Remove), iteramos sobre los paths afectados
             for path in paths {
                 // 1. Filtrar eventos fuera de interés
-                // Ignorar .gdrive_tmp_ops
-                if path.to_string_lossy().contains(".gdrive_tmp_ops") {
+                // Ignorar .gdrive_tmp_ops y el punto de montaje oculto
+                let path_str = path.to_string_lossy();
+                if path_str.contains(".gdrive_tmp_ops") || path_str.contains(".cloud_mount") {
                     continue;
                 }
                 
@@ -700,6 +717,15 @@ impl MirrorManager {
     
     async fn handle_local_delete(&self, relative_path: &str) {
         tracing::debug!("🗑️ Eliminación local detectada: {}", relative_path);
+        
+        // DOUBLE CHECK: El evento puede ser falso positivo si fue parte de un rename atómico rápido.
+        // Si el archivo EXISTE ahora (como symlink o real), IGNORAR el delete.
+        let check_path = self.ctx.mirror_path.join(relative_path);
+        if check_path.exists() || tokio::fs::symlink_metadata(&check_path).await.is_ok() {
+            tracing::warn!("⚠️ FALSO NEGATIVO: Evento Remove para '{}' pero el archivo existe. Ignorando.", relative_path);
+            return;
+        }
+
         let db = &self.ctx.db;
         
         // Resolver inode antes de que desaparezca de nuestra memoria lógica

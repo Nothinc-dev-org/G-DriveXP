@@ -83,7 +83,7 @@ pub fn run_backend(
             .context("Error al inicializar gestor OAuth2")?;
 
         tracing::info!("Verificando estado de autenticación (esto puede abrir su navegador)...");
-        oauth_manager.authenticate()
+        oauth_manager.authenticate(Some(ui_sender.clone()))
             .await
             .context("Fallo crítico en autenticación")?;
             
@@ -99,7 +99,7 @@ pub fn run_backend(
         ui_sender.input(gui::app_model::AppMsg::SetDatabase(db.clone()));
         
         // Inicializar cliente de Google Drive
-        let authenticator = oauth_manager.get_authenticator().await?;
+        let authenticator = oauth_manager.get_authenticator(None).await?;
         let drive_client = Arc::new(gdrive::client::DriveClient::new(authenticator));
         
         // Obtener Root ID para optimizaciones del Uploader

@@ -32,7 +32,8 @@ impl Config {
         let home = env::var("HOME")?;
         
         Ok(Self {
-            fuse_mount_path: PathBuf::from(format!("{}/.local/share/g-drive-xp/cloud_mount", home)),
+            // USAR nested mount para máxima compatibilidad con Flatpak/Snap
+            fuse_mount_path: PathBuf::from(format!("{}/GoogleDrive/.cloud_mount", home)),
             mirror_path: PathBuf::from(format!("{}/GoogleDrive", home)),
             cache_dir: PathBuf::from(format!("{}/.cache/fedoradrive", home)),
             db_path: PathBuf::from(format!("{}/.config/fedoradrive/metadata.db", home)),
@@ -47,7 +48,29 @@ impl Config {
         
         if config_path.exists() {
             let contents = fs::read_to_string(&config_path)?;
-            let config: Config = serde_json::from_str(&contents)?;
+            let mut config: Config = serde_json::from_str(&contents)?;
+            
+            // MIGRATION: Check if using old restricted path (.local) and migrate to /tmp
+            let home = env::var("HOME")?;
+            let _old_default = format!("{}/.local/share/g-drive-xp/cloud_mount", home);
+            
+            // MIGRATION: Check if using restricted paths (.local) or unstable (/tmp) and migrate to nested mount
+            let home = env::var("HOME")?;
+            let current_path = config.fuse_mount_path.to_string_lossy();
+            
+            let needs_migration = current_path.contains(".local/share/g-drive-xp") || 
+                                  current_path.contains("/tmp/g-drive-xp-mount");
+
+            if needs_migration {
+                tracing::warn!("⚠️ MIGRACIÓN SUPERIOR: Moviendo punto de montaje a ~/GoogleDrive/.cloud_mount para compatibilidad total con Sandbox.");
+                // Usamos path relativo al home para construir el nuevo target
+                // Idealmente deberíamos usar config.mirror_path pero necesitamos asegurar que sea str
+                let new_mount = PathBuf::from(format!("{}/GoogleDrive/.cloud_mount", home));
+                config.fuse_mount_path = new_mount;
+                config.ensure_directories()?;
+                config.save()?;
+            }
+            
             tracing::info!("Configuración cargada desde {:?}", config_path);
             Ok(config)
         } else {

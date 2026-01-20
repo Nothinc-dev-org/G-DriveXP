@@ -608,6 +608,18 @@ impl MetadataRepository {
         Ok(row)
     }
 
+    /// Verifica si existen chunks cacheados para un inodo
+    pub async fn has_any_chunks(&self, inode: u64) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM file_cache_chunks WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count > 0)
+    }
+
     // ============================================================
     // Métodos para Conflict Detection (Remote MD5 Tracking)
     // ============================================================
@@ -862,6 +874,29 @@ impl MetadataRepository {
         .await?;
 
         Ok(())
+    }
+
+    /// Limpia todos los chunks cacheados de un inodo (usado en caso de corrupción detectada)
+    pub async fn clear_chunks(&self, inode: u64) -> Result<()> {
+        sqlx::query("DELETE FROM file_cache_chunks WHERE inode = ?")
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+        
+        tracing::warn!("🧹 Chunks limpiados para inode: {}", inode);
+        Ok(())
+    }
+
+    /// Obtiene el offset máximo registrado en los chunks (para validar consistencia de tamaño)
+    pub async fn get_max_cached_offset(&self, inode: u64) -> Result<u64> {
+        let max_offset: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(end_offset) FROM file_cache_chunks WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        Ok(max_offset.unwrap_or(0) as u64)
     }
 
     /// Obtiene los rangos faltantes para un archivo en un intervalo dado

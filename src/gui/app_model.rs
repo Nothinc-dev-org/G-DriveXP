@@ -15,6 +15,7 @@ pub struct AppModel {
     pub sync_paused: Arc<AtomicBool>,
     pub history: ActionHistory,
     pub db: Option<Arc<crate::db::MetadataRepository>>,
+    pub login_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -31,6 +32,9 @@ pub enum AppMsg {
     ShowWindow,
     // Mensajes para el historial
     LogAction(ActionType, String),
+    HardReset,
+    Login,
+    SetLoginUrl(String),
 }
 
 #[relm4::component(pub)]
@@ -85,6 +89,8 @@ impl Component for AppModel {
 
                             // Botón principal: Abrir en Archivos
                             append = &gtk::Button {
+                                #[watch]
+                                set_visible: model.is_connected,
                                 set_css_classes: &["suggested-action", "pill"],
                                 set_halign: gtk::Align::Center,
                                 set_margin_top: 8,
@@ -111,6 +117,8 @@ impl Component for AppModel {
 
                             // Estado actual
                             append = &adw::PreferencesGroup {
+                                #[watch]
+                                set_visible: model.is_connected,
                                 set_title: "Estado",
 
                                 add = &adw::ActionRow {
@@ -135,6 +143,8 @@ impl Component for AppModel {
 
                             // Sección Configuración
                             append = &adw::PreferencesGroup {
+                                #[watch]
+                                set_visible: model.is_connected,
                                 set_title: "Configuración",
 
                                 add = &adw::SwitchRow {
@@ -151,6 +161,8 @@ impl Component for AppModel {
 
                             // Sección Cuenta
                             append = &adw::PreferencesGroup {
+                                #[watch]
+                                set_visible: model.is_connected,
                                 set_title: "Account",
 
                                 add = &adw::ActionRow {
@@ -164,6 +176,55 @@ impl Component for AppModel {
 
                                     connect_activated[sender] => move |_| {
                                         sender.input(AppMsg::Logout);
+                                    },
+                                },
+
+                                add = &adw::ActionRow {
+                                    set_title: "Hard Reset",
+                                    set_subtitle: "⚠️ BORRADO TOTAL: Reinicia DB, Cache y Archivos.",
+                                    set_activatable: true,
+                                    set_css_classes: &["destructive-action"],
+
+                                    add_suffix = &gtk::Image {
+                                        set_icon_name: Some("user-trash-symbolic"),
+                                    },
+
+                                    connect_activated[sender] => move |_| {
+                                        sender.input(AppMsg::HardReset);
+                                    },
+                                },
+                            },
+
+                            // PANTALLA DE LOGIN (SOLO SI NO ESTÁ CONECTADO)
+                            append = &gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_valign: gtk::Align::Center,
+                                set_halign: gtk::Align::Center,
+                                set_spacing: 16,
+                                set_margin_top: 40,
+                                #[watch]
+                                set_visible: !model.is_connected,
+
+                                append = &gtk::Image {
+                                    set_pixel_size: 96,
+                                    set_icon_name: Some("avatar-default-symbolic"),
+                                    set_css_classes: &["dim-label"],
+                                },
+                                
+                                append = &gtk::Label {
+                                    set_label: "Inicie sesión para continuar",
+                                    set_css_classes: &["title-1"],
+                                },
+                                
+                                append = &gtk::Button {
+                                    #[watch]
+                                    set_label: if model.login_url.is_some() { "Iniciar Sesión" } else { "Generando enlace..." },
+                                    #[watch]
+                                    set_sensitive: model.login_url.is_some(),
+                                    set_css_classes: &["suggested-action", "pill"],
+                                    set_margin_top: 16,
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(AppMsg::Login);
                                     },
                                 },
                             },
@@ -193,6 +254,7 @@ impl Component for AppModel {
             sync_paused: sync_paused.clone(),
             history: history.clone(),
             db: None,
+            login_url: None,
         };
 
         // Iniciar icono de bandeja
@@ -317,6 +379,40 @@ impl Component for AppModel {
                 }
                 
                 std::process::exit(0);
+            }
+            AppMsg::HardReset => {
+                tracing::warn!("🔄 Ejecutando Hard Reset y reiniciando...");
+                
+                // 1. Programar el reinicio (delayed)
+                // Usamos sh para dormir un poco y permitir que esta instancia se cierre y libere recursos
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("sleep 3; {:?} &", exe)) // 3 segundos para asegurar limpieza
+                        .spawn();
+                }
+
+                // 2. Ejecutar limpieza
+                if let Err(e) = crate::utils::cleanup::perform_hard_reset() {
+                    tracing::error!("Error durante el Hard Reset: {:?}", e);
+                }
+                
+                // 3. Salir de la aplicación forzosamente
+                std::process::exit(0);
+            }
+            AppMsg::Login => {
+                if let Some(ref url) = self.login_url {
+                    tracing::info!("🌐 [System] Abriendo navegador para login: {}", url);
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(url)
+                        .spawn();
+                } else {
+                    tracing::warn!("⚠️ [System] Intento de login sin URL disponible. Por favor espere.");
+                }
+            }
+            AppMsg::SetLoginUrl(url) => {
+                tracing::info!("📥 URL de login recibida: {}", url);
+                self.login_url = Some(url);
             }
         }
     }
