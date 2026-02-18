@@ -204,10 +204,26 @@ impl Uploader {
 
         // Ruta del archivo en caché
         let cache_path = self.cache_dir.join(temp_gdrive_id);
-        
+
         if !cache_path.exists() {
-            warn!("Archivo de caché no existe: {:?}, creando vacío", cache_path);
-            tokio::fs::write(&cache_path, b"").await?;
+            // El archivo fue copiado directamente al directorio mirror (no a través de FUSE),
+            // por lo que su contenido nunca llegó a la caché. Buscar en el mirror como fallback.
+            let mirror_source = self.db.resolve_inode_to_relative_path(inode).await
+                .ok()
+                .flatten()
+                .map(|rel| self.mirror_path.join(rel));
+
+            match mirror_source {
+                Some(ref src) if src.exists() => {
+                    info!("📂 Copiando desde mirror a caché antes de subir: {:?}", src);
+                    tokio::fs::copy(src, &cache_path).await
+                        .context("Error copiando archivo desde mirror a caché")?;
+                }
+                _ => {
+                    warn!("Archivo de caché no existe y no se encontró en mirror: {:?}", cache_path);
+                    tokio::fs::write(&cache_path, b"").await?;
+                }
+            }
         }
         
         // Subir archivo usando la API
