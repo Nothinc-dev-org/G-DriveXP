@@ -44,6 +44,7 @@ async fn ensure_root_exists(db: &Arc<MetadataRepository>) -> Result<()> {
 pub async fn sync_all_metadata(
     db: &Arc<MetadataRepository>,
     client: &Arc<DriveClient>,
+    root_id: &str,
 ) -> Result<()> {
     tracing::info!("Iniciando bootstrapping de metadatos...");
 
@@ -58,7 +59,12 @@ pub async fn sync_all_metadata(
     // Esto es CRÍTICO: el inode 1 debe existir como registro en `inodes` y `attrs`
     // para que las referencias foreign key en `dentry` sean válidas
     ensure_root_exists(db).await?;
+    // Mapear tanto el string literal "root" como el ID canónico real de Drive
+    // (la API devuelve el ID canónico como padre, no el string "root")
     drive_id_to_inode.insert("root".to_string(), 1u64);
+    if !root_id.is_empty() {
+        drive_id_to_inode.insert(root_id.to_string(), 1u64);
+    }
 
     // 4. Procesar archivos en dos pasadas o con recursión
     // Primera pasada: Crear todos los inodos y guardar sus metadatos básicos

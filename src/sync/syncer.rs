@@ -219,20 +219,32 @@ impl BackgroundSyncer {
             ).await?;
 
             // Actualizar dentry (árbol de directorios)
-            if let Some(parents) = &file.parents {
-                for parent_id in parents {
-                    // Google Drive usa "root" o el ID canónico (root_id) para el "My Drive" del usuario
-                    // Ambos deben mapearse al inode 1 (root del filesystem local)
-                    let parent_inode = if parent_id == "root" || parent_id == root_id {
-                        1u64
-                    } else {
-                        self.db.get_or_create_inode(parent_id).await?
-                    };
-                    self.db.upsert_dentry(parent_inode, inode, name).await?;
+            // IMPORTANTE: Si el archivo tiene cambios locales pendientes (dirty),
+            // NO sobreescribir la dentry. El cambio remoto es probablemente un eco
+            // de una operación previa nuestra, y el estado local (posiblemente un
+            // segundo movimiento) tiene prioridad.
+            let is_dirty = self.db.is_dirty(inode).await.unwrap_or(false);
+            if !is_dirty {
+                if let Some(parents) = &file.parents {
+                    for parent_id in parents {
+                        // Google Drive usa "root" o el ID canónico (root_id) para el "My Drive" del usuario
+                        // Ambos deben mapearse al inode 1 (root del filesystem local)
+                        let parent_inode = if parent_id == "root" || parent_id == root_id {
+                            1u64
+                        } else {
+                            self.db.get_or_create_inode(parent_id).await?
+                        };
+                        self.db.upsert_dentry(parent_inode, inode, name).await?;
+                    }
+                } else {
+                    // Sin padres → colgar del root
+                    self.db.upsert_dentry(1, inode, name).await?;
                 }
             } else {
-                // Sin padres → colgar del root
-                self.db.upsert_dentry(1, inode, name).await?;
+                tracing::debug!(
+                    "⏭️ Saltando actualización de dentry para inode={} (dirty): el cambio remoto es un eco",
+                    inode
+                );
             }
 
             // Actualizar remote_md5 si está disponible (para detección de conflictos)
@@ -275,6 +287,11 @@ impl BackgroundSyncer {
             "local_online" => {
                 // Descargar contenido actualizado al path local
                 if !file.mime_type.as_deref().map(|m| m.contains("folder")).unwrap_or(false) {
+                    let name_display = std::path::PathBuf::from(&local_file.relative_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| local_file.relative_path.clone());
+                    self.history.log(ActionType::Download, format!("Descargando: {}", name_display));
                     tracing::info!("📥 Descargando actualización para: {}", local_file.relative_path);
                     
                     // Descargar archivo usando chunks
@@ -309,6 +326,7 @@ impl BackgroundSyncer {
                         mtime,
                     ).await?;
                     
+                    self.history.log(ActionType::Download, format!("Descargado: {}", name_display));
                     tracing::info!("✅ Archivo actualizado localmente: {}", local_file.relative_path);
                 }
             }

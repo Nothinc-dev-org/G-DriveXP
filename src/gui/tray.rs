@@ -24,9 +24,24 @@ impl TrayIcon {
     /// Inicia el servicio del icono de bandeja en un thread separado
     pub fn spawn(self) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
+            let history = self.history.clone();
             let service = TrayService::new(GDriveXPTray {
                 history: self.history,
                 sync_paused: self.sync_paused,
+            });
+
+            // Obtener handle para forzar actualizaciones del menú
+            let handle = service.handle();
+
+            // Canal de notificación: history.push() → watcher → handle.update()
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            history.set_notifier(tx);
+
+            // Thread watcher: escucha cambios en el historial y fuerza refresh del menú
+            std::thread::spawn(move || {
+                while rx.recv().is_ok() {
+                    handle.update(|_| {});
+                }
             });
 
             // Ejecutar el loop de eventos de ksni (blocking)

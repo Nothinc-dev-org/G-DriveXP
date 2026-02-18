@@ -113,7 +113,7 @@ pub fn run_backend(
         // Fase 2.1: Bootstrapping (Sincronización de metadatos)
         if db.is_empty().await? {
             ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Sincronización inicial (esto puede tardar)...".to_string()));
-            sync::bootstrap::sync_all_metadata(&db, &drive_client).await?;
+            sync::bootstrap::sync_all_metadata(&db, &drive_client, &root_id).await?;
         }
         
         // Fase 2.2: Background Syncer (sincronización continua)
@@ -183,6 +183,7 @@ pub fn run_backend(
             db.clone(),
             config.mirror_path.clone(),
             config.fuse_mount_path.clone(),
+            history.clone(),
         );
         let _mirror_handle = mirror_manager.spawn();
         

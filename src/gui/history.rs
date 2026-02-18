@@ -3,7 +3,7 @@
 //! Almacena las últimas N acciones de sincronización, creación, eliminación, etc.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 use std::time::SystemTime;
 
 /// Número máximo de entradas en el historial
@@ -77,6 +77,7 @@ impl ActionEntry {
 #[derive(Clone)]
 pub struct ActionHistory {
     entries: Arc<RwLock<VecDeque<ActionEntry>>>,
+    notify: Arc<RwLock<Option<mpsc::Sender<()>>>>,
 }
 
 impl Default for ActionHistory {
@@ -89,6 +90,14 @@ impl ActionHistory {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_HISTORY_ENTRIES))),
+            notify: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Registra un notificador que se dispara cada vez que se añade una entrada
+    pub fn set_notifier(&self, tx: mpsc::Sender<()>) {
+        if let Ok(mut notify) = self.notify.write() {
+            *notify = Some(tx);
         }
     }
 
@@ -99,6 +108,12 @@ impl ActionHistory {
                 entries.pop_back();
             }
             entries.push_front(entry);
+        }
+        // Notificar al tray que hay cambios
+        if let Ok(notify) = self.notify.read() {
+            if let Some(tx) = notify.as_ref() {
+                let _ = tx.send(());
+            }
         }
     }
 

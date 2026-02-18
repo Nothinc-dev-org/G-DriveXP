@@ -183,10 +183,19 @@ impl Uploader {
                 .execute(self.db.pool())
                 .await?;
             
-            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                .bind(inode as i64)
-                .execute(self.db.pool())
-                .await?;
+            // Optimistic Locking: Verificar si el estado cambió mientras creábamos la carpeta
+            let current_name = self.get_file_name(inode).await?;
+            let current_parent_id = self.get_parent_gdrive_id(inode).await?;
+
+            if current_name != name || current_parent_id != parent_gdrive_id {
+                warn!("⚠️ Modificación concurrente detectada durante creación de carpeta (inode={}). Manteniendo dirty=1.", inode);
+                // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
+            } else {
+                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                    .bind(inode as i64)
+                    .execute(self.db.pool())
+                    .await?;
+            }
             
             info!("✅ Carpeta creada en GDrive: {} (inode={})", real_gdrive_id, inode);
             self.history.log(ActionType::Create, format!("Carpeta creada: {}", name));
@@ -217,10 +226,19 @@ impl Uploader {
             .await?;
         
         // Marcar como limpio (no dirty)
-        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await?;
+        // Optimistic Locking: Verificar si el estado cambió mientras subíamos el archivo
+        let current_name = self.get_file_name(inode).await?;
+        let current_parent_id = self.get_parent_gdrive_id(inode).await?;
+
+        if current_name != name || current_parent_id != parent_gdrive_id {
+            warn!("⚠️ Modificación concurrente detectada durante creación de archivo (inode={}). Manteniendo dirty=1.", inode);
+            // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
+        } else {
+            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await?;
+        }
         
         info!("✅ Archivo creado en GDrive: {} (inode={})", real_gdrive_id, inode);
         self.history.log(ActionType::Create, format!("Archivo creado: {}", name));
@@ -436,7 +454,11 @@ impl Uploader {
                     .bind(inode as i64)
                     .execute(self.db.pool())
                     .await?;
-                self.history.log(ActionType::Sync, format!("Renombrado: {}", local_name));
+                if add_parent.is_some() {
+                    self.history.log(ActionType::Sync, format!("Movido: {} → {}", current_remote_name, local_name));
+                } else {
+                    self.history.log(ActionType::Sync, format!("Renombrado: {} → {}", current_remote_name, local_name));
+                }
                 return Ok(());
             }
 
@@ -514,13 +536,26 @@ impl Uploader {
         }
         
         // 7. Marcar como limpio
-        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await?;
+        // 7. Optimistic Locking: Verificar si el estado cambió durante la actualización
+        let current_name = self.get_file_name(inode).await?;
+        let current_parent_id = self.get_parent_gdrive_id(inode).await?;
+
+        if current_name != local_name || current_parent_id != local_parent_id {
+            warn!("⚠️ Modificación concurrente detectada durante actualización (inode={}). Manteniendo dirty=1.", inode);
+            // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
+        } else {
+            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+                .bind(inode as i64)
+                .execute(self.db.pool())
+                .await?;
+        }
         
         info!("✅ Archivo actualizado en GDrive: {} (inode={})", gdrive_id, inode);
-        self.history.log(ActionType::Upload, format!("Archivo actualizado: {}", gdrive_id));
+        if add_parent.is_some() {
+            self.history.log(ActionType::Sync, format!("Movido: {} → {}", current_remote_name, local_name));
+        } else {
+            self.history.log(ActionType::Upload, format!("Subido: {}", local_name));
+        }
         
         Ok(())
     }

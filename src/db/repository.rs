@@ -275,6 +275,48 @@ impl MetadataRepository {
         Ok(())
     }
 
+    /// Obtiene todos los directorios "vivos" para el bootstrapping del Mirror
+    /// Incluye directorios vacíos que de otro modo serían invisibles.
+    /// Retorna: (inode, path_relativo_desde_root)
+    pub async fn get_all_active_dirs(&self) -> Result<Vec<(u64, String)>> {
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            r#"
+            WITH RECURSIVE dir_tree AS (
+                SELECT
+                    d.child_inode,
+                    d.name as path,
+                    a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                WHERE d.parent_inode = 1
+
+                UNION ALL
+
+                SELECT
+                    d.child_inode,
+                    dt.path || '/' || d.name,
+                    a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                JOIN dir_tree dt ON d.parent_inode = dt.child_inode
+            )
+            SELECT
+                dt.child_inode,
+                dt.path
+            FROM dir_tree dt
+            LEFT JOIN sync_state s ON dt.child_inode = s.inode
+            WHERE dt.is_dir = 1
+              AND (s.deleted_at IS NULL OR s.deleted_at = 0)
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter()
+            .map(|(inode, path)| (inode as u64, path))
+            .collect())
+    }
+
     /// Obtiene todos los archivos "vivos" para el Bootstrapping
     /// Retorna: (inode, path_relativo_desde_root, availability)
     pub async fn get_all_active_files(&self) -> Result<Vec<(u64, String, String)>> {
@@ -651,6 +693,19 @@ impl MetadataRepository {
         .await?;
 
         Ok(())
+    }
+
+    /// Verifica si un inode tiene cambios locales pendientes de subir
+    pub async fn is_dirty(&self, inode: u64) -> Result<bool> {
+        let dirty = sqlx::query_scalar::<_, bool>(
+            "SELECT dirty FROM sync_state WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
+
+        Ok(dirty)
     }
 
     // ============================================================

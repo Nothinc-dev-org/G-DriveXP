@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{info, error, warn};
 
 use crate::db::MetadataRepository;
+use crate::gui::history::{ActionHistory, ActionType};
 
 /// Comandos para el MirrorManager (desde IPC o GUI)
 #[derive(Debug)]
@@ -27,6 +28,7 @@ struct MirrorContext {
     db: Arc<MetadataRepository>,
     mirror_path: PathBuf,
     fuse_mount_path: PathBuf,
+    history: ActionHistory,
 }
 
 /// Gestor principal de la arquitectura Espejo
@@ -44,14 +46,16 @@ impl MirrorManager {
         db: Arc<MetadataRepository>,
         mirror_path: PathBuf,
         fuse_mount_path: PathBuf,
+        history: ActionHistory,
     ) -> (Self, mpsc::Sender<MirrorCommand>) {
         let (tx, rx) = mpsc::channel(32);
         let (w_tx, w_rx) = mpsc::channel(100);
-        
+
         let ctx = Arc::new(MirrorContext {
             db,
             mirror_path,
             fuse_mount_path,
+            history,
         });
         
         let manager = Self {
@@ -117,10 +121,24 @@ impl MirrorManager {
     // Función estática asociada que corre independiente del estado mut del manager
     async fn run_bootstrap(ctx: Arc<MirrorContext>) -> Result<()> {
         info!("🔄 Iniciando bootstrap del espejo...");
-        
+
         // Pequeña pausa adicional de seguridad
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        
+
+        // PASO 0: Crear todos los directorios activos, incluyendo los vacíos.
+        // get_all_active_files() filtra is_dir=0, así que directorios sin archivos
+        // nunca se crearían como padres implícitos. Lo hacemos aquí explícitamente.
+        let dirs = ctx.db.get_all_active_dirs().await?;
+        info!("📁 Se encontraron {} directorios activos en DB", dirs.len());
+        for (_inode, relative_path) in dirs {
+            let mirror_dir = ctx.mirror_path.join(&relative_path);
+            if !mirror_dir.exists() {
+                if let Err(e) = tokio::fs::create_dir_all(&mirror_dir).await {
+                    warn!("No se pudo crear directorio {:?}: {:?}", mirror_dir, e);
+                }
+            }
+        }
+
         let files = ctx.db.get_all_active_files().await?;
         info!("📂 Se encontraron {} archivos activos en DB", files.len());
         
@@ -305,6 +323,10 @@ impl MirrorManager {
                     return;
                 }
                 
+                let name_display = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path_str.to_string());
+                ctx.history.log(ActionType::Sync, format!("Solo online: {}", name_display));
                 info!("☁️ Espacio liberado (External Temp): {:?}", relative);
 
                 // 7. FORCE NAUTILUS REFRESH
@@ -374,6 +396,10 @@ impl MirrorManager {
         // 2. Database is source of truth - If DB has inode, we proceed
         // FUSE will serve the file on-demand when accessed
 
+        let name_display = path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path_str.to_string());
+        ctx.history.log(ActionType::Download, format!("Descargando: {}", name_display));
         info!("📥 Iniciando descarga: {:?}", relative);
         
         // 3. Copiar contenido usando spawn_blocking (evitar bloqueo de runtime)
@@ -433,6 +459,7 @@ impl MirrorManager {
               error!("Error moviendo archivo descargado a destino final: {:?}", e);
               let _ = tokio::fs::remove_file(&tmp_path).await;
         } else {
+              ctx.history.log(ActionType::Download, format!("Descargado: {}", name_display));
               info!("✅ Archivo descargado exitosamente (External Temp): {:?}", relative);
               
               // 6. FORCE NAUTILUS REFRESH
@@ -519,6 +546,8 @@ impl MirrorManager {
     }
 
     async fn handle_local_rename(&self, old_path: &PathBuf, new_path: &PathBuf) {
+        let old_name = old_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        self.ctx.history.log(ActionType::Sync, format!("Moviendo: {}", old_name));
         tracing::info!("🔄 DETECTADO RENOMBRADO INTELIGENTE: {:?} -> {:?}", old_path, new_path);
         
         // 1. Calcular relativas
@@ -555,13 +584,13 @@ impl MirrorManager {
         if let Ok(attrs) = db.get_attrs(inode).await {
             if !attrs.can_move {
                 warn!("⛔ Bloqueando movimiento de archivo compartido (ReadOnly). Revirtiendo físicamente: {:?} -> {:?}", new_path, old_path);
-                
+                self.ctx.history.log(ActionType::Error, format!("Movimiento bloqueado: {}", old_name));
+
                 // Intentar moverlo de vuelta físicamente
                 if let Err(e) = tokio::fs::rename(new_path, old_path).await {
                     error!("Fallo crítico al intentar revertir movimiento físico: {:?}", e);
                 }
-                
-                // Opcional: Notificar a Nautilus/UI (por ahora solo log)
+
                 return;
             }
         }
@@ -610,17 +639,64 @@ impl MirrorManager {
         }
 
         // 6. Marcar DIRTY para que el Uploader verifique metadata
-        let dirty_sql = "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 1, 0, 'local_online') 
+        let dirty_sql = "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 1, 0, 'local_online')
                          ON CONFLICT(inode) DO UPDATE SET dirty=1";
         if let Err(e) = sqlx::query(dirty_sql)
              .bind(inode as i64)
              .execute(db.pool())
-             .await 
+             .await
         {
              error!("Error marcando dirty tras Rename: {:?}", e);
         }
-        
-        info!("✅ Renombrado local procesado exitosamente.");
+
+        // 7. Reparar target de symlink si el archivo movido es online_only.
+        // El kernel mueve el *archivo* symlink correctamente, pero su contenido (el target path)
+        // sigue apuntando a la ruta FUSE antigua. Como la DB acaba de actualizarse, FUSE ahora
+        // expone el archivo en la nueva ruta: necesitamos recrear el symlink con el target correcto.
+        if let Ok(meta) = tokio::fs::symlink_metadata(new_path).await {
+            if meta.is_symlink() {
+                info!("🔗 Symlink detectado tras movimiento, reparando target: {:?}", new_path);
+                let new_fuse_target = self.ctx.fuse_mount_path.join(
+                    new_path.strip_prefix(&self.ctx.mirror_path).unwrap_or(new_path)
+                );
+
+                // Misma estrategia atómica que static_handle_set_online_only:
+                // creamos en temp dir externo al directorio observado y luego renombramos.
+                let temp_dir_root = self.ctx.mirror_path.join(".gdrive_tmp_ops");
+                if let Err(e) = tokio::fs::create_dir_all(&temp_dir_root).await {
+                    error!("No se pudo crear directorio temporal para reparar symlink: {:?}", e);
+                } else {
+                    let file_name = new_path.file_name()
+                        .map(|f| f.to_string_lossy())
+                        .unwrap_or_else(|| "unknown".into());
+                    let unique_name = format!("{}.{}.link.tmp", uuid::Uuid::new_v4(), file_name);
+                    let tmp_symlink_path = temp_dir_root.join(&unique_name);
+
+                    let fuse_clone = new_fuse_target.clone();
+                    let tmp_clone = tmp_symlink_path.clone();
+                    let new_path_clone = new_path.clone();
+
+                    let create_result = tokio::task::spawn_blocking(move || {
+                        std::os::unix::fs::symlink(&fuse_clone, &tmp_clone)
+                    }).await;
+
+                    match create_result {
+                        Ok(Ok(())) => {
+                            if let Err(e) = tokio::fs::rename(&tmp_symlink_path, &new_path_clone).await {
+                                error!("Error al intercambiar symlink reparado: {:?}", e);
+                                let _ = tokio::fs::remove_file(&tmp_symlink_path).await;
+                            } else {
+                                info!("✅ Symlink reparado: {:?} → {:?}", new_path_clone, new_fuse_target);
+                            }
+                        }
+                        Ok(Err(e)) => error!("Error creando symlink temporal para reparación: {:?}", e),
+                        Err(e) => error!("Error en spawn_blocking (symlink repair): {:?}", e),
+                    }
+                }
+            }
+        }
+
+        info!("✅ Renombrado local procesado exitosamente (pendiente confirmación de Drive).");
     }
 
     async fn handle_local_change(&self, path: &PathBuf, relative_path: &str, is_dir: bool) {
@@ -662,6 +738,7 @@ impl MirrorManager {
             Err(_) => None,
         };
 
+        let is_new = existing_inode.is_none();
         let inode = if let Some(i) = existing_inode {
             // UPDATE
             i
@@ -712,6 +789,14 @@ impl MirrorManager {
              error!("Error marcando dirty: {:?}", e);
         }
         
+        let name_display = PathBuf::from(relative_path).file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| relative_path.to_string());
+        if is_new {
+            self.ctx.history.log(ActionType::Create, format!("Creado: {}", name_display));
+        } else {
+            self.ctx.history.log(ActionType::Upload, format!("Modificado: {}", name_display));
+        }
         info!("✅ Cambio local registrado: {} (inode={})", relative_path, inode);
     }
     
@@ -742,6 +827,10 @@ impl MirrorManager {
                 if let Err(e) = db.soft_delete_by_gdrive_id(&gid).await {
                     error!("Error realizando soft delete en DB: {:?}", e);
                 } else {
+                    let name_display = PathBuf::from(relative_path).file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| relative_path.to_string());
+                    self.ctx.history.log(ActionType::Delete, format!("Eliminado: {}", name_display));
                     info!("✅ Eliminación registrada: {} (id={})", relative_path, gid);
                 }
             } else {
