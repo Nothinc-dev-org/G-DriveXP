@@ -724,53 +724,98 @@ impl MetadataRepository {
         Ok(row.map(|i| i as u64))
     }
 
-    /// Marca un archivo como eliminado (soft delete)
-    /// Mueve el dentry a dentry_deleted, marca sync_state con deleted_at
+    /// Marca un archivo o directorio y todo su contenido (recursivamente) como eliminado
     pub async fn soft_delete_by_gdrive_id(&self, gdrive_id: &str) -> Result<bool> {
-        let inode = match self.get_inode_by_gdrive_id(gdrive_id).await? {
+        let root_inode = match self.get_inode_by_gdrive_id(gdrive_id).await? {
             Some(i) => i,
-            None => return Ok(false), // No existe, nada que eliminar
+            None => return Ok(false),
         };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        // 1. Mover dentry a dentry_deleted
-        sqlx::query(
-            r#"
+        // 1. Identificar recursivamente todos los inodos hijos (incluyendo el raíz)
+        // Usamos una CTE para encontrar toda la descendencia.
+        let sql_deleted_dentries = r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode, parent_inode, name FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode, d.parent_inode, d.name
+                FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
             INSERT OR REPLACE INTO dentry_deleted (parent_inode, child_inode, name, deleted_at)
-            SELECT parent_inode, child_inode, name, ?
-            FROM dentry WHERE child_inode = ?
-            "#
-        )
-        .bind(now)
-        .bind(inode as i64)
-        .execute(&self.pool)
-        .await?;
+            SELECT parent_inode, child_inode, name, ? FROM subordinates
+        "#;
 
-        // 2. Eliminar de dentry (ya no visible en FUSE)
-        sqlx::query("DELETE FROM dentry WHERE child_inode = ?")
-            .bind(inode as i64)
+        sqlx::query(sql_deleted_dentries)
+            .bind(root_inode as i64)
+            .bind(now)
             .execute(&self.pool)
             .await?;
 
-        // 3. Marcar deleted_at en sync_state Y dirty=1 para forzar sync
-        sqlx::query(
-            r#"
-            INSERT INTO sync_state (inode, dirty, version, deleted_at)
-            VALUES (?, 1, 0, ?)
-            ON CONFLICT(inode) DO UPDATE SET 
-                deleted_at = excluded.deleted_at,
-                dirty = 1
-            "#
-        )
-        .bind(inode as i64)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        // 2. Marcar sync_state para todos los inodos afectados
+        // Primero intentamos actualizar los existentes
+        let sql_update_sync = r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode
+                FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            UPDATE sync_state 
+            SET deleted_at = ?, dirty = 1 
+            WHERE inode IN (SELECT child_inode FROM subordinates)
+        "#;
 
-        tracing::debug!("Soft delete aplicado: gdrive_id={}, inode={}", gdrive_id, inode);
+        sqlx::query(sql_update_sync)
+            .bind(root_inode as i64)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+
+        // Luego insertamos los que falten
+        let sql_insert_sync = r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode
+                FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            INSERT INTO sync_state (inode, dirty, version, deleted_at)
+            SELECT child_inode, 1, 0, ? 
+            FROM subordinates 
+            WHERE child_inode NOT IN (SELECT inode FROM sync_state)
+        "#;
+
+        sqlx::query(sql_insert_sync)
+            .bind(root_inode as i64)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+
+        // 3. Limpiar dentry original para todos los inodos afectados
+        // IMPORTANTE: Esto debe ser lo ÚLTIMO porque las CTEs anteriores dependen de dentry.
+        let sql_cleanup_dentry = r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode
+                FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            DELETE FROM dentry WHERE child_inode IN (SELECT child_inode FROM subordinates)
+        "#;
+
+        sqlx::query(sql_cleanup_dentry)
+            .bind(root_inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::info!("Recursive soft delete applied for gdrive_id={}, root_inode={}", gdrive_id, root_inode);
         Ok(true)
     }
 
@@ -1367,7 +1412,6 @@ impl MetadataRepository {
         Err(anyhow::anyhow!("Path no pertenece a ninguna carpeta Local Sync: {}", absolute_path))
     }
 }
-
 /// Struct que representa un directorio local sincronizado
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LocalSyncDir {

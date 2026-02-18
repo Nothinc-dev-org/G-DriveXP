@@ -480,15 +480,37 @@ impl MirrorManager {
             let event = debounced_event.event;
             let paths = event.paths;
             
-            // Si el evento es un Renamed (Both), tenemos source y dest en paths[0] y paths[1]
-            if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = event.kind {
-                if paths.len() == 2 {
+            // 1. Manejo Inteligente de Renombrados/Movimientos
+            match event.kind {
+                // Caso A: Renombrado completo (Source + Dest) detectado por Notify
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if paths.len() == 2 => {
                     self.handle_local_rename(&paths[0], &paths[1]).await;
                     continue;
                 }
+                // Caso B: "Rename From" (Mover FUERA del espejo o a la papelera)
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                    for path in paths {
+                        if let Ok(relative) = path.strip_prefix(&self.ctx.mirror_path) {
+                            self.handle_local_delete(&relative.to_string_lossy()).await;
+                        }
+                    }
+                    continue;
+                }
+                // Caso C: "Rename To" (Mover DESDE FUERA al espejo)
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                    for path in paths {
+                        if let Ok(relative) = path.strip_prefix(&self.ctx.mirror_path) {
+                            if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
+                                self.handle_local_change(&path, &relative.to_string_lossy(), meta.is_dir()).await;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
 
-            // Para otros eventos (Create, Modify, Remove), iteramos sobre los paths afectados
+            // 2. Procesar otros eventos (Create, Modify, Remove)
             for path in paths {
                 // 1. Filtrar eventos fuera de interés
                 // Ignorar .gdrive_tmp_ops y el punto de montaje oculto
@@ -700,6 +722,74 @@ impl MirrorManager {
     }
 
     async fn handle_local_change(&self, path: &PathBuf, relative_path: &str, is_dir: bool) {
+        // 1. Procesar el nodo principal
+        let is_new = self.process_local_change(path, relative_path, is_dir).await;
+        
+        // 2. Si es un directorio nuevo, iniciar escaneo recursivo (iterativo con stack)
+        // Esto evita "recursion in async fn" y asegura captura de contenido inicial.
+        if is_new && is_dir {
+            info!("magnifying_glass_tilted_left Ejecutando Escaneo de Seguridad Iterativo en: {}", relative_path);
+            
+            // Stack de directorios a explorar: (path_absoluto, path_relativo)
+            let mut stack = vec![(path.clone(), relative_path.to_string())];
+            
+            // Límite de seguridad para evitar loops de symlinks o profundidad excesiva
+            let mut depth_guard = 0;
+            const MAX_SCAN_DEPTH: usize = 5000; 
+
+            while let Some((current_path, current_rel)) = stack.pop() {
+                depth_guard += 1;
+                if depth_guard > MAX_SCAN_DEPTH {
+                    warn!("Abortando escaneo de seguridad por exceso de elementos/profundidad");
+                    break;
+                }
+
+                let mut read_dir = match tokio::fs::read_dir(&current_path).await {
+                    Ok(rd) => rd,
+                    Err(e) => {
+                        // Puede pasar si se borró mientras escaneábamos
+                        tracing::debug!("No se pudo leer dir en escaneo: {:?}", e);
+                        continue;
+                    }
+                };
+
+                while let Ok(Some(entry)) = read_dir.next_entry().await {
+                    let child_path = entry.path();
+                    let child_name = entry.file_name().to_string_lossy().to_string();
+                    
+                    // Ignorar basura
+                     if child_name.starts_with(".gdrive") || child_name.starts_with(".cloud") {
+                        continue;
+                    }
+
+                    let child_relative = if current_rel.is_empty() {
+                         child_name.clone()
+                    } else {
+                         format!("{}/{}", current_rel, child_name)
+                    };
+                    
+                    if let Ok(child_meta) = entry.metadata().await {
+                        if !child_meta.is_symlink() {
+                            let child_is_dir = child_meta.is_dir();
+                            
+                            // Procesar hijo
+                            info!("   ↪️ Detectado hijo en escaneo: {}", child_relative);
+                            let _ = self.process_local_change(&child_path, &child_relative, child_is_dir).await;
+                            
+                            // Si es directorio, añadir al stack para explorar SUS hijos
+                            if child_is_dir {
+                                stack.push((child_path, child_relative));
+                            }
+                        }
+                    }
+                }
+            }
+            info!("✅ Escaneo de seguridad completado para cluster de: {}", relative_path);
+        }
+    }
+
+    /// Lógica core de registro de cambios. Retorna true si el archivo es NUEVO.
+    async fn process_local_change(&self, path: &PathBuf, relative_path: &str, is_dir: bool) -> bool {
         tracing::debug!("📝 Cambio local detectado: {} (dir={})", relative_path, is_dir);
         
         let db = &self.ctx.db;
@@ -717,11 +807,11 @@ impl MirrorManager {
                 Ok(Some(i)) => i,
                 Ok(None) => {
                     warn!("Padre no encontrado en DB para cambio local: {}", relative_path);
-                    return;
+                    return false;
                 }
                 Err(e) => {
                     error!("Error resolviendo padre: {:?}", e);
-                    return;
+                    return false;
                 }
             }
         };
@@ -729,7 +819,7 @@ impl MirrorManager {
         // 2. Obtener nombre
         let name = match PathBuf::from(relative_path).file_name() {
             Some(n) => n.to_string_lossy().to_string(),
-            None => return,
+            None => return false,
         };
 
         // 3. Verificar si ya existe (Update vs Create)
@@ -749,7 +839,7 @@ impl MirrorManager {
                 Ok(i) => i,
                 Err(e) => {
                     error!("Error creando inode temporal: {:?}", e);
-                    return;
+                    return false;
                 }
             }
         };
@@ -776,8 +866,6 @@ impl MirrorManager {
         }
 
         // 6. Marcar DIRTY y LocalOnline
-        // Usamos raw SQL porque no tenemos metodo "mark_dirty_local" facil expuesto
-        // También ponemos availability = local_online
         let sql = "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 1, 0, 'local_online') 
                    ON CONFLICT(inode) DO UPDATE SET dirty=1, availability='local_online'";
         
@@ -798,13 +886,14 @@ impl MirrorManager {
             self.ctx.history.log(ActionType::Upload, format!("Modificado: {}", name_display));
         }
         info!("✅ Cambio local registrado: {} (inode={})", relative_path, inode);
+        
+        is_new
     }
     
     async fn handle_local_delete(&self, relative_path: &str) {
         tracing::debug!("🗑️ Eliminación local detectada: {}", relative_path);
         
-        // DOUBLE CHECK: El evento puede ser falso positivo si fue parte de un rename atómico rápido.
-        // Si el archivo EXISTE ahora (como symlink o real), IGNORAR el delete.
+        // DOUBLE CHECK: El evento puede ser falso positivo o redundante (por eliminación recursiva previa)
         let check_path = self.ctx.mirror_path.join(relative_path);
         if check_path.exists() || tokio::fs::symlink_metadata(&check_path).await.is_ok() {
             tracing::warn!("⚠️ FALSO NEGATIVO: Evento Remove para '{}' pero el archivo existe. Ignorando.", relative_path);
@@ -813,10 +902,25 @@ impl MirrorManager {
 
         let db = &self.ctx.db;
         
-        // Resolver inode antes de que desaparezca de nuestra memoria lógica
-        // (Aunque físicamente ya no está, en la DB sí)
+        // 1. Resolver inode
         if let Ok(Some(inode)) = db.resolve_relative_path_to_inode(relative_path).await {
-            // Obtener gdrive_id para soft delete
+            // 2. OPTIMIZACIÓN CRÍTICA: Verificar si ya está marcado como eliminado
+            // Si el padre ya fue eliminado recursivamente, este inode ya no tendrá dentry
+            // y no necesitamos procesarlo de nuevo.
+            if let Ok(Some(deleted)) = sqlx::query_scalar::<_, bool>(
+                "SELECT deleted_at IS NOT NULL FROM sync_state WHERE inode = ?"
+            ).bind(inode as i64).fetch_optional(db.pool()).await {
+                if deleted {
+                    tracing::debug!("   Inodo {} ya está marcado como eliminado (posiblemente por cascada).", inode);
+                    return;
+                }
+            } else {
+                // If sync_state entry doesn't exist, it's not deleted, proceed.
+                // Or if there was an error, log it and proceed cautiously.
+                // For now, if fetch_optional returns None, it means no entry, so not deleted.
+            }
+
+            // 3. Obtener gdrive_id para soft delete
             let gdrive_id: Option<String> = sqlx::query_scalar("SELECT gdrive_id FROM inodes WHERE inode = ?")
                 .bind(inode as i64)
                 .fetch_optional(db.pool())
@@ -824,6 +928,7 @@ impl MirrorManager {
                 .unwrap_or(None);
             
             if let Some(gid) = gdrive_id {
+                // Ahora es RECURSIVO en la base de datos
                 if let Err(e) = db.soft_delete_by_gdrive_id(&gid).await {
                     error!("Error realizando soft delete en DB: {:?}", e);
                 } else {
@@ -831,7 +936,7 @@ impl MirrorManager {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| relative_path.to_string());
                     self.ctx.history.log(ActionType::Delete, format!("Eliminado: {}", name_display));
-                    info!("✅ Eliminación registrada: {} (id={})", relative_path, gid);
+                    info!("✅ Eliminación registrada (Cascada): {} (id={})", relative_path, gid);
                 }
             } else {
                  // Archivo sin gdrive_id (temporal local), hard delete
@@ -846,4 +951,3 @@ impl MirrorManager {
         }
     }
 }
-
