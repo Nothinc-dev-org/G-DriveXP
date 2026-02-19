@@ -140,6 +140,28 @@ pub fn run_backend(
         );
         let _uploader_handle = uploader.spawn();
         
+        // Fase 2.3.5: Progress Monitor (Monitor de Operaciones Pendientes)
+        let db_monitor = db.clone();
+        let history_monitor = history.clone();
+        tokio::spawn(async move {
+            tracing::info!("🔍 Iniciando monitor de progreso DB...");
+            loop {
+                let dirty_fuse = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_state WHERE dirty = 1")
+                    .fetch_one(db_monitor.pool())
+                    .await
+                    .unwrap_or(0);
+                    
+                let dirty_local = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM local_sync_files WHERE dirty = 1")
+                    .fetch_one(db_monitor.pool())
+                    .await
+                    .unwrap_or(0);
+                    
+                history_monitor.set_pending_uploads((dirty_fuse + dirty_local) as usize);
+                
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+        });
+
         // Fase 2.4: MirrorManager (Nuevo Sistema Híbrido)
         // Reemplaza a LocalSyncManager
         // Fase 2.4: MirrorManager & IPC DEFERRED

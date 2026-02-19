@@ -21,6 +21,7 @@ pub struct AppModel {
     pub active_transfers: Vec<ActiveTransfer>,
     pub sync_detected: usize,
     pub sync_applied: usize,
+    pub pending_uploads: usize,
     // Referencias a widgets dinámicos
     pub transfers_listbox: Option<gtk::ListBox>,
     pub history_listbox: Option<gtk::ListBox>,
@@ -35,11 +36,15 @@ pub enum ViewMode {
 }
 
 impl AppModel {
-    /// Genera el texto del hint de sincronización
     fn sync_hint_text(&self) -> String {
-        if !self.active_transfers.is_empty() || self.sync_detected != self.sync_applied {
-            if self.sync_detected > 0 {
+        let has_pending_downloads = self.sync_detected != self.sync_applied;
+        let has_pending_uploads = self.pending_uploads > 0;
+        
+        if !self.active_transfers.is_empty() || has_pending_downloads || has_pending_uploads {
+            if has_pending_downloads {
                 format!("{}/{} Cambios aplicados", self.sync_applied, self.sync_detected)
+            } else if has_pending_uploads {
+                format!("{} Cambios pendientes", self.pending_uploads)
             } else {
                 "Sincronizando...".to_string()
             }
@@ -469,6 +474,7 @@ impl Component for AppModel {
             active_transfers: Vec::new(),
             sync_detected: 0,
             sync_applied: 0,
+            pending_uploads: 0,
             transfers_listbox: None,
             history_listbox: None,
             current_view: ViewMode::Main,
@@ -649,6 +655,7 @@ impl Component for AppModel {
                 let progress = self.history.get_sync_progress();
                 self.sync_detected = progress.changes_detected;
                 self.sync_applied = progress.changes_applied;
+                self.pending_uploads = progress.pending_uploads;
 
                 // Rebuild imperativo de los listbox dinámicos
                 if let Some(ref transfers_box) = self.transfers_listbox {

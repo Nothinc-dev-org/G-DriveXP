@@ -81,6 +81,7 @@ impl ActiveTransfer {
 pub struct SyncProgress {
     pub changes_detected: usize,
     pub changes_applied: usize,
+    pub pending_uploads: usize,
 }
 
 impl SyncProgress {
@@ -276,6 +277,22 @@ impl ActionHistory {
             progress.clone()
         } else {
             SyncProgress::default()
+        }
+    }
+
+    /// Actualiza el conteo de subidas pendientes localmente
+    pub fn set_pending_uploads(&self, count: usize) {
+        let changed = if let Ok(mut progress) = self.sync_progress.write() {
+            let changed = progress.pending_uploads != count;
+            progress.pending_uploads = count;
+            changed
+        } else {
+            false
+        };
+        
+        // Si el conteo cambió, notificar al tray (hacerlo fuera del lock)
+        if changed {
+            self.notify_change();
         }
     }
 }

@@ -7,8 +7,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use super::history::ActionHistory;
 
-/// Número de entradas recientes a mostrar en el menú
-const RECENT_ENTRIES_COUNT: usize = 10;
+
 
 /// Servicio del icono de bandeja
 pub struct TrayIcon {
@@ -94,25 +93,50 @@ impl Tray for GDriveXPTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items: Vec<MenuItem<Self>> = Vec::new();
 
-        // Historial reciente
-        let recent = self.history.recent(RECENT_ENTRIES_COUNT);
-        if !recent.is_empty() {
-            for entry in recent {
-                items.push(StandardItem {
-                    label: entry.format_for_menu(),
-                    enabled: false, // Solo informativo
-                    ..Default::default()
-                }.into());
-            }
-            items.push(MenuItem::Separator);
-        } else {
+        let progress = self.history.get_sync_progress();
+        let active_transfers = self.history.active_transfers();
+
+        let has_pending_downloads = progress.changes_detected != progress.changes_applied;
+        let has_pending_uploads = progress.pending_uploads > 0;
+
+        // Determinar estado de sincronización
+        if !active_transfers.is_empty() || has_pending_downloads || has_pending_uploads {
             items.push(StandardItem {
-                label: "Sin actividad reciente".to_string(),
+                label: "🔄 Syncronizando".to_string(),
                 enabled: false,
                 ..Default::default()
             }.into());
-            items.push(MenuItem::Separator);
+
+            if has_pending_downloads {
+                items.push(StandardItem {
+                    label: format!("Descargas pendientes: {}/{}", progress.changes_applied, progress.changes_detected),
+                    enabled: false,
+                    ..Default::default()
+                }.into());
+            } 
+            if has_pending_uploads {
+                items.push(StandardItem {
+                    label: format!("Subidas/Cambios pendientes: {}", progress.pending_uploads),
+                    enabled: false,
+                    ..Default::default()
+                }.into());
+            }
+            if !active_transfers.is_empty() {
+                items.push(StandardItem {
+                    label: format!("{} transferencias activas", active_transfers.len()),
+                    enabled: false,
+                    ..Default::default()
+                }.into());
+            }
+        } else {
+            items.push(StandardItem {
+                label: "Todo en Orden".to_string(),
+                enabled: false,
+                ..Default::default()
+            }.into());
         }
+
+        items.push(MenuItem::Separator);
 
         // Abrir panel principal
         items.push(StandardItem {
