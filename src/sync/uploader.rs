@@ -16,7 +16,7 @@ use crate::gdrive::client::DriveClient;
 /// Intervalo máximo de backoff en segundos
 const MAX_BACKOFF_SECS: u64 = 300;
 
-use crate::gui::history::{ActionHistory, ActionType};
+use crate::gui::history::{ActionHistory, ActionType, TransferOp};
 
 /// Uploader en background que sube archivos dirty a Google Drive
 pub struct Uploader {
@@ -226,13 +226,16 @@ impl Uploader {
             }
         }
         
-        // Subir archivo usando la API
+        // Subir archivo usando la API (con tracking de progreso)
+        let file_size = tokio::fs::metadata(&cache_path).await.map(|m| m.len()).unwrap_or(0);
+        let transfer_id = self.history.start_transfer(&name, TransferOp::Upload, file_size);
         let real_gdrive_id = self.client.upload_file(
             &cache_path,
             &name,
             attrs.mime_type.as_deref(),
             &parent_gdrive_id,
         ).await.context("Error subiendo archivo nuevo")?;
+        self.history.complete_transfer(transfer_id);
         
         // Actualizar el gdrive_id en la base de datos
         sqlx::query("UPDATE inodes SET gdrive_id = ? WHERE inode = ?")
@@ -542,9 +545,12 @@ impl Uploader {
              return Ok(());
         }
 
-        // 6. Actualizar contenido usando la API
+        // 6. Actualizar contenido usando la API (con tracking de progreso)
+        let file_size = tokio::fs::metadata(&cache_path).await.map(|m| m.len()).unwrap_or(0);
+        let transfer_id = self.history.start_transfer(&local_name, TransferOp::Upload, file_size);
         self.client.update_file_content(gdrive_id, &cache_path).await
             .context("Error actualizando archivo")?;
+        self.history.complete_transfer(transfer_id);
         
         // 6. Obtener el nuevo MD5 tras la actualización
         if let Some(new_md5) = self.client.get_file_md5(gdrive_id).await? {
@@ -852,13 +858,16 @@ impl Uploader {
             None => {
                 // Archivo nuevo: subir a Drive
                 info!("📤 Creando archivo local sync en Drive: {}", file.relative_path);
-                
+
+                let file_size = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
+                let transfer_id = self.history.start_transfer(file_name, TransferOp::Upload, file_size);
                 let gdrive_id = self.client.upload_file(
                     local_path,
                     file_name,
                     mime_type.as_deref(),
                     &parent_gdrive_id,
                 ).await.context("Error subiendo archivo local sync")?;
+                self.history.complete_transfer(transfer_id);
                 
                 // Actualizar BD
                 self.db.set_local_file_gdrive_id(file.id, &gdrive_id).await?;
@@ -877,11 +886,14 @@ impl Uploader {
             Some(gdrive_id) => {
                 // Archivo existente: actualizar contenido
                 info!("📤 Actualizando archivo local sync: {}", file.relative_path);
-                
+
                 // TODO: Implementar detección de conflictos similar a update_file
-                
+
+                let file_size = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
+                let transfer_id = self.history.start_transfer(file_name, TransferOp::Upload, file_size);
                 self.client.update_file_content(gdrive_id, local_path).await
                     .context("Error actualizando archivo local sync")?;
+                self.history.complete_transfer(transfer_id);
                 
                 // Actualizar BD
                 self.db.clear_local_file_dirty(file.id).await?;

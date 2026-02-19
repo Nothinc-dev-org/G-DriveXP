@@ -21,7 +21,7 @@ const MAX_BACKOFF_SECS: u64 = 300;
 /// Período de gracia para tombstones en días
 const TOMBSTONE_GRACE_DAYS: i64 = 7;
 
-use crate::gui::history::{ActionHistory, ActionType};
+use crate::gui::history::{ActionHistory, ActionType, TransferOp};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Sincronizador en background que detecta cambios de Google Drive
@@ -119,13 +119,20 @@ impl BackgroundSyncer {
         let (changes, new_start_token) = self.client.list_changes(&page_token).await?;
         
         let changes_count = changes.len();
-        
-        // 3. Procesar cada cambio
+
+        // 3. Procesar cada cambio (con tracking de progreso)
+        if changes_count > 0 {
+            self.history.set_sync_progress(changes_count, 0);
+        }
         for change in changes {
             if let Err(e) = self.process_change(change, &root_id).await {
                 tracing::warn!("Error procesando cambio individual: {:?}", e);
                 // Continuamos con los demás
             }
+            self.history.increment_applied();
+        }
+        if changes_count > 0 {
+            self.history.mark_all_synced();
         }
 
         // 4. Guardar nuevo token si es la última página
@@ -294,19 +301,24 @@ impl BackgroundSyncer {
                     self.history.log(ActionType::Download, format!("Descargando: {}", name_display));
                     tracing::info!("📥 Descargando actualización para: {}", local_file.relative_path);
                     
-                    // Descargar archivo usando chunks
+                    // Descargar archivo usando chunks (con tracking de progreso)
                     let file_size = file.size.unwrap_or(0) as u64;
                     let mut content = Vec::with_capacity(file_size as usize);
-                    
+
+                    let transfer_id = self.history.start_transfer(&name_display, TransferOp::Download, file_size);
+
                     const CHUNK_SIZE: u32 = 10 * 1024 * 1024; // 10 MB
                     let mut offset = 0u64;
-                    
+
                     while offset < file_size {
                         let size = std::cmp::min(CHUNK_SIZE, (file_size - offset) as u32);
                         let chunk = self.client.download_chunk(file_id, offset, size).await?;
                         content.extend_from_slice(&chunk);
                         offset += chunk.len() as u64;
+                        self.history.update_transfer_progress(transfer_id, offset);
                     }
+
+                    self.history.complete_transfer(transfer_id);
                     
                     // Asegurar que el directorio padre existe
                     if let Some(parent) = local_path.parent() {
