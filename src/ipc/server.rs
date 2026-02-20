@@ -147,9 +147,26 @@ async fn handle_client(
                 IpcResponse::Availability(avail)
             }
             IpcRequest::SetOnlineOnly { path } => {
-                match set_availability(&mirror_tx, &path, "online_only").await {
-                    Ok(()) => IpcResponse::Success,
-                    Err(e) => IpcResponse::Error { message: e.to_string() },
+                // Validación para evitar borrar archivos no sincronizados
+                let rel = if path.starts_with(mirror_path.to_string_lossy().as_ref()) {
+                    path.strip_prefix(mirror_path.to_string_lossy().as_ref()).unwrap_or(&path).trim_start_matches('/')
+                } else {
+                    &path
+                };
+                
+                let can_free_space = if let Ok(Some((_, gdrive_id))) = resolve_path_to_inode_and_gdrive_id(&db, rel).await {
+                    !gdrive_id.starts_with("temp_")
+                } else {
+                    true // Si no encontramos inode, dejamos que el error se maneje más adelante
+                };
+
+                if !can_free_space {
+                    IpcResponse::Error { message: "El archivo aún no se ha sincronizado con Google Drive. No se puede liberar espacio.".to_string() }
+                } else {
+                    match set_availability(&mirror_tx, &path, "online_only").await {
+                        Ok(()) => IpcResponse::Success,
+                        Err(e) => IpcResponse::Error { message: e.to_string() },
+                    }
                 }
             }
             IpcRequest::SetLocalOnline { path } => {

@@ -81,7 +81,16 @@ impl AppModel {
             if transfer.total_bytes > 0 {
                 let mb_done = transfer.bytes_transferred as f64 / (1024.0 * 1024.0);
                 let mb_total = transfer.total_bytes as f64 / (1024.0 * 1024.0);
-                progress.set_text(Some(&format!("{:.1}/{:.1} MB", mb_done, mb_total)));
+                
+                let speed_str = if transfer.speed_bps >= 1024 * 1024 {
+                    format!("{:.1} MB/s", transfer.speed_bps as f64 / (1024.0 * 1024.0))
+                } else if transfer.speed_bps >= 1024 {
+                    format!("{:.1} KB/s", transfer.speed_bps as f64 / 1024.0)
+                } else {
+                    format!("{} B/s", transfer.speed_bps)
+                };
+
+                progress.set_text(Some(&format!("{:.1}/{:.1} MB ({})", mb_done, mb_total, speed_str)));
                 progress.set_show_text(true);
             }
             row.append(&progress);

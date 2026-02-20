@@ -33,7 +33,7 @@ impl ActionType {
             ActionType::Sync => "🔄",
             ActionType::Upload => "📤",
             ActionType::Download => "📥",
-            ActionType::Create => "✨",
+            ActionType::Create => "📄",
             ActionType::Delete => "🗑️",
             ActionType::Conflict => "⚠️",
             ActionType::Error => "❌",
@@ -65,6 +65,8 @@ pub struct ActiveTransfer {
     pub operation: TransferOp,
     pub bytes_transferred: u64,
     pub total_bytes: u64,
+    pub speed_bps: u64,
+    pub last_update: Option<(SystemTime, u64)>,
 }
 
 impl ActiveTransfer {
@@ -212,6 +214,8 @@ impl ActionHistory {
             operation,
             bytes_transferred: 0,
             total_bytes,
+            speed_bps: 0,
+            last_update: Some((SystemTime::now(), 0)),
         };
         if let Ok(mut transfers) = self.active_transfers.write() {
             transfers.insert(id, transfer);
@@ -222,10 +226,48 @@ impl ActionHistory {
 
     /// Actualiza el progreso de un transfer activo
     pub fn update_transfer_progress(&self, id: u64, bytes_transferred: u64) {
-        if let Ok(mut transfers) = self.active_transfers.write() {
+        let changed = if let Ok(mut transfers) = self.active_transfers.write() {
             if let Some(transfer) = transfers.get_mut(&id) {
-                transfer.bytes_transferred = bytes_transferred;
+                // Calcular velocidad si ha pasado suficiente tiempo (ej. 500ms)
+                let now = SystemTime::now();
+                let mut speed_updated = false;
+                
+                if let Some((last_time, last_bytes)) = transfer.last_update {
+                    if let Ok(elapsed) = now.duration_since(last_time) {
+                        if elapsed.as_millis() >= 500 {
+                            let bytes_delta = bytes_transferred.saturating_sub(last_bytes);
+                            let current_speed = (bytes_delta as f64 / elapsed.as_secs_f64()) as u64;
+                            
+                            // Suavizado simple (EMA)
+                            if transfer.speed_bps == 0 {
+                                transfer.speed_bps = current_speed;
+                            } else {
+                                transfer.speed_bps = (transfer.speed_bps as f64 * 0.7 + current_speed as f64 * 0.3) as u64;
+                            }
+                            
+                            transfer.last_update = Some((now, bytes_transferred));
+                            speed_updated = true;
+                        }
+                    }
+                } else {
+                    transfer.last_update = Some((now, bytes_transferred));
+                }
+
+                if transfer.bytes_transferred != bytes_transferred || speed_updated {
+                    transfer.bytes_transferred = bytes_transferred;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
+        } else {
+            false
+        };
+
+        if changed {
+            self.notify_change();
         }
     }
 
@@ -250,9 +292,17 @@ impl ActionHistory {
 
     /// Establece el progreso de sincronización (cambios detectados y aplicados)
     pub fn set_sync_progress(&self, detected: usize, applied: usize) {
-        if let Ok(mut progress) = self.sync_progress.write() {
+        let changed = if let Ok(mut progress) = self.sync_progress.write() {
+            let changed = progress.changes_detected != detected || progress.changes_applied != applied;
             progress.changes_detected = detected;
             progress.changes_applied = applied;
+            changed
+        } else {
+            false
+        };
+
+        if changed {
+            self.notify_change();
         }
     }
 
@@ -261,13 +311,22 @@ impl ActionHistory {
         if let Ok(mut progress) = self.sync_progress.write() {
             progress.changes_applied += 1;
         }
+        self.notify_change();
     }
 
     /// Marca todo como sincronizado (resetea contadores)
     pub fn mark_all_synced(&self) {
-        if let Ok(mut progress) = self.sync_progress.write() {
+        let changed = if let Ok(mut progress) = self.sync_progress.write() {
+            let changed = progress.changes_detected != 0 || progress.changes_applied != 0;
             progress.changes_detected = 0;
             progress.changes_applied = 0;
+            changed
+        } else {
+            false
+        };
+
+        if changed {
+            self.notify_change();
         }
     }
 

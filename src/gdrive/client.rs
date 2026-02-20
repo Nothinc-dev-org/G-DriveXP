@@ -2,7 +2,47 @@ use anyhow::{Context, Result};
 use google_drive3::DriveHub;
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
+use std::io::{Read, Seek, SeekFrom};
 use yup_oauth2::authenticator::Authenticator;
+
+/// Tipo para callback de progreso de upload
+pub type ProgressCallback = Box<dyn Fn(u64) + Send>;
+
+/// Reader que envuelve otro Read y reporta progreso via callback
+struct ProgressReader<R: Read + Seek> {
+    inner: R,
+    bytes_read: u64,
+    callback: ProgressCallback,
+}
+
+impl<R: Read + Seek> ProgressReader<R> {
+    fn new(inner: R, callback: ProgressCallback) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+            callback,
+        }
+    }
+}
+
+impl<R: Read + Seek> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.bytes_read += n as u64;
+            (self.callback)(self.bytes_read);
+        }
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for ProgressReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let result = self.inner.seek(pos)?;
+        self.bytes_read = result;
+        Ok(result)
+    }
+}
 
 /// Cliente Wrapper para Google Drive API
 pub struct DriveClient {
@@ -294,6 +334,7 @@ impl DriveClient {
         name: &str,
         mime_type: Option<&str>,
         parent_id: &str,
+        progress_cb: Option<ProgressCallback>,
     ) -> Result<String> {
         tracing::info!("📤 Subiendo archivo: {}", name);
 
@@ -305,7 +346,7 @@ impl DriveClient {
         let mut file_metadata = google_drive3::api::File::default();
         file_metadata.name = Some(name.to_string());
         file_metadata.mime_type = Some(mime_type.unwrap_or("application/octet-stream").to_string());
-        
+
         if parent_id != "root" {
             file_metadata.parents = Some(vec![parent_id.to_string()]);
         }
@@ -318,26 +359,34 @@ impl DriveClient {
         // - Archivos grandes: Resumable upload
         let result = if content_len < 5 * 1024 * 1024 {
             tracing::debug!("Usando upload simple para archivo de {} bytes", content_len);
-            self.hub
-                .files()
-                .create(file_metadata)
-                .upload(
-                    std::io::Cursor::new(content),
-                    mime,
-                )
-                .await
-                .context("Error en upload simple")?
+            match progress_cb {
+                Some(cb) => {
+                    let reader = ProgressReader::new(std::io::Cursor::new(content), cb);
+                    self.hub.files().create(file_metadata)
+                        .upload(reader, mime).await
+                        .context("Error en upload simple")?
+                }
+                None => {
+                    self.hub.files().create(file_metadata)
+                        .upload(std::io::Cursor::new(content), mime).await
+                        .context("Error en upload simple")?
+                }
+            }
         } else {
             tracing::debug!("Usando upload resumable para archivo de {} bytes", content_len);
-            self.hub
-                .files()
-                .create(file_metadata)
-                .upload_resumable(
-                    std::io::Cursor::new(content),
-                    mime,
-                )
-                .await
-                .context("Error en upload resumable")?
+            match progress_cb {
+                Some(cb) => {
+                    let reader = ProgressReader::new(std::io::Cursor::new(content), cb);
+                    self.hub.files().create(file_metadata)
+                        .upload_resumable(reader, mime).await
+                        .context("Error en upload resumable")?
+                }
+                None => {
+                    self.hub.files().create(file_metadata)
+                        .upload_resumable(std::io::Cursor::new(content), mime).await
+                        .context("Error en upload resumable")?
+                }
+            }
         };
 
         let file_id = result.1.id.ok_or_else(|| anyhow::anyhow!("No se recibió file_id en respuesta"))?;
@@ -385,6 +434,7 @@ impl DriveClient {
         &self,
         file_id: &str,
         file_path: &std::path::Path,
+        progress_cb: Option<ProgressCallback>,
     ) -> Result<()> {
         tracing::info!("📝 Actualizando contenido de archivo: {}", file_id);
 
@@ -400,26 +450,34 @@ impl DriveClient {
         // Estrategia adaptativa para updates
         if content_len < 5 * 1024 * 1024 {
             tracing::debug!("Usando update simple para archivo de {} bytes", content_len);
-            self.hub
-                .files()
-                .update(file_metadata, file_id)
-                .upload(
-                    std::io::Cursor::new(content),
-                    mime,
-                )
-                .await
-                .context("Error en update simple")?;
+            match progress_cb {
+                Some(cb) => {
+                    let reader = ProgressReader::new(std::io::Cursor::new(content), cb);
+                    self.hub.files().update(file_metadata, file_id)
+                        .upload(reader, mime).await
+                        .context("Error en update simple")?;
+                }
+                None => {
+                    self.hub.files().update(file_metadata, file_id)
+                        .upload(std::io::Cursor::new(content), mime).await
+                        .context("Error en update simple")?;
+                }
+            }
         } else {
             tracing::debug!("Usando update resumable para archivo de {} bytes", content_len);
-            self.hub
-                .files()
-                .update(file_metadata, file_id)
-                .upload_resumable(
-                    std::io::Cursor::new(content),
-                    mime,
-                )
-                .await
-                .context("Error en update resumable")?;
+            match progress_cb {
+                Some(cb) => {
+                    let reader = ProgressReader::new(std::io::Cursor::new(content), cb);
+                    self.hub.files().update(file_metadata, file_id)
+                        .upload_resumable(reader, mime).await
+                        .context("Error en update resumable")?;
+                }
+                None => {
+                    self.hub.files().update(file_metadata, file_id)
+                        .upload_resumable(std::io::Cursor::new(content), mime).await
+                        .context("Error en update resumable")?;
+                }
+            }
         }
 
         tracing::info!("✅ Archivo actualizado: {}", file_id);

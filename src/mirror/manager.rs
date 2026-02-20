@@ -250,6 +250,26 @@ impl MirrorManager {
         // 3. Database is source of truth - No FUSE access to avoid deadlock
 
         // If inode exists in DB with valid gdrive_id, file WILL exist in FUSE when accessed
+        // If inode exists in DB with valid gdrive_id, file WILL exist in FUSE when accessed
+        if let Ok(Some(inode)) = ctx.db.resolve_relative_path_to_inode(relative.to_str().unwrap_or("")).await {
+            // Verificar si el archivo es puramente local (aún no subido)
+            let gdrive_id: Option<String> = sqlx::query_scalar("SELECT gdrive_id FROM inodes WHERE inode = ?")
+                .bind(inode as i64)
+                .fetch_optional(ctx.db.pool())
+                .await
+                .unwrap_or(None);
+
+            if let Some(id) = gdrive_id {
+                if id.starts_with("temp_") {
+                    let file_name = path.file_name()
+                        .map(|f| f.to_string_lossy())
+                        .unwrap_or_else(|| "unknown".into());
+                    warn!("Intento bloqueado de liberar espacio de archivo local no sincronizado: {}", path_str);
+                    ctx.history.log(ActionType::Error, format!("No se puede liberar: {} (Pendiente a subir)", file_name));
+                    return;
+                }
+            }
+        }
 
         // 4. Validar tipo de archivo de forma ASYNC y SIN seguir symlinks (evitar FUSE deadlock)
         tracing::debug!("🪞 Verificando tipo de archivo para: {:?}", path);
@@ -881,7 +901,7 @@ impl MirrorManager {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| relative_path.to_string());
         if is_new {
-            self.ctx.history.log(ActionType::Create, format!("Creado: {}", name_display));
+            self.ctx.history.log(ActionType::Create, format!("Local Creado: {}", name_display));
         } else {
             self.ctx.history.log(ActionType::Upload, format!("Modificado: {}", name_display));
         }
