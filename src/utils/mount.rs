@@ -85,18 +85,57 @@ pub fn unmount<P: AsRef<Path>>(path: P) -> Result<()> {
     Ok(())
 }
 
+/// Desmonta FUSE y espera a que el kernel confirme que ya no está montado.
+/// Reintenta con estrategias cada vez más agresivas si el mount persiste.
+pub fn unmount_and_wait<P: AsRef<Path>>(path: P) -> Result<()> {
+    let path_ref = path.as_ref();
+
+    if !is_mounted(path_ref) {
+        return Ok(());
+    }
+
+    tracing::info!("🛑 Desmontando FUSE y esperando confirmación del kernel...");
+    unmount(path_ref)?;
+
+    // Polling: verificar que el mount realmente se fue
+    let start = std::time::Instant::now();
+    let max_wait = std::time::Duration::from_secs(10);
+
+    while is_mounted(path_ref) {
+        if start.elapsed() > max_wait {
+            tracing::error!(
+                "⚠️ FUSE sigue montado después de {}s. Forzando salida de todas formas.",
+                max_wait.as_secs()
+            );
+            break;
+        }
+
+        // Esperar brevemente antes de re-verificar
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Si ya pasaron 2 segundos y sigue montado, reintentar unmount
+        if start.elapsed() > std::time::Duration::from_secs(2) && is_mounted(path_ref) {
+            tracing::warn!("FUSE persiste, reintentando desmontaje...");
+            let _ = unmount(path_ref);
+        }
+    }
+
+    if !is_mounted(path_ref) {
+        tracing::info!("✅ FUSE desmontado correctamente en {:?}", start.elapsed());
+    }
+
+    Ok(())
+}
+
 /// Limpia un punto de montaje potencialmente "huérfano"
 /// Se asegura de que el directorio esté limpio antes de intentar un nuevo montaje
 pub fn cleanup_if_needed<P: AsRef<Path>>(path: P) -> Result<()> {
     let path_ref = path.as_ref();
-    
+
     if is_mounted(path_ref) {
         tracing::warn!("Detectado montaje previo en {:?}, aplicando purga...", path_ref);
-        unmount(path_ref)?;
-        
-        // Pequeña espera para permitir que el kernel limpie el inodo
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        unmount_and_wait(path_ref)?;
     }
-    
+
     Ok(())
 }

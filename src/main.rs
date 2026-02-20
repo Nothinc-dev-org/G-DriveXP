@@ -108,7 +108,12 @@ pub fn run_backend(
             .context("Error crítico obteniendo Root ID de Google Drive")?;
         
         // Inicializar sistema de archivos
-        let fs = GDriveFS::new(db.clone(), drive_client.clone(), &config.cache_dir);
+        let fs = GDriveFS::new(
+            db.clone(),
+            drive_client.clone(),
+            &config.cache_dir,
+            Arc::new(history.clone()),
+        );
         
         // Fase 2.1: Bootstrapping (Sincronización de metadatos)
         if db.is_empty().await? {
@@ -189,7 +194,8 @@ pub fn run_backend(
             .fs_name("fedoradrive")
             .allow_other(true)
             .custom_options("default_permissions") // Apply permissions locally
-            .custom_options("exec"); // CRÍTICO: Permitir ejecución de binarios y .desktop
+            .custom_options("exec") // CRÍTICO: Permitir ejecución de binarios y .desktop
+            .custom_options("max_read=1048576"); // Rendimiento: Kernel debe solicitar hasta 1MB por read()
             
         tracing::info!("Montando sistema de archivos en {:?}...", config.fuse_mount_path);
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus(format!("Montando en {:?}...", config.mirror_path)));
@@ -247,7 +253,7 @@ pub fn run_backend(
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Desmontando...".to_string()));
         
         // El drop de 'handle' debería intentar desmontar, pero lo forzamos por seguridad
-        let _ = utils::mount::unmount(&config.fuse_mount_path);
+        let _ = utils::mount::unmount_and_wait(&config.fuse_mount_path);
         
         // Forzar salida del proceso (GTK no responde a señales del backend)
         tracing::info!("👋 Cerrando aplicación...");

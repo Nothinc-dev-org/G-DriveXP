@@ -4,7 +4,7 @@ use libadwaita as adw;
 use adw::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use super::history::{ActionHistory, ActionType, ActionEntry, ActiveTransfer};
+use super::history::{ActionHistory, ActionType, ActionEntry, ActiveTransfer, TransferOp};
 use super::tray::TrayIcon;
 
 pub struct AppModel {
@@ -25,7 +25,8 @@ pub struct AppModel {
     // Directorios de sincronización
     pub local_sync_dirs: Vec<crate::db::repository::LocalSyncDir>,
     // Referencias a widgets dinámicos
-    pub transfers_listbox: Option<gtk::ListBox>,
+    pub uploads_listbox: Option<gtk::ListBox>,
+    pub downloads_listbox: Option<gtk::ListBox>,
     pub history_listbox: Option<gtk::ListBox>,
     pub sync_dirs_listbox: Option<gtk::ListBox>,
     // Navegación
@@ -57,7 +58,7 @@ impl AppModel {
     }
 
     /// Reconstruye el contenido del listbox de transfers activos
-    fn rebuild_transfers_box(transfers_box: &gtk::ListBox, transfers: &[ActiveTransfer]) {
+    fn rebuild_transfers_box(transfers_box: &gtk::ListBox, transfers: &[&ActiveTransfer]) {
         // Limpiar
         while let Some(child) = transfers_box.first_child() {
             transfers_box.remove(&child);
@@ -530,13 +531,40 @@ impl Component for AppModel {
                             },
                         },
 
-                        // Transfers activos (barras de progreso)
-                        #[name = "transfers_box"]
+                        // Label "Descargando de Google Drive"
+                        append = &gtk::Label {
+                            set_label: "Descargando de Google Drive",
+                            set_halign: gtk::Align::Start,
+                            set_css_classes: &["heading"],
+                            #[watch]
+                            set_visible: model.active_transfers.iter().any(|t| t.operation == TransferOp::Download),
+                        },
+
+                        // Descargas activas
+                        #[name = "downloads_box"]
                         append = &gtk::ListBox {
                             set_css_classes: &["boxed-list"],
                             set_selection_mode: gtk::SelectionMode::None,
                             #[watch]
-                            set_visible: !model.active_transfers.is_empty(),
+                            set_visible: model.active_transfers.iter().any(|t| t.operation == TransferOp::Download),
+                        },
+
+                        // Label "Subiendo a Google Drive"
+                        append = &gtk::Label {
+                            set_label: "Subiendo a Google Drive",
+                            set_halign: gtk::Align::Start,
+                            set_css_classes: &["heading"],
+                            #[watch]
+                            set_visible: model.active_transfers.iter().any(|t| t.operation == TransferOp::Upload),
+                        },
+
+                        // Cargas activas
+                        #[name = "uploads_box"]
+                        append = &gtk::ListBox {
+                            set_css_classes: &["boxed-list"],
+                            set_selection_mode: gtk::SelectionMode::None,
+                            #[watch]
+                            set_visible: model.active_transfers.iter().any(|t| t.operation == TransferOp::Upload),
                         },
 
                         // Label "Historial"
@@ -595,7 +623,8 @@ impl Component for AppModel {
             sync_applied: 0,
             pending_uploads: 0,
             local_sync_dirs: Vec::new(),
-            transfers_listbox: None,
+            uploads_listbox: None,
+            downloads_listbox: None,
             history_listbox: None,
             sync_dirs_listbox: None,
             current_view: ViewMode::Main,
@@ -646,7 +675,8 @@ impl Component for AppModel {
         let widgets = view_output!();
 
         // Guardar referencias a widgets dinámicos en el model
-        model.transfers_listbox = Some(widgets.transfers_box.clone());
+        model.uploads_listbox = Some(widgets.uploads_box.clone());
+        model.downloads_listbox = Some(widgets.downloads_box.clone());
         model.history_listbox = Some(widgets.history_listbox.clone());
         model.sync_dirs_listbox = Some(widgets.sync_dirs_box.clone());
 
@@ -740,9 +770,9 @@ impl Component for AppModel {
             AppMsg::Quit => {
                 tracing::info!("Cerrando aplicación...");
 
-                // Intentar desmontar si tenemos el mount point
+                // Desmontar FUSE y esperar confirmación del kernel
                 if let Some(ref path) = self.fuse_mount_path {
-                    if let Err(e) = crate::utils::mount::unmount(path) {
+                    if let Err(e) = crate::utils::mount::unmount_and_wait(path) {
                         tracing::error!("Error al desmontar en cierre: {:?}", e);
                     }
                 }
@@ -861,8 +891,15 @@ impl Component for AppModel {
                 self.pending_uploads = progress.pending_uploads;
 
                 // Rebuild imperativo de los listbox dinámicos
-                if let Some(ref transfers_box) = self.transfers_listbox {
-                    Self::rebuild_transfers_box(transfers_box, &self.active_transfers);
+                if let Some(ref uploads_box) = self.uploads_listbox {
+                    let uploads: Vec<&ActiveTransfer> = self.active_transfers.iter()
+                        .filter(|t| t.operation == TransferOp::Upload).collect();
+                    Self::rebuild_transfers_box(uploads_box, &uploads);
+                }
+                if let Some(ref downloads_box) = self.downloads_listbox {
+                    let downloads: Vec<&ActiveTransfer> = self.active_transfers.iter()
+                        .filter(|t| t.operation == TransferOp::Download).collect();
+                    Self::rebuild_transfers_box(downloads_box, &downloads);
                 }
                 if let Some(ref history_box) = self.history_listbox {
                     Self::rebuild_history_listbox(history_box, &self.activity_entries);

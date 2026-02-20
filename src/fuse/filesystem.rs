@@ -1,4 +1,3 @@
-
 use fuse3::raw::prelude::*;
 use fuse3::{Errno, Result};
 use std::ffi::OsStr;
@@ -7,10 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error};
 use futures_util::stream::{self, BoxStream, StreamExt};
+use std::collections::HashMap;
+use dashmap::DashMap;
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
 use crate::fuse::shortcuts;
+use crate::gui::history::{ActionHistory, TransferOp};
 
 
 /// Implementación del sistema de archivos FUSE para Google Drive
@@ -18,14 +20,25 @@ pub struct GDriveFS {
     db: Arc<MetadataRepository>,
     drive_client: Arc<DriveClient>,
     cache_dir: std::path::PathBuf,
+    history: Arc<ActionHistory>,
+    fuse_downloads: Arc<tokio::sync::Mutex<HashMap<u64, u64>>>,
+    file_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl GDriveFS {
-    pub fn new(db: Arc<MetadataRepository>, drive_client: Arc<DriveClient>, cache_dir: impl AsRef<std::path::Path>) -> Self {
-        Self { 
-            db, 
+    pub fn new(
+        db: Arc<MetadataRepository>,
+        drive_client: Arc<DriveClient>,
+        cache_dir: impl AsRef<std::path::Path>,
+        history: Arc<ActionHistory>,
+    ) -> Self {
+        Self {
+            db,
             drive_client,
             cache_dir: cache_dir.as_ref().to_path_buf(),
+            history,
+            fuse_downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            file_locks: Arc::new(DashMap::new()),
         }
     }
 }
@@ -334,39 +347,37 @@ impl Filesystem for GDriveFS {
         }
 
         // SMART PREFETCH:
-        // Si es un archivo multimedia, iniciar descarga de cabeceras en background
-        // para mejorar la respuesta de reproductores que leen metadatos al abrir.
-        if let Some(ref mime) = attrs.mime_type {
-            if Self::is_multimedia_file(mime) {
-                // Obtener gdrive_id
-                let gdrive_id = self.get_gdrive_id(inode).await
-                    .unwrap_or_default();
-                    
-                if !gdrive_id.is_empty() {
-                    let db = self.db.clone();
-                    let drive_client = self.drive_client.clone();
-                    let cache_path = self.get_cache_path(&gdrive_id);
-                    let file_size = attrs.size as u64;
-                    let inode = inode;
-                    
-                    // Fire-and-forget task
-                    tokio::spawn(async move {
-                         let _ = Self::prefetch_headers_and_tail(
-                             &db, 
-                             &drive_client, 
-                             inode, 
-                             &gdrive_id, 
-                             &cache_path, 
-                             file_size
-                         ).await;
-                    });
-                    
-                    if is_audio {
-                        tracing::warn!("🚀 Smart prefetch triggers for AUDIO inode={}", inode);
-                    } else {
-                         tracing::info!("🚀 Smart prefetch triggers for inode={}", inode);
-                    }
-                }
+        // Iniciar descarga continua en background para TODOS los archivos (excepto Documentos de Google Workspace).
+        // Esto permite que las peticiones 'read' del kernel de Linux se sirvan desde la caché local sin latencia.
+        let is_workspace = attrs.mime_type.as_deref().map(shortcuts::is_workspace_file).unwrap_or(false);
+
+        if attrs.size > 0 && !is_workspace {
+            // Obtener gdrive_id
+            let gdrive_id = self.get_gdrive_id(inode).await.unwrap_or_default();
+                
+            if !gdrive_id.is_empty() {
+                let db = self.db.clone();
+                let drive_client = self.drive_client.clone();
+                let cache_path = self.get_cache_path(&gdrive_id);
+                let file_size = attrs.size as u64;
+                let inode = inode;
+
+                let file_locks = self.file_locks.clone();
+
+                // Fire-and-forget task: Streaming de fondo
+                tokio::spawn(async move {
+                     let _ = Self::start_background_download_stream(
+                         db,
+                         drive_client,
+                         inode,
+                         gdrive_id,
+                         cache_path,
+                         file_size,
+                         file_locks,
+                     ).await;
+                });
+                
+                tracing::info!("🚀 Background streamer triggered for inode={} size={}", inode, file_size);
             }
         }
         
@@ -377,13 +388,20 @@ impl Filesystem for GDriveFS {
     async fn release(
         &self,
         _req: Request,
-        _inode: u64,
+        inode: u64,
         _fh: u64,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
     ) -> Result<()> {
-        tracing::trace!("release");
+        tracing::trace!("release: inode={}", inode);
+        
+        let mut fuse_downloads = self.fuse_downloads.lock().await;
+        if let Some(t_id) = fuse_downloads.remove(&inode) {
+            self.history.complete_transfer(t_id);
+            tracing::debug!("✅ Transfer FUSE completado y removido de la interfaz: inode={}", inode);
+        }
+
         Ok(())
     }
 
@@ -479,9 +497,10 @@ impl Filesystem for GDriveFS {
 
         // 3. Archivo binario normal: estrategia de caché bajo demanda
         let cache_path = self.get_cache_path(&gdrive_id);
+        let is_workspace = mime_type.as_deref().map(shortcuts::is_workspace_file).unwrap_or(false);
         
-        // 3a. Asegurar que el rango solicitado esté disponible
-        if file_size > 0 {
+        // 3a. Asegurar que el rango solicitado esté disponible (Solo si no es Workspace Docs)
+        if file_size > 0 && !is_workspace {
             // Descargar solo lo necesario
             if let Err(e) = self.ensure_range_cached(inode, &gdrive_id, offset, size, file_size as u64).await {
                 error!("Error descargando chunk para inode {}: {}", inode, e);
@@ -1188,14 +1207,13 @@ impl GDriveFS {
 
         // Solo si el archivo no está completo, consultar la DB para rangos faltantes
         let missing_ranges = self.db.get_missing_ranges(inode, requested_start, requested_end).await?;
-        
+
 
         if missing_ranges.is_empty() {
             tracing::debug!("✅ Rango ya cacheado: inode={} offset={} size={}", inode, offset, size);
             return Ok(());
         }
 
-        
         // Crear directorio de caché si no existe
         if let Some(parent) = cache_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -1211,13 +1229,43 @@ impl GDriveFS {
         }
 
         // OPTIMIZACIÓN: Descargar todos los rangos EN PARALELO
-        tracing::info!("📥 Descargando {} chunks faltantes en paralelo para inode {}", 
+        tracing::info!("📥 Descargando {} chunks faltantes en paralelo para inode {}",
                        missing_ranges.len(), inode);
+
+        // --- FUSE DOWNLOAD PROGRESS TRACKING ---
+        let transfer_id;
+        let mut fuse_downloads = self.fuse_downloads.lock().await;
+
+        if let Some(existing_t_id) = fuse_downloads.get(&inode) {
+            // Ya hay un transfer en curso
+            transfer_id = Some(*existing_t_id);
+        } else {
+            // Registrar nuevo transfer de FUSE Download
+            let file_name = self.get_file_name(inode).await.unwrap_or_else(|_| format!("file_{}", inode));
+            
+            let t_id = self.history.start_transfer(
+                &file_name,
+                TransferOp::Download,
+                file_size
+            );
+            fuse_downloads.insert(inode, t_id);
+            transfer_id = Some(t_id);
+        }
+
+        // Actualizar el progreso inicial
+        if let Some(t_id) = transfer_id {
+            if let Ok(cached_bytes) = self.db.get_cached_bytes_count(inode).await {
+                self.history.update_transfer_progress(t_id, cached_bytes);
+            }
+        }
+        
+        drop(fuse_downloads); // Liberar lock antes del stream
 
         let drive_client = self.drive_client.clone();
         let db = self.db.clone();
         let gdrive_id_owned = gdrive_id.to_string();
         let cache_path_owned = cache_path.clone();
+        let history = self.history.clone();
 
         // Spawn tasks para descargar cada rango en paralelo
         let download_tasks: Vec<_> = missing_ranges.into_iter().map(|(start, end)| {
@@ -1225,6 +1273,9 @@ impl GDriveFS {
             let db = db.clone();
             let gdrive_id = gdrive_id_owned.clone();
             let cache_path = cache_path_owned.clone();
+            let history = history.clone();
+
+            let file_locks_clone = self.file_locks.clone();
 
             tokio::spawn(async move {
                 let chunk_size = (end - start + 1) as u32;
@@ -1235,6 +1286,14 @@ impl GDriveFS {
                 // Descargar chunk
                 let data = drive_client.download_chunk(&gdrive_id, start, chunk_size).await?;
                 
+                // OBTENER LOCK ANTES DE MUTAR EL ARCHIVO CONJUNTO
+                let inode_lock = file_locks_clone
+                    .entry(inode)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone();
+                    
+                let _guard = inode_lock.lock().await;
+
                 // Escribir en el archivo de caché en la posición correcta (con lock)
                 let mut file = tokio::fs::OpenOptions::new()
                     .write(true)
@@ -1247,9 +1306,15 @@ impl GDriveFS {
                 
                 // Registrar el chunk descargado en la DB
                 db.add_cached_chunk(inode, start, end).await?;
-                
+
+                // Actualizar progreso visible en GUI
+                if let Some(t_id) = transfer_id {
+                    let cached_bytes = db.get_cached_bytes_count(inode).await.unwrap_or(0);
+                    history.update_transfer_progress(t_id, cached_bytes);
+                }
+
                 tracing::debug!("✅ Chunk cacheado: {}-{}", start, end);
-                
+
                 Ok::<_, anyhow::Error>((start, end))
             })
         }).collect();
@@ -1270,12 +1335,7 @@ impl GDriveFS {
         Ok(())
     }
 
-    /// Detecta si un archivo es multimedia por MIME type
-    fn is_multimedia_file(mime_type: &str) -> bool {
-        mime_type.starts_with("audio/") || 
-        mime_type.starts_with("video/") ||
-        mime_type.starts_with("image/")
-    }
+
 
     /// Pre-descarga un archivo completo en background (para archivos pequeños)
     #[allow(dead_code)]
@@ -1378,76 +1438,118 @@ impl GDriveFS {
         Ok(())
     }
 
-    /// Pre-descarga cabeceras (primeros 1MB) + cola (últimos 256KB) para archivos grandes
-    async fn prefetch_headers_and_tail(
-        db: &Arc<MetadataRepository>,
-        drive_client: &Arc<DriveClient>,
+    /// Descarga continua y agresiva de un archivo en background (Para maximizar el ancho de banda)
+    async fn start_background_download_stream(
+        db: Arc<MetadataRepository>,
+        drive_client: Arc<DriveClient>,
         inode: u64,
-        gdrive_id: &str,
-        cache_path: &std::path::Path,
+        gdrive_id: String,
+        cache_path: std::path::PathBuf,
         file_size: u64,
+        file_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     ) -> anyhow::Result<()> {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-        
-        const HEADER_SIZE: u64 = 1024 * 1024; // 1MB
-        const TAIL_SIZE: u64 = 256 * 1024;    // 256KB
-        
+
         // Crear directorio de caché si no existe
         if let Some(parent) = cache_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        
-        // Asegurar que el archivo existe (usando OpenOptions para NO truncar si ganó la carrera otro hilo)
+
+        // Asegurar que el archivo existe
         if !cache_path.exists() {
              let _ = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
-                .open(cache_path)
+                .open(&cache_path)
                 .await;
         }
+
+        // Obtener nombre del archivo para el transfer
+        let file_name = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM dentry WHERE child_inode = ? LIMIT 1"
+        )
+        .bind(inode as i64)
+        .fetch_optional(db.pool())
+        .await?
+        .unwrap_or_else(|| format!("file_{}", inode));
+
+        // Para FUSE progresivo, el transfer_id podría colisionar o compartir con ensure_range_cached.
+        // Haremos que el transfer explícito sea gestionado allí, pero aquí lo actualizamos
+        tracing::info!("🚀 Iniciando streaming en background para archivo grande: {} ({} bytes)", file_name, file_size);
+
+        // Bloques grandes para maximizar la velocidad (2MB)
+        const CHUNK_SIZE: u64 = 2 * 1024 * 1024; 
+        const MAX_CONCURRENT: usize = 4; // 4 descargas en paralelo = 8MB/s por archivo max
         
-        // Descargar cabeceras (primeros 1MB)
-        let header_end = HEADER_SIZE.min(file_size - 1);
-        let missing_header = db.get_missing_ranges(inode, 0, header_end).await?;
-        
-        if !missing_header.is_empty() {
-            tracing::info!("📥 Prefetching cabeceras: 0-{}", header_end);
-            let header_data = drive_client.download_chunk(gdrive_id, 0, (header_end + 1) as u32).await?;
-            
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(cache_path)
-                .await?;
-            file.seek(std::io::SeekFrom::Start(0)).await?;
-            file.write_all(&header_data).await?;
-            file.flush().await?;
-            
-            db.add_cached_chunk(inode, 0, header_end).await?;
+        // Calcular rangos que debemos iterar
+        let mut chunks: Vec<(u64, u64)> = Vec::new();
+        let mut offset = 0u64;
+        while offset < file_size {
+            let end = (offset + CHUNK_SIZE - 1).min(file_size - 1);
+            chunks.push((offset, end));
+            offset = end + 1;
         }
         
-        // Descargar cola (últimos 256KB)
-        if file_size > TAIL_SIZE {
-            let tail_start = file_size - TAIL_SIZE;
-            let tail_end = file_size - 1;
-            let missing_tail = db.get_missing_ranges(inode, tail_start, tail_end).await?;
+        // Descargar iterativamente en lotes de MAX_CONCURRENT
+        for batch in chunks.chunks(MAX_CONCURRENT) {
+            let mut download_tasks = Vec::new();
+
+            for &(start, end) in batch {
+                let db_clone = db.clone();
+                let client_clone = drive_client.clone();
+                let gdrive_id_clone = gdrive_id.clone();
+                let cache_path_clone = cache_path.clone();
+
+                // Revisar rápidamente si ESTE chunk específico ya está cacheado
+                let missing = db_clone.get_missing_ranges(inode, start, end).await.unwrap_or_default();
+                if missing.is_empty() {
+                    continue; // Chunk ya existe, pasamos al siguiente
+                }
+
+                let file_locks_clone = file_locks.clone();
+                
+                let task = tokio::spawn(async move {
+                    for (m_start, m_end) in missing {
+                        let m_size = (m_end - m_start + 1) as u32;
+                        tracing::debug!("📥 Streamer Background descargando: {}-{}", m_start, m_end);
+                        
+                        let data = client_clone.download_chunk(&gdrive_id_clone, m_start, m_size).await?;
+                        
+                        // OBTENER LOCK ANTES DE MUTAR EL ARCHIVO CONJUNTO
+                        let inode_lock = file_locks_clone
+                            .entry(inode)
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone();
+                            
+                        let _guard = inode_lock.lock().await;
+
+                        let mut file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&cache_path_clone)
+                            .await?;
+                        file.seek(std::io::SeekFrom::Start(m_start)).await?;
+                        file.write_all(&data).await?;
+                        file.flush().await?;
+                        
+                        db_clone.add_cached_chunk(inode, m_start, m_end).await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                });
+                
+                download_tasks.push(task);
+            }
             
-            if !missing_tail.is_empty() {
-                tracing::info!("📥 Prefetching cola: {}-{}", tail_start, tail_end);
-                let tail_data = drive_client.download_chunk(gdrive_id, tail_start, TAIL_SIZE as u32).await?;
-                
-                let mut file = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(cache_path)
-                    .await?;
-                file.seek(std::io::SeekFrom::Start(tail_start)).await?;
-                file.write_all(&tail_data).await?;
-                file.flush().await?;
-                
-                db.add_cached_chunk(inode, tail_start, tail_end).await?;
+            // Esperar a que el lote complete
+            for result in futures_util::future::join_all(download_tasks).await {
+                match result {
+                    Ok(Ok(_)) => {},
+                    Ok(Err(e)) => tracing::error!("❌ Error en Background Streamer: {}", e),
+                    Err(e) => tracing::error!("❌ Panic en Background Streamer: {}", e),
+                }
             }
         }
         
-        tracing::info!("✅ Prefetch cabeceras+cola completado");
+        tracing::info!("✅ Streaming background completado: {}", file_name);
         Ok(())
     }
 }

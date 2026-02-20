@@ -197,6 +197,11 @@ impl Tray for GDriveXPTray {
             label: "Salir".to_string(),
             activate: Box::new(|_| {
                 tracing::info!("👋 Cerrando aplicación desde bandeja...");
+                // Desmontar FUSE antes de salir para evitar zombie del kernel
+                let fuse_path = dirs::home_dir()
+                    .map(|h| h.join("GoogleDrive/FUSE_Mount"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/GoogleDrive/FUSE_Mount"));
+                let _ = crate::utils::mount::unmount_and_wait(&fuse_path);
                 std::process::exit(0);
             }),
             ..Default::default()

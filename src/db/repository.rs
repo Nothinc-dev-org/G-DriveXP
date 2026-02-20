@@ -999,6 +999,18 @@ impl MetadataRepository {
         Ok(max_offset.unwrap_or(0) as u64)
     }
 
+    /// Obtiene el total de bytes cacheados sumando todos los chunks
+    pub async fn get_cached_bytes_count(&self, inode: u64) -> Result<u64> {
+        let total: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(end_offset - start_offset + 1) FROM file_cache_chunks WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        Ok(total.unwrap_or(0) as u64)
+    }
+
     /// Obtiene los rangos faltantes para un archivo en un intervalo dado
     /// Retorna una lista de (start, end) que necesitan descargarse
     pub async fn get_missing_ranges(&self, inode: u64, requested_start: u64, requested_end: u64) -> Result<Vec<(u64, u64)>> {
