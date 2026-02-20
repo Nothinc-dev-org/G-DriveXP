@@ -49,7 +49,7 @@ impl AppModel {
                 "Sincronizando...".to_string()
             }
         } else {
-            "Todo Sincronizado".to_string()
+            "Sin Novedad, mi general".to_string()
         }
     }
 
@@ -537,6 +537,18 @@ impl Component for AppModel {
             sender_timer.input(AppMsg::RefreshActivity);
             gtk::glib::ControlFlow::Continue
         });
+
+        // Atajo de teclado: Ctrl+Q para cerrar
+        let sender_quit = sender.clone();
+        let controller = gtk::ShortcutController::new();
+        let trigger = gtk::ShortcutTrigger::parse_string("<Control>q");
+        let action = gtk::CallbackAction::new(move |_, _| {
+            sender_quit.input(AppMsg::Quit);
+            gtk::glib::Propagation::Stop
+        });
+        let shortcut = gtk::Shortcut::new(trigger, Some(action));
+        controller.add_shortcut(shortcut);
+        root.add_controller(controller);
 
         // Spawnear el backend en un hilo separado
         let sender_clone = sender.clone();
