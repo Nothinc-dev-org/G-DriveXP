@@ -297,14 +297,14 @@ impl Component for AppModel {
                                         add_prefix = &gtk::Image {
                                             #[watch]
                                             set_icon_name: Some(
-                                                if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied {
+                                                if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                                     "emblem-synchronizing-symbolic"
                                                 } else {
                                                     "emblem-ok-symbolic"
                                                 }
                                             ),
                                             #[watch]
-                                            set_css_classes: if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied {
+                                            set_css_classes: if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                                 &["accent"]
                                             } else {
                                                 &["success"]
@@ -419,6 +419,35 @@ impl Component for AppModel {
                         set_orientation: gtk::Orientation::Vertical,
                         set_spacing: 16,
                         set_margin_all: 16,
+
+                        // Tarjeta de estado global
+                        append = &gtk::ListBox {
+                            set_css_classes: &["boxed-list"],
+                            set_selection_mode: gtk::SelectionMode::None,
+
+                            append = &adw::ActionRow {
+                                #[watch]
+                                set_title: &model.sync_hint_text(),
+                                set_subtitle: "Estado General",
+
+                                add_prefix = &gtk::Image {
+                                    #[watch]
+                                    set_icon_name: Some(
+                                        if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                            "emblem-synchronizing-symbolic"
+                                        } else {
+                                            "emblem-ok-symbolic"
+                                        }
+                                    ),
+                                    #[watch]
+                                    set_css_classes: if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                        &["accent"]
+                                    } else {
+                                        &["success"]
+                                    },
+                                },
+                            },
+                        },
 
                         // Transfers activos (barras de progreso)
                         #[name = "transfers_box"]
