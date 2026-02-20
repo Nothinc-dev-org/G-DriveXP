@@ -22,9 +22,12 @@ pub struct AppModel {
     pub sync_detected: usize,
     pub sync_applied: usize,
     pub pending_uploads: usize,
+    // Directorios de sincronización
+    pub local_sync_dirs: Vec<crate::db::repository::LocalSyncDir>,
     // Referencias a widgets dinámicos
     pub transfers_listbox: Option<gtk::ListBox>,
     pub history_listbox: Option<gtk::ListBox>,
+    pub sync_dirs_listbox: Option<gtk::ListBox>,
     // Navegación
     pub current_view: ViewMode,
 }
@@ -126,6 +129,64 @@ impl AppModel {
             history_listbox.append(&label);
         }
     }
+
+    /// Reconstruye el listbox de directorios locales
+    fn rebuild_sync_dirs_box(box_widget: &gtk::ListBox, dirs: &[crate::db::repository::LocalSyncDir], sender: &ComponentSender<Self>) {
+        while let Some(child) = box_widget.first_child() {
+            box_widget.remove(&child);
+        }
+
+        // Fila para "Añadir Carpeta..." siempre visible
+        let add_row = adw::ActionRow::new();
+        add_row.set_title("Añadir Carpeta...");
+        add_row.set_activatable(true);
+        let add_icon = gtk::Image::from_icon_name("list-add-symbolic");
+        add_row.add_prefix(&add_icon);
+        let sender_clone = sender.clone();
+        add_row.connect_activated(move |_| {
+            sender_clone.input(AppMsg::SelectNewSyncDir);
+        });
+        box_widget.append(&add_row);
+
+        if dirs.is_empty() {
+            let label = gtk::Label::new(Some("Ninguna carpeta adicional configurada"));
+            label.set_css_classes(&["dim-label"]);
+            label.set_margin_top(16);
+            label.set_margin_bottom(16);
+            box_widget.append(&label);
+            return;
+        }
+
+        for dir in dirs {
+            let row = adw::ActionRow::new();
+            row.set_title(&dir.local_path);
+            row.set_subtitle(if dir.enabled { "Sincronizando activamente" } else { "Sincronización pausada para esta carpeta" });
+            
+            let id = dir.id;
+            
+            let switch = gtk::Switch::new();
+            switch.set_active(dir.enabled);
+            switch.set_valign(gtk::Align::Center);
+            let sender_clone = sender.clone();
+            switch.connect_active_notify(move |s| {
+                sender_clone.input(AppMsg::ToggleSyncDir(id, s.is_active()));
+            });
+            row.add_suffix(&switch);
+            
+            let btn_remove = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .css_classes(["flat", "destructive-action"])
+                .valign(gtk::Align::Center)
+                .build();
+            let sender_clone2 = sender.clone();
+            btn_remove.connect_clicked(move |_| {
+                sender_clone2.input(AppMsg::RemoveSyncDir(id));
+            });
+            row.add_suffix(&btn_remove);
+            
+            box_widget.append(&row);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -145,6 +206,13 @@ pub enum AppMsg {
     HardReset,
     Login,
     SetLoginUrl(String),
+    // Gestión de directorios
+    LoadSyncDirs,
+    SyncDirsLoaded(Vec<crate::db::repository::LocalSyncDir>),
+    SelectNewSyncDir,
+    AddSyncDir(std::path::PathBuf),
+    RemoveSyncDir(i64),
+    ToggleSyncDir(i64, bool),
     // Refresco periódico de actividad
     RefreshActivity,
     // Navegación
@@ -339,6 +407,19 @@ impl Component for AppModel {
                                     },
                                 },
 
+                                // Sección Directorios Adicionales
+                                append = &adw::PreferencesGroup {
+                                    set_visible: false, // Oculto hasta nuevo aviso
+                                    set_title: "Carpetas Locales Sincronizadas",
+                                    set_description: Some("Seleccione directorios fuera del espejo de Google Drive para sincronizar"),
+
+                                    #[name = "sync_dirs_box"]
+                                    add = &gtk::ListBox {
+                                        set_css_classes: &["boxed-list"],
+                                        set_selection_mode: gtk::SelectionMode::None,
+                                    },
+                                },
+
                                 // Sección Cuenta
                                 append = &adw::PreferencesGroup {
                                     #[watch]
@@ -513,8 +594,10 @@ impl Component for AppModel {
             sync_detected: 0,
             sync_applied: 0,
             pending_uploads: 0,
+            local_sync_dirs: Vec::new(),
             transfers_listbox: None,
             history_listbox: None,
+            sync_dirs_listbox: None,
             current_view: ViewMode::Main,
         };
 
@@ -565,6 +648,7 @@ impl Component for AppModel {
         // Guardar referencias a widgets dinámicos en el model
         model.transfers_listbox = Some(widgets.transfers_box.clone());
         model.history_listbox = Some(widgets.history_listbox.clone());
+        model.sync_dirs_listbox = Some(widgets.sync_dirs_box.clone());
 
         // Cargar logo embebido y asignarlo al widget
         let logo_bytes = include_bytes!("../../assets/logo.png");
@@ -651,6 +735,7 @@ impl Component for AppModel {
             }
             AppMsg::SetDatabase(db) => {
                 self.db = Some(db);
+                _sender.input(AppMsg::LoadSyncDirs);
             }
             AppMsg::Quit => {
                 tracing::info!("Cerrando aplicación...");
@@ -697,6 +782,74 @@ impl Component for AppModel {
             AppMsg::SetLoginUrl(url) => {
                 tracing::info!("URL de login recibida: {}", url);
                 self.login_url = Some(url);
+            }
+            AppMsg::LoadSyncDirs => {
+                if let Some(db) = self.db.clone() {
+                    let sender_clone = _sender.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(rt) = tokio::runtime::Runtime::new() {
+                            if let Ok(dirs) = rt.block_on(db.get_local_sync_dirs()) {
+                                sender_clone.input(AppMsg::SyncDirsLoaded(dirs));
+                            }
+                        }
+                    });
+                }
+            }
+            AppMsg::SyncDirsLoaded(dirs) => {
+                self.local_sync_dirs = dirs;
+                if let Some(ref box_widget) = self.sync_dirs_listbox {
+                    Self::rebuild_sync_dirs_box(box_widget, &self.local_sync_dirs, &_sender);
+                }
+            }
+            AppMsg::SelectNewSyncDir => {
+                let dialog = gtk::FileDialog::builder()
+                    .title("Seleccionar carpeta para sincronizar")
+                    .build();
+                let sender_clone = _sender.clone();
+                // Pass the root window explicitly since context requires it in GTK4
+                dialog.select_folder(Some(root), gtk::gio::Cancellable::NONE, move |res| {
+                    if let Ok(folder) = res {
+                        if let Some(path) = folder.path() {
+                            sender_clone.input(AppMsg::AddSyncDir(path));
+                        }
+                    }
+                });
+            }
+            AppMsg::AddSyncDir(path) => {
+                if let Some(db) = self.db.clone() {
+                    let sender_clone = _sender.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(rt) = tokio::runtime::Runtime::new() {
+                            if let Ok(_) = rt.block_on(db.add_local_sync_dir(&path)) {
+                                sender_clone.input(AppMsg::LoadSyncDirs);
+                            }
+                        }
+                    });
+                }
+            }
+            AppMsg::RemoveSyncDir(id) => {
+                if let Some(db) = self.db.clone() {
+                    let sender_clone = _sender.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(rt) = tokio::runtime::Runtime::new() {
+                            if let Ok(_) = rt.block_on(db.remove_local_sync_dir(id)) {
+                                sender_clone.input(AppMsg::LoadSyncDirs);
+                            }
+                        }
+                    });
+                }
+            }
+            AppMsg::ToggleSyncDir(id, enabled) => {
+                if let Some(db) = self.db.clone() {
+                    let sender_clone = _sender.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(rt) = tokio::runtime::Runtime::new() {
+                            if let Ok(_) = rt.block_on(db.toggle_local_sync_dir(id, enabled)) {
+                                sender_clone.input(AppMsg::LoadSyncDirs);
+                            }
+                        }
+                    });
+                }
             }
             AppMsg::RefreshActivity => {
                 // Leer datos del historial compartido
