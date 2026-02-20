@@ -238,7 +238,47 @@ impl MirrorManager {
             warn!("Intento de modificar archivo fuera del mirror: {}", path_str);
             return;
         }
+
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) => {
+                if meta.is_dir() {
+                    let name_display = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path_str.to_string());
+                    ctx.history.log(ActionType::Sync, format!("Liberando espacio en carpeta: {}", name_display));
+                    
+                    let mut stack = vec![path.clone()];
+                    while let Some(current_dir) = stack.pop() {
+                        if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
+                            while let Ok(Some(entry)) = entries.next_entry().await {
+                                let child_path = entry.path();
+                                if let Ok(m) = entry.file_type().await {
+                                    if m.is_dir() {
+                                        stack.push(child_path);
+                                    } else {
+                                        Self::do_handle_set_online_only(ctx, &child_path, false).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            },
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    tracing::warn!("Archivo no encontrado en disco, intentando reparar symlink: {:?}", e);
+                } else {
+                    error!("Error leyendo metadata de archivo: {:?}", e);
+                    return;
+                }
+            }
+        }
         
+        Self::do_handle_set_online_only(ctx, &path, true).await;
+    }
+
+    async fn do_handle_set_online_only(ctx: &MirrorContext, path: &PathBuf, log_history: bool) {
         // 2. Calcular path relativo y path FUSE
         let relative = match path.strip_prefix(&ctx.mirror_path) {
             Ok(p) => p,
@@ -264,35 +304,15 @@ impl MirrorManager {
                     let file_name = path.file_name()
                         .map(|f| f.to_string_lossy())
                         .unwrap_or_else(|| "unknown".into());
-                    warn!("Intento bloqueado de liberar espacio de archivo local no sincronizado: {}", path_str);
-                    ctx.history.log(ActionType::Error, format!("No se puede liberar: {} (Pendiente a subir)", file_name));
+                    warn!("Intento bloqueado de liberar espacio de archivo local no sincronizado: {:?}", path);
+                    if log_history {
+                        ctx.history.log(ActionType::Error, format!("No se puede liberar: {} (Pendiente a subir)", file_name));
+                    }
                     return;
                 }
             }
         }
 
-        // 4. Validar tipo de archivo de forma ASYNC y SIN seguir symlinks (evitar FUSE deadlock)
-        tracing::debug!("🪞 Verificando tipo de archivo para: {:?}", path);
-        match tokio::fs::symlink_metadata(&path).await {
-            Ok(meta) => {
-                if meta.is_dir() {
-                    warn!("La liberación de espacio en directorios completos no es atómica aún");
-                    return;
-                }
-            },
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    // Si no existe, podría ser que ya se borró o nunca existió.
-                    // Si la DB dice que existe, procedemos a crear el symlink de todos modos
-                    // para reparar el estado.
-                    tracing::warn!("Archivo no encontrado en disco, intentando reparar symlink: {:?}", e);
-                } else {
-                    error!("Error leyendo metadata de archivo: {:?}", e);
-                    return;
-                }
-            }
-        }
-        
         // 5. ATOMIC SYMLINK SWAP (EXTERNAL TEMP DIR STRATEGY)
         // Usamos un directorio temporal FUERA de la vista actual para evitar que Nautilus refresque
         // la lista de archivos mientras preparamos el reemplazo.
@@ -314,7 +334,7 @@ impl MirrorManager {
         let fuse_path_clone = fuse_path.clone();
         let tmp_path_clone = tmp_symlink_path.clone();
         
-        tracing::info!("🪞 Creando symlink temporal en zona segura: {:?} -> {:?}", tmp_symlink_path, fuse_path);
+        tracing::debug!("🪞 Creando symlink temporal en zona segura: {:?} -> {:?}", tmp_symlink_path, fuse_path);
         
         // Crear el symlink en ubicación temporal externa (blocking)
         let create_result = tokio::task::spawn_blocking(move || {
@@ -332,7 +352,7 @@ impl MirrorManager {
                     warn!("No se pudo resolver inode para actualizar DB: {:?}", relative);
                 }
 
-                tracing::info!("🪞 Symlink creado. Ejecutando intercambio atómico trans-directorio...");
+                tracing::debug!("🪞 Symlink creado. Ejecutando intercambio atómico trans-directorio...");
                 
                 // Renombrar el symlink temporal (externo) sobre el archivo original (ATOMIC Move)
                 // Al venir desde fuera del directorio observado, Nautilus ve esto como una actualización
@@ -343,10 +363,12 @@ impl MirrorManager {
                     return;
                 }
                 
-                let name_display = path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path_str.to_string());
-                ctx.history.log(ActionType::Sync, format!("Solo online: {}", name_display));
+                if log_history {
+                    let name_display = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    ctx.history.log(ActionType::Sync, format!("Solo online: {}", name_display));
+                }
                 info!("☁️ Espacio liberado (External Temp): {:?}", relative);
 
                 // 7. FORCE NAUTILUS REFRESH
@@ -392,15 +414,47 @@ impl MirrorManager {
             return;
         }
 
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) => {
+                if meta.is_dir() {
+                    let name_display = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path_str.to_string());
+                    ctx.history.log(ActionType::Download, format!("Descargando carpeta: {}", name_display));
+                    
+                    let mut stack = vec![path.clone()];
+                    while let Some(current_dir) = stack.pop() {
+                        if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
+                            while let Ok(Some(entry)) = entries.next_entry().await {
+                                let child_path = entry.path();
+                                if let Ok(m) = entry.file_type().await {
+                                    if m.is_dir() {
+                                        stack.push(child_path);
+                                    } else {
+                                        Self::do_handle_set_local_online(ctx, &child_path, false).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            },
+            Err(_) => {} // Proceed as normal if error, maybe file doesn't exist but is in DB
+        }
+
+        Self::do_handle_set_local_online(ctx, &path, true).await;
+    }
+
+    async fn do_handle_set_local_online(ctx: &MirrorContext, path: &PathBuf, log_history: bool) {
         let relative = match path.strip_prefix(&ctx.mirror_path) {
            Ok(p) => p,
            Err(_) => return,
         };
         
         let fuse_path = ctx.fuse_mount_path.join(relative);
-        tracing::info!("🪞 Fuse path objetivo: {:?}", fuse_path);
+        tracing::debug!("🪞 Fuse path objetivo: {:?}", fuse_path);
         
-        // 2. Verificar si ya es archivo real (y no symlink)
         let meta = tokio::fs::symlink_metadata(&path).await;
         if let Ok(m) = meta {
             if !m.is_symlink() && m.is_file() {
@@ -416,10 +470,12 @@ impl MirrorManager {
         // 2. Database is source of truth - If DB has inode, we proceed
         // FUSE will serve the file on-demand when accessed
 
-        let name_display = path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path_str.to_string());
-        ctx.history.log(ActionType::Download, format!("Descargando: {}", name_display));
+        if log_history {
+            let name_display = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            ctx.history.log(ActionType::Download, format!("Descargando: {}", name_display));
+        }
         info!("📥 Iniciando descarga: {:?}", relative);
         
         // 3. Copiar contenido usando spawn_blocking (evitar bloqueo de runtime)
@@ -443,17 +499,17 @@ impl MirrorManager {
         
         let tmp_path = temp_dir_root.join(&unique_name);
         
-        let fuse_path_copy = fuse_path.clone();
+        let fuse_path_clone = fuse_path.clone();
         let tmp_path_copy = tmp_path.clone();
         
-        tracing::info!("🪞 Copiando {:?} -> {:?}", fuse_path, tmp_path);
+        tracing::debug!("🪞 Copiando {:?} -> {:?}", fuse_path, tmp_path);
         let copy_result = tokio::task::spawn_blocking(move || {
-            std::fs::copy(&fuse_path_copy, &tmp_path_copy)
+            std::fs::copy(&fuse_path_clone, &tmp_path_copy)
         }).await;
         
         match copy_result {
             Ok(Ok(_)) => {
-                tracing::info!("🪞 Copia finalizada. Preparando intercambio...");
+                tracing::debug!("🪞 Copia finalizada. Preparando intercambio...");
             }
             Ok(Err(e)) => {
                 error!("Error descargando archivo desde FUSE: {:?}", e);
@@ -479,7 +535,12 @@ impl MirrorManager {
               error!("Error moviendo archivo descargado a destino final: {:?}", e);
               let _ = tokio::fs::remove_file(&tmp_path).await;
         } else {
-              ctx.history.log(ActionType::Download, format!("Descargado: {}", name_display));
+              if log_history {
+                  let name_display = path.file_name()
+                      .map(|n| n.to_string_lossy().to_string())
+                      .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                  ctx.history.log(ActionType::Download, format!("Descargado: {}", name_display));
+              }
               info!("✅ Archivo descargado exitosamente (External Temp): {:?}", relative);
               
               // 6. FORCE NAUTILUS REFRESH
