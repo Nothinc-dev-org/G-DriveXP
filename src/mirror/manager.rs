@@ -662,11 +662,33 @@ impl MirrorManager {
              None => return,
         };
 
-        // 5. ACTUALIZACIÓN ATÓMICA EN DB
-        // Actualizamos dentry para apuntar al nuevo padre y nombre
-        // El inode se mantiene, por lo que el gdrive_id se mantiene.
+        // 5. ACTUALIZACIÓN ATÓMICA EN DB CON GESTIÓN DE CONFLICTOS
+        // Si el destino ya existe (sobreescritura), debemos eliminar el dentry antiguo
+        // del destino para evitar el error UNIQUE constraint failed.
         
-        info!("📝 Ejecutando Move en DB: inode={} -> new_parent={}, new_name={}", inode, new_parent_inode, new_name);
+        info!("📝 Preparando Move en DB: inode={} -> new_parent={}, new_name={}", inode, new_parent_inode, new_name);
+
+        // A. Verificar si el destino ya existe en la DB
+        if let Ok(Some(existing_dest_inode)) = db.lookup(new_parent_inode, &new_name).await {
+            warn!("⚠️ Conflicto detectado en Rename. El destino '{}' ya existe (inode={}). Eliminando anterior...", new_name, existing_dest_inode);
+            
+            // Resolvemos gdrive_id para aplicar soft_delete si es posible
+            let existing_gdrive_id: Option<String> = sqlx::query_scalar("SELECT gdrive_id FROM inodes WHERE inode = ?")
+                .bind(existing_dest_inode as i64)
+                .fetch_optional(db.pool())
+                .await
+                .unwrap_or(None);
+
+            if let Some(gid) = existing_gdrive_id {
+                let _ = db.soft_delete_by_gdrive_id(&gid).await;
+            } else {
+                // Si no tiene gdrive_id, es un dentry local puro, lo borramos de dentry
+                let _ = sqlx::query("DELETE FROM dentry WHERE child_inode = ?")
+                    .bind(existing_dest_inode as i64)
+                    .execute(db.pool())
+                    .await;
+            }
+        }
 
         let update_sql = "UPDATE dentry SET parent_inode = ?, name = ? WHERE child_inode = ?";
         if let Err(e) = sqlx::query(update_sql)
@@ -676,7 +698,7 @@ impl MirrorManager {
             .execute(db.pool())
             .await 
         {
-             error!("Error actualizando dentry en Rename: {:?}", e);
+             error!("Error crítico actualizando dentry en Rename: {:?}", e);
              return;
         }
 
