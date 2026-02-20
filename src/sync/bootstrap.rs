@@ -37,6 +37,17 @@ async fn ensure_root_exists(db: &Arc<MetadataRepository>) -> Result<()> {
     .await?;
 
     tracing::debug!("Inode raíz (1) verificado/creado en la base de datos");
+
+    // FIX MIGRATION: Update existing incorrect permissions
+    // Flatpak/Audio players fail if directories don't have execute bits (0o755 / 493)
+    let _ = sqlx::query("UPDATE attrs SET mode = 493 WHERE is_dir = 1 AND mode = 420")
+        .execute(pool)
+        .await;
+        
+    let _ = sqlx::query("UPDATE attrs SET mode = 420 WHERE is_dir = 0 AND mode != 420")
+        .execute(pool)
+        .await;
+        
     Ok(())
 }
 

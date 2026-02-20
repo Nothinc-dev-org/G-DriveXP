@@ -49,6 +49,20 @@ cargo build --release
 5. Descargue el archivo `credentials.json`
 6. Colóquelo en la raíz del proyecto como `credentials.json`
 
+### 4. Configurar FUSE (Opcional, recomendado para Flatpak)
+
+Para que aplicaciones de terceros (reproductores, navegadores) puedan acceder al sistema de archivos:
+
+1. Descomente `user_allow_other` en `/etc/fuse.conf`.
+2. Asegúrese de que su usuario esté en el grupo `fuse`.
+
+Consulte [INSTALL.md](./INSTALL.md) para instrucciones detalladas.
+
+## ⚠️ Limitaciones Conocidas
+
+- **Resolución de Enlaces Simbólicos**: Algunas aplicaciones modernas de GNOME (especialmente aquellas basadas en GTK4/GJS como **GNOME Decibels**) pueden fallar al abrir archivos desde la carpeta principal del espejo. Esto se debe a restricciones de seguridad que impiden seguir enlaces simbólicos (`OnlineOnly`) hacia el sistema de archivos FUSE.
+  - **Solución**: Navegue directamente a `~/GoogleDrive/FUSE_Mount/` para una compatibilidad total, o sincronice el archivo a local para convertirlo en un archivo real.
+
 ## 🎯 Uso
 
 ```bash

@@ -75,15 +75,36 @@ cargo build
 cargo build --release
 ```
 
+### Configuración de FUSE (Acceso para Apps/Flatpak)
+
+Para que aplicaciones como reproductores de música (GNOME Music, Rhythmbox) o navegadores puedan acceder a los archivos, especialmente si funcionan bajo **Flatpak**, es necesario permitir el acceso a otros usuarios en FUSE:
+
+1. **Habilitar `user_allow_other`**:
+   Edite el archivo `/etc/fuse.conf` como superusuario:
+   ```bash
+   sudo nano /etc/fuse.conf
+   ```
+   Descomente (elimine el `#`) la línea que dice `user_allow_other`.
+
+2. **Asegurar pertenencia al grupo `fuse`**:
+   ```bash
+   sudo usermod -a -G fuse $USER
+   # Reinicie su sesión para que los cambios surtan efecto
+   ```
+
+#### Compatibilidad con Aplicaciones (Restricciones de Symlinks)
+
+G-DriveXP utiliza una arquitectura híbrida donde los archivos en línea son **enlaces simbólicos** hacia el montaje FUSE. Algunas aplicaciones GNOME modernas (como **GNOME Decibels**) tienen políticas de seguridad estrictas que les impiden seguir enlaces simbólicos hacia sistemas de archivos virtuales.
+
+- **Síntoma**: La aplicación dice "Archivo no admitido" al intentar abrir desde la carpeta principal.
+- **Workaround**:
+  1. Acceda al archivo directamente desde el punto de montaje virtual: `~/GoogleDrive/FUSE_Mount/`.
+  2. O descargue el archivo ("Sincronizar a Local") para que se convierta en un archivo real compatible con el portal de archivos de GNOME.
+
 ### Notas Específicas de Fedora
 
 - **Versión mínima de Fedora**: 39+ (para GTK4 4.12 y Libadwaita 1.5)
 - **Edición de Rust**: Este proyecto usa Rust Edition 2024, requiere `rustc >= 1.85`
-- **FUSE3**: Asegúrese de que su usuario pertenece al grupo `fuse`:
-  ```bash
-  sudo usermod -a -G fuse $USER
-  newgrp fuse
-  ```
 
 ### Solución de Problemas Comunes
 

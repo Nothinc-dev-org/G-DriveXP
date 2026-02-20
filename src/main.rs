@@ -187,6 +187,8 @@ pub fn run_backend(
             .uid(uid)
             .gid(gid)
             .fs_name("fedoradrive")
+            .allow_other(true)
+            .custom_options("default_permissions") // Apply permissions locally
             .custom_options("exec"); // CRÍTICO: Permitir ejecución de binarios y .desktop
             
         tracing::info!("Montando sistema de archivos en {:?}...", config.fuse_mount_path);

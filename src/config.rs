@@ -32,8 +32,8 @@ impl Config {
         let home = env::var("HOME")?;
         
         Ok(Self {
-            // USAR nested mount para máxima compatibilidad con Flatpak/Snap
-            fuse_mount_path: PathBuf::from(format!("{}/GoogleDrive/.cloud_mount", home)),
+            // FUSE_Mount en lugar de .cloud_mount para que Flatpak pueda atravesarlo
+            fuse_mount_path: PathBuf::from(format!("{}/GoogleDrive/FUSE_Mount", home)),
             mirror_path: PathBuf::from(format!("{}/GoogleDrive", home)),
             cache_dir: PathBuf::from(format!("{}/.cache/fedoradrive", home)),
             db_path: PathBuf::from(format!("{}/.config/fedoradrive/metadata.db", home)),
@@ -50,22 +50,17 @@ impl Config {
             let contents = fs::read_to_string(&config_path)?;
             let mut config: Config = serde_json::from_str(&contents)?;
             
-            // MIGRATION: Check if using old restricted path (.local) and migrate to /tmp
-            let home = env::var("HOME")?;
-            let _old_default = format!("{}/.local/share/g-drive-xp/cloud_mount", home);
-            
-            // MIGRATION: Check if using restricted paths (.local) or unstable (/tmp) and migrate to nested mount
+            // MIGRATION: Check if using restricted paths (.local) or unstable (/tmp) or hidden (.cloud_mount) and migrate to visible mount
             let home = env::var("HOME")?;
             let current_path = config.fuse_mount_path.to_string_lossy();
             
             let needs_migration = current_path.contains(".local/share/g-drive-xp") || 
-                                  current_path.contains("/tmp/g-drive-xp-mount");
+                                  current_path.contains("/tmp/g-drive-xp-mount") ||
+                                  current_path.contains(".cloud_mount");
 
             if needs_migration {
-                tracing::warn!("⚠️ MIGRACIÓN SUPERIOR: Moviendo punto de montaje a ~/GoogleDrive/.cloud_mount para compatibilidad total con Sandbox.");
-                // Usamos path relativo al home para construir el nuevo target
-                // Idealmente deberíamos usar config.mirror_path pero necesitamos asegurar que sea str
-                let new_mount = PathBuf::from(format!("{}/GoogleDrive/.cloud_mount", home));
+                tracing::warn!("⚠️ MIGRACIÓN: Moviendo punto de montaje a ~/GoogleDrive/FUSE_Mount para compatibilidad total con Flatpak (Sandbox).");
+                let new_mount = PathBuf::from(format!("{}/GoogleDrive/FUSE_Mount", home));
                 config.fuse_mount_path = new_mount;
                 config.ensure_directories()?;
                 config.save()?;
@@ -112,15 +107,15 @@ impl Config {
         // Crear el directorio espejo (visible) si no existe
         fs::create_dir_all(&self.mirror_path)?;
 
-        // Crear el punto de montaje FUSE (oculto) si no existe
-        // Si ya existe (incluso en estado stale por crash anterior), ignorar el error EEXIST
+        // Crear el punto de montaje FUSE (oculto visualmente con .hidden)
+        // Si ya existe ignorar el error EEXIST
         match fs::create_dir_all(&self.fuse_mount_path) {
             Ok(()) => {},
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                tracing::debug!("Punto de montaje oculto ya existe, continuando...");
+                tracing::debug!("Punto de montaje FUSE ya existe, continuando...");
             },
             Err(e) => {
-                // Verificar si es accesible (stale mount devuelve error al acceder)
+                // Verificar si es accesible (stale mount)
                 if fs::read_dir(&self.fuse_mount_path).is_err() {
                     tracing::warn!(
                         "Punto de montaje {:?} existe pero no es accesible. \
@@ -130,6 +125,18 @@ impl Config {
                 }
                 return Err(e.into());
             }
+        }
+        
+        // Ocultar FUSE_Mount en Nautilus usando un archivo .hidden
+        let hidden_file_path = self.mirror_path.join(".hidden");
+        let mount_name = self.fuse_mount_path.file_name().unwrap_or_default().to_string_lossy();
+        if let Ok(contents) = fs::read_to_string(&hidden_file_path) {
+            if !contents.contains(mount_name.as_ref()) {
+                let new_contents = format!("{}\n{}", contents, mount_name);
+                let _ = fs::write(&hidden_file_path, new_contents);
+            }
+        } else {
+            let _ = fs::write(&hidden_file_path, format!("{}\n", mount_name));
         }
         
         tracing::info!("Directorios de configuración y montaje creados");

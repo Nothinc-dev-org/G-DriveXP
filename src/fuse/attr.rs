@@ -50,7 +50,7 @@ impl FileAttributes {
             size: 4096,
             mtime: now,
             ctime: now,
-            mode: 0o755,
+            mode: 0o755, // 0o755 is correct, but let's check why stat showed 0644
             is_dir: true,
             mime_type: Some("application/vnd.google-apps.folder".to_string()),
             can_move: true,
