@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+use futures::stream::{self, StreamExt};
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
@@ -93,14 +94,26 @@ impl Uploader {
         let mut uploaded_count = 0;
         
         // 2. Procesar archivos FUSE
-        for (inode, gdrive_id, is_delete) in dirty_files {
-            match self.upload_file(inode, &gdrive_id, is_delete).await {
+        let upload_results = stream::iter(dirty_files)
+            .map(|(inode, gdrive_id, is_delete)| async move {
+                let res = self.upload_file(inode, &gdrive_id, is_delete).await;
+                (inode, res)
+            })
+            .buffer_unordered(4) // Concurrencia máxima de 4
+            .collect::<Vec<_>>()
+            .await;
+
+        for (inode, result) in upload_results {
+            match result {
                 Ok(()) => {
                     uploaded_count += 1;
                 }
                 Err(e) => {
-                    warn!("Error subiendo inode {}: {:?}", inode, e);
-                    // Continuamos con los demás
+                    if e.to_string().contains("DEFERRED_PARENT_TEMP") {
+                        debug!("⏳ Inode {} aplazado: directorio padre aún no sincronizado", inode);
+                    } else {
+                        warn!("Error subiendo inode {}: {:?}", inode, e);
+                    }
                 }
             }
         }
@@ -167,6 +180,10 @@ impl Uploader {
         let attrs = self.db.get_attrs(inode).await?;
         let name = self.get_file_name(inode).await?;
         let parent_gdrive_id = self.get_parent_gdrive_id(inode).await?;
+    
+    if parent_gdrive_id.starts_with("temp_") {
+        anyhow::bail!("DEFERRED_PARENT_TEMP");
+    }
         
         // Validar si es una carpeta
         if attrs.is_dir {
@@ -372,6 +389,10 @@ impl Uploader {
         // Detectar cambio de ubicación (Move)
         let remote_parents = remote_meta.parents.clone().unwrap_or_default();
         let local_parent_id = self.get_parent_gdrive_id(inode).await?;
+        
+        if local_parent_id.starts_with("temp_") {
+            anyhow::bail!("DEFERRED_PARENT_TEMP");
+        }
         
         // Verificar si el padre local está en la lista de padres remotos
         // Manejar el caso especial de "root" vs ID real del root
@@ -789,39 +810,51 @@ impl Uploader {
         
         debug!("📋 Encontrados {} archivos local sync dirty", dirty_files.len());
         
-        let mut uploaded = 0;
-        
-        for file in dirty_files {
-            // Solo subir si está en modo local_online
-            if file.availability != "local_online" {
-                debug!("Saltando archivo online_only: {}", file.relative_path);
-                continue;
-            }
-            
-            // Obtener path absoluto
-            let base_dir = match self.db.get_local_sync_dir(file.sync_dir_id).await {
-                Ok(dir) => dir,
-                Err(e) => {
-                    warn!("Error obteniendo sync_dir_id={}: {:?}", file.sync_dir_id, e);
-                    continue;
+        let local_results = stream::iter(dirty_files)
+            .map(|file| async move {
+                // Solo subir si está en modo local_online
+                if file.availability != "local_online" {
+                    debug!("Saltando archivo online_only: {}", file.relative_path);
+                    return None;
                 }
-            };
-            
-            let local_path = std::path::PathBuf::from(&base_dir.local_path).join(&file.relative_path);
-            
-            // Verificar que el archivo existe y NO es symlink
-            if !local_path.exists() || local_path.is_symlink() {
-                debug!("Archivo no disponible localmente: {}", file.relative_path);
-                continue;
-            }
-            
-            // Procesar según si tiene gdrive_id o no
-            match self.upload_local_file(&file, &local_path, &base_dir).await {
+                
+                // Obtener path absoluto
+                let base_dir = match self.db.get_local_sync_dir(file.sync_dir_id).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        warn!("Error obteniendo sync_dir_id={}: {:?}", file.sync_dir_id, e);
+                        return None;
+                    }
+                };
+                
+                let local_path = std::path::PathBuf::from(&base_dir.local_path).join(&file.relative_path);
+                
+                // Verificar que el archivo existe y NO es symlink
+                if !local_path.exists() || local_path.is_symlink() {
+                    debug!("Archivo no disponible localmente: {}", file.relative_path);
+                    return None;
+                }
+                
+                // Procesar según si tiene gdrive_id o no
+                Some((file.relative_path.clone(), self.upload_local_file(&file, &local_path, &base_dir).await))
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut uploaded = 0;
+        for res in local_results.into_iter().flatten() {
+            let (rel_path, result) = res;
+            match result {
                 Ok(()) => {
                     uploaded += 1;
                 }
                 Err(e) => {
-                    warn!("Error subiendo {}: {:?}", file.relative_path, e);
+                    if e.to_string().contains("DEFERRED_PARENT_TEMP") {
+                        debug!("⏳ {} aplazado: directorio padre aún no sincronizado", rel_path);
+                    } else {
+                        warn!("Error subiendo {}: {:?}", rel_path, e);
+                    }
                 }
             }
         }

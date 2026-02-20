@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio::sync::RwLock;
+use futures::stream::{self, StreamExt};
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
@@ -124,13 +125,27 @@ impl BackgroundSyncer {
         if changes_count > 0 {
             self.history.set_sync_progress(changes_count, 0);
         }
-        for change in changes {
-            if let Err(e) = self.process_change(change, &root_id).await {
+        
+        let root_id_arc = Arc::new(root_id);
+
+        let process_results = stream::iter(changes)
+            .map(|change| {
+                let root_id_ref = root_id_arc.clone();
+                async move {
+                    self.process_change(change, &root_id_ref).await
+                }
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+
+        for res in process_results {
+            if let Err(e) = res {
                 tracing::warn!("Error procesando cambio individual: {:?}", e);
-                // Continuamos con los demás
             }
             self.history.increment_applied();
         }
+
         if changes_count > 0 {
             self.history.mark_all_synced();
         }
