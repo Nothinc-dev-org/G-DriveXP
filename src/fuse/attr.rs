@@ -17,6 +17,8 @@ pub struct FileAttributes {
     pub can_move: bool,
     #[sqlx(default)]
     pub shared: bool,
+    #[sqlx(default)]
+    pub owned_by_me: bool,
 }
 
 impl FileAttributes {
@@ -55,6 +57,7 @@ impl FileAttributes {
             mime_type: Some("application/vnd.google-apps.folder".to_string()),
             can_move: true,
             shared: false,
+            owned_by_me: true,
         }
     }
 }

@@ -15,6 +15,7 @@ use crate::gdrive::client::DriveClient;
 /// Clave en sync_meta para el page token de changes
 const SYNC_META_PAGE_TOKEN: &str = "changes_page_token";
 
+
 /// Intervalo máximo de backoff en segundos
 const MAX_BACKOFF_SECS: u64 = 300;
 
@@ -238,6 +239,7 @@ impl BackgroundSyncer {
                 file.mime_type.as_deref(),
                 can_move,
                 shared,
+                file.owned_by_me.unwrap_or(true),
             ).await?;
 
             // Actualizar dentry (árbol de directorios)

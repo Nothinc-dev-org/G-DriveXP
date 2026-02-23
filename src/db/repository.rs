@@ -243,6 +243,23 @@ impl MetadataRepository {
                 .await?;
         }
 
+        // 9. Verificar si la columna owned_by_me existe en attrs
+        let has_owned_by_me = sqlx::query("PRAGMA table_info(attrs)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "owned_by_me"
+            });
+
+        if !has_owned_by_me {
+            sqlx::query("ALTER TABLE attrs ADD COLUMN owned_by_me BOOLEAN DEFAULT 1")
+                .execute(&self.pool)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -284,7 +301,10 @@ impl MetadataRepository {
             WITH RECURSIVE dir_tree AS (
                 SELECT
                     d.child_inode,
-                    d.name as path,
+                    CASE 
+                        WHEN a.owned_by_me = 0 THEN 'SHARED/' || d.name
+                        ELSE d.name
+                    END as path,
                     a.is_dir
                 FROM dentry d
                 JOIN attrs a ON d.child_inode = a.inode
@@ -312,9 +332,17 @@ impl MetadataRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter()
+        let mut results: Vec<(u64, String)> = rows.into_iter()
             .map(|(inode, path)| (inode as u64, path))
-            .collect())
+            .collect();
+
+        // Inyectar el directorio virtual SHARED si hay ítems no propios en la raíz
+        let count_non_owned = self.count_non_owned_root_children().await.unwrap_or(0);
+        if count_non_owned > 0 {
+            results.insert(0, (0xFFFF_FFFF_FFFF_FFFE, "SHARED".to_string()));
+        }
+
+        Ok(results)
     }
 
     /// Obtiene todos los archivos "vivos" para el Bootstrapping
@@ -326,7 +354,10 @@ impl MetadataRepository {
                 -- Caso base: archivos en root (parent_inode = 1)
                 SELECT 
                     d.child_inode, 
-                    d.name as path, 
+                    CASE 
+                        WHEN a.owned_by_me = 0 THEN 'SHARED/' || d.name
+                        ELSE d.name
+                    END as path, 
                     a.is_dir
                 FROM dentry d
                 JOIN attrs a ON d.child_inode = a.inode
@@ -427,13 +458,46 @@ impl MetadataRepository {
             .collect())
     }
 
+    /// Listar contenido compartido de la raíz (archivos no propios que cuelgan del inode 1)
+    pub async fn list_non_owned_root_children(&self) -> Result<Vec<(u64, String, bool, Option<String>, String)>> {
+        let children = sqlx::query_as::<_, (i64, String, bool, Option<String>, String)>(
+            r#"
+            SELECT 
+                d.child_inode, 
+                d.name, 
+                a.is_dir,
+                a.mime_type,
+                i.gdrive_id
+            FROM dentry d
+            JOIN attrs a ON d.child_inode = a.inode
+            JOIN inodes i ON d.child_inode = i.inode
+            WHERE d.parent_inode = 1 AND a.owned_by_me = 0
+            ORDER BY d.name
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        
+        Ok(children.into_iter()
+            .map(|(inode, name, is_dir, mime, gdrive_id)| (inode as u64, name, is_dir, mime, gdrive_id))
+            .collect())
+    }
+
     /// Resuelve un path relativo (desde el root del mirror) a su inode
     pub async fn resolve_relative_path_to_inode(&self, relative_path: &str) -> Result<Option<u64>> {
         let parts: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
         
         let mut current_inode = 1u64; // Root inode
         
-        for part in parts {
+        // Si el path empieza con "SHARED", saltamos ese segmento virtual
+        // y seguimos resolviendo desde root (inode 1)
+        let parts_to_resolve = if parts.first() == Some(&"SHARED") {
+            &parts[1..]
+        } else {
+            &parts[..]
+        };
+        
+        for part in parts_to_resolve {
             match self.lookup(current_inode, part).await? {
                 Some(child_inode) => current_inode = child_inode,
                 None => return Ok(None),
@@ -505,6 +569,23 @@ impl MetadataRepository {
         Ok(count as u64)
     }
 
+    /// Cuenta el número de hijos de un directorio que NO son propiedad del usuario
+    /// y que están en el root (usado para la carpeta compartida virtual)
+    pub async fn count_non_owned_root_children(&self) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) 
+            FROM dentry d
+            JOIN attrs a ON d.child_inode = a.inode
+            WHERE d.parent_inode = 1 AND a.owned_by_me = 0
+            "#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        
+        Ok(count as u64)
+    }
+
     /// Verifica si la tabla de inodos está vacía (excepto el root si existe)
     pub async fn is_empty(&self) -> Result<bool> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inodes")
@@ -551,11 +632,12 @@ impl MetadataRepository {
         mime_type: Option<&str>,
         can_move: bool,
         shared: bool,
+        owned_by_me: bool,
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO attrs (inode, size, mtime, ctime, mode, is_dir, mime_type, can_move, shared)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO attrs (inode, size, mtime, ctime, mode, is_dir, mime_type, can_move, shared, owned_by_me)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(inode) DO UPDATE SET
                 size = excluded.size,
                 mtime = excluded.mtime,
@@ -563,7 +645,8 @@ impl MetadataRepository {
                 is_dir = excluded.is_dir,
                 mime_type = excluded.mime_type,
                 can_move = excluded.can_move,
-                shared = excluded.shared
+                shared = excluded.shared,
+                owned_by_me = excluded.owned_by_me
             "#
         )
         .bind(inode as i64)
@@ -575,9 +658,20 @@ impl MetadataRepository {
         .bind(mime_type)
         .bind(can_move)
         .bind(shared)
+        .bind(owned_by_me)
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    /// Actualiza específicamente el campo de propiedad (para correcciones masivas)
+    pub async fn update_ownership(&self, inode: u64, owned_by_me: bool) -> Result<()> {
+        sqlx::query("UPDATE attrs SET owned_by_me = ? WHERE inode = ?")
+            .bind(owned_by_me)
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

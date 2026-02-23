@@ -157,7 +157,7 @@ impl DriveClient {
         let client = reqwest::Client::new();
 
         loop {
-            let mut url = "https://www.googleapis.com/drive/v3/files?trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,capabilities(canMoveItemWithinDrive))".to_string();
+            let mut url = "https://www.googleapis.com/drive/v3/files?trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))".to_string();
             
             if let Some(ref token_str) = page_token {
                 url.push_str(&format!("&pageToken={}", token_str));
@@ -251,7 +251,7 @@ impl DriveClient {
         
         // pageToken es requerido, fields especifica qué queremos recibir
         let url = format!(
-            "https://www.googleapis.com/drive/v3/changes?pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed,shared,capabilities(canMoveItemWithinDrive)))",
+            "https://www.googleapis.com/drive/v3/changes?pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed,shared,ownedByMe,capabilities(canMoveItemWithinDrive)))",
             page_token
         );
 
@@ -538,7 +538,7 @@ impl DriveClient {
         let client = reqwest::Client::new();
         // Solicitamos name, parents, md5Checksum y capabilities para verificar permisos
         let url = format!(
-            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType,shared,capabilities&supportsAllDrives=true",
+            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType,shared,ownedByMe,capabilities&supportsAllDrives=true",
             file_id
         );
 

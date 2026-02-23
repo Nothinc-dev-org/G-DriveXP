@@ -191,7 +191,66 @@ impl MirrorManager {
                 _ => {}
             }
         }
-        
+        // PASO 3: LIMPIEZA DE SYMLINKS OBSOLETOS EN ROOT
+        // En versiones anteriores, los archivos compartidos (owned_by_me=0) se colocaban
+        // en la raíz del espejo. Ahora se colocan bajo SHARED/. Este paso detecta y elimina
+        // los symlinks "huérfanos" que ya no corresponden a ninguna ruta en la DB de root.
+        info!("🧹 Inspeccionando symlinks obsoletos en el root del espejo...");
+
+        // Construir un Set de todas las rutas relativas válidas en la raíz (sin prefijo SHARED/)
+        let valid_root_names: std::collections::HashSet<String> = {
+            let all_files = ctx.db.get_all_active_files().await.unwrap_or_default();
+            let all_dirs = ctx.db.get_all_active_dirs().await.unwrap_or_default();
+            let mut set: std::collections::HashSet<String> = all_files.into_iter()
+                .filter_map(|(_, path, _)| {
+                    // Solo nombres en root (sin separador '/')
+                    if !path.contains('/') { Some(path) } else { None }
+                })
+                .collect();
+            // Añadir también directorios de root válidos
+            for (_, path) in all_dirs {
+                if !path.contains('/') {
+                    set.insert(path);
+                }
+            }
+            // SHARED/ es siempre válido (directorio virtual)
+            set.insert("SHARED".to_string());
+            set
+        };
+
+        if let Ok(mut root_entries) = tokio::fs::read_dir(&ctx.mirror_path).await {
+            let mut stale_count = 0;
+            while let Ok(Some(entry)) = root_entries.next_entry().await {
+                let path = entry.path();
+
+                // Solo nos interesan los symlinks del root
+                let meta = match tokio::fs::symlink_metadata(&path).await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !meta.is_symlink() { continue; }
+
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                // Ignorar entradas del sistema y temporales
+                if name.starts_with('.') { continue; }
+
+                if !valid_root_names.contains(&name) {
+                    warn!("🧹 Eliminando symlink obsoleto del root: {}", name);
+                    if let Err(e) = tokio::fs::remove_file(&path).await {
+                        warn!("   No se pudo eliminar {:?}: {:?}", path, e);
+                    } else {
+                        stale_count += 1;
+                    }
+                }
+            }
+            if stale_count > 0 {
+                info!("🧹 {} symlinks obsoletos eliminados del root.", stale_count);
+            }
+        }
+
         info!("✅ Bootstrap completado");
         Ok(())
     }
@@ -640,7 +699,7 @@ impl MirrorManager {
                         }
                     }
                     EventKind::Remove(_) => {
-                         self.handle_local_delete(&relative_str).await;
+                        self.handle_local_delete(&relative_str).await;
                     }
                     _ => {} 
                 }
@@ -958,7 +1017,7 @@ impl MirrorManager {
             // Detectar MIME type básico
             let mime = mime_guess::from_path(path).first().map(|m| m.essence_str().to_string());
 
-            if let Err(e) = db.upsert_file_metadata(inode, size, mtime, mode, is_dir, mime.as_deref(), true, false).await {
+            if let Err(e) = db.upsert_file_metadata(inode, size, mtime, mode, is_dir, mime.as_deref(), true, false, true).await {
                 error!("Error actualizando metadata en DB: {:?}", e);
             }
         }

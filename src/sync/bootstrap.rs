@@ -111,7 +111,8 @@ pub async fn sync_all_metadata(
                 is_dir,
                 file.mime_type.as_deref(),
                 can_move,
-                shared
+                shared,
+                file.owned_by_me.unwrap_or(true)
             ).await?;
         }
     }
@@ -139,5 +140,33 @@ pub async fn sync_all_metadata(
     }
 
     tracing::info!("Bootstrapping completado exitosamente");
+    Ok(())
+}
+
+/// Repara específicamente los metadatos de propiedad (owned_by_me)
+/// Útil cuando la base de datos tiene datos antiguos o incompletos
+pub async fn repair_ownership_metadata(
+    db: &Arc<MetadataRepository>,
+    client: &Arc<DriveClient>,
+) -> Result<()> {
+    tracing::info!("🛠️ Iniciando REPARACIÓN de metadatos de propiedad...");
+
+    // 1. Obtener lista mínima de Google Drive (solo IDs y propiedad)
+    let files = client.list_all_files().await?;
+    let total = files.len();
+    
+    let mut repaired_count = 0;
+    for file in files {
+        if let Some(id) = file.id {
+            // Solo actualizamos si el inodo existe localmente
+            if let Some(inode) = db.get_inode_by_gdrive_id(&id).await? {
+                let owned = file.owned_by_me.unwrap_or(true);
+                db.update_ownership(inode, owned).await?;
+                repaired_count += 1;
+            }
+        }
+    }
+
+    tracing::info!("✅ Reparación completada: {}/{} archivos actualizados", repaired_count, total);
     Ok(())
 }

@@ -1,5 +1,5 @@
 use fuse3::raw::prelude::*;
-use fuse3::{Errno, Result};
+use fuse3::{Errno, Result, Timestamp};
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::time::Duration;
 use tracing::{debug, error};
 use futures_util::stream::{self, BoxStream, StreamExt};
 use std::collections::HashMap;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
@@ -16,6 +16,7 @@ use crate::gui::history::{ActionHistory, TransferOp};
 
 
 /// Implementación del sistema de archivos FUSE para Google Drive
+pub const SHARED_INODE: u64 = 0xFFFF_FFFF_FFFF_FFFE; // Un inodo virtual muy alto
 pub struct GDriveFS {
     db: Arc<MetadataRepository>,
     drive_client: Arc<DriveClient>,
@@ -23,6 +24,8 @@ pub struct GDriveFS {
     history: Arc<ActionHistory>,
     fuse_downloads: Arc<tokio::sync::Mutex<HashMap<u64, u64>>>,
     file_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Inodes que recibieron 403 permanente de Drive API (no reintentar)
+    failed_downloads: Arc<DashSet<u64>>,
 }
 
 impl GDriveFS {
@@ -39,6 +42,7 @@ impl GDriveFS {
             history,
             fuse_downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             file_locks: Arc::new(DashMap::new()),
+            failed_downloads: Arc::new(DashSet::new()),
         }
     }
 }
@@ -70,17 +74,55 @@ impl Filesystem for GDriveFS {
     ) -> Result<ReplyDirectory<Self::DirEntryStream<'_>>> {
         tracing::trace!("👁️ readdir: parent={} offset={}", parent, offset);
 
-        // 1. Verificación temprana: obtener conteo sin cargar datos
-        let child_count = match self.db.count_children(parent).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("❌ Error contando hijos de {}: {}", parent, e);
-                return Err(Errno::from(libc::EIO));
+        // 1. Verificación temprana y carga de datos
+        // Caso especial: SHARED_INODE
+        let (children, child_count) = if parent == SHARED_INODE {
+            let items = self.db.list_non_owned_root_children().await
+                .map_err(|e| {
+                    error!("❌ Error listando compartidos: {}", e);
+                    Errno::from(libc::EIO)
+                })?;
+            let count = items.len() as u64;
+            let simplified = items.into_iter().map(|(inode, name, is_dir, _, _)| (inode, name, is_dir)).collect::<Vec<_>>();
+            (simplified, count)
+        } else {
+            let _count = match self.db.count_children(parent).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("❌ Error contando hijos de {}: {}", parent, e);
+                    return Err(Errno::from(libc::EIO));
+                }
+            };
+            
+            let mut items = match self.db.list_children(parent).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("❌ Error listando hijos de {}: {}", parent, e);
+                    return Err(Errno::from(libc::EIO));
+                }
+            };
+
+            // Si es root, filtrar los que NO son propios
+            if parent == 1 {
+                let mut filtered = Vec::new();
+                for (inode, name, is_dir) in items {
+                    let attrs = self.db.get_attrs(inode).await.map_err(|_| Errno::from(libc::EIO))?;
+                    if attrs.owned_by_me {
+                        filtered.push((inode, name, is_dir));
+                    }
+                }
+                items = filtered;
             }
+
+            let real_count = items.len() as u64;
+            (items, real_count)
         };
         
-        // Total = hijos + 2 (por . y ..)
-        let total_entries = child_count + 2;
+        // Total = hijos + 2 (por . y ..) + (1 si es root por el SHARED)
+        let mut total_entries = child_count + 2;
+        if parent == 1 {
+            total_entries += 1;
+        }
         
         // Short-circuit: si ya consumieron todo, retornar vacío sin consultar DB
         if offset as u64 >= total_entries {
@@ -90,19 +132,15 @@ impl Filesystem for GDriveFS {
             });
         }
 
-        // 2. Solo si hay entradas por retornar, consultar los datos
-        let children = match self.db.list_children(parent).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("❌ Error listando hijos de {}: {}", parent, e);
-                return Err(Errno::from(libc::EIO));
-            }
-        };
-
-        // 3. Construir lista completa SIEMPRE (. y .. + hijos)
-        let mut entries: Vec<(u64, String, bool)> = Vec::with_capacity(children.len() + 2);
+        // 3. Construir lista completa SIEMPRE (. y .. + hijos + SHARED)
+        let mut entries: Vec<(u64, String, bool)> = Vec::with_capacity(children.len() + 3);
         entries.push((parent, ".".to_string(), true));
-        entries.push((1.max(parent), "..".to_string(), true));
+        entries.push((if parent == SHARED_INODE { 1 } else { 1.max(parent) }, "..".to_string(), true));
+        
+        if parent == 1 {
+            entries.push((SHARED_INODE, "SHARED".to_string(), true));
+        }
+
         entries.extend(children);
 
         // 4. Aplicar offset y generar stream
@@ -126,8 +164,34 @@ impl Filesystem for GDriveFS {
     // Buscar un archivo en un directorio (ls)
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> Result<ReplyEntry> {
         let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
-        // trace is enough for lookup
-        // tracing::info!("🔎 LOOKUP called: parent={} name={}", parent, name_str);
+        
+        // Caso especial: Lookup de SHARED en el root
+        if parent == 1 && name_str == "SHARED" {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            
+            return Ok(ReplyEntry {
+                ttl: Duration::from_secs(3600),
+                attr: FileAttr {
+                    ino: SHARED_INODE,
+                    size: 4096,
+                    blocks: 8,
+                    atime: Timestamp::new(now, 0),
+                    mtime: Timestamp::new(now, 0),
+                    ctime: Timestamp::new(now, 0),
+                    kind: FileType::Directory,
+                    perm: 0o755,
+                    nlink: 2,
+                    uid: unsafe { libc::getuid() },
+                    gid: unsafe { libc::getgid() },
+                    rdev: 0,
+                    blksize: 4096,
+                },
+                generation: 0,
+            });
+        }
 
         // Para archivos Workspace, el usuario busca con .html pero en DB está sin extensión
         let (lookup_name, is_html_lookup) = if name_str.ends_with(".html") {
@@ -137,7 +201,10 @@ impl Filesystem for GDriveFS {
         };
 
         // Consultar la base de datos
-        let inode = self.db.lookup(parent, lookup_name)
+        // Si el padre es SHARED_INODE, buscamos en el root (1) pero verificamos que sea SHARED
+        let search_parent = if parent == SHARED_INODE { 1 } else { parent };
+
+        let inode = self.db.lookup(search_parent, lookup_name)
             .await
             .map_err(|e| {
                 error!("Error en lookup: {}", e);
@@ -152,6 +219,17 @@ impl Filesystem for GDriveFS {
                 error!("Error obteniendo atributos para inode {}: {}", inode, e);
                 Errno::from(libc::EIO)
             })?;
+
+        // Lógica de visibilidad
+        if parent == 1 && !attrs.owned_by_me {
+            // Un archivo compartido en el root NO debe ser visible mediante lookup directo en /
+            return Err(Errno::from(libc::ENOENT));
+        }
+
+        if parent == SHARED_INODE && attrs.owned_by_me {
+            // Un archivo PROPIO no debe ser visible en SHARED/
+            return Err(Errno::from(libc::ENOENT));
+        }
 
         let mut file_attr = attrs.to_file_attr();
 
@@ -170,11 +248,11 @@ impl Filesystem for GDriveFS {
 
 
 
-        // LUCERO DIAGNOSTIC: Log detail for media files to check why OPEN is not called
+        // DIAGNOSTIC: Log detail for media files to check why OPEN is not called
         // We restore this to confirm if the kernel even LOOKUPS the file.
         if name_str.ends_with(".mp3") || name_str.ends_with(".mkv") || name_str.ends_with(".mp4") {
-             tracing::warn!("🔎 LOOKUP MEDIA: name={} inode={} size={} perm={:o} kind={:?}", 
-                           name_str, inode, file_attr.size, file_attr.perm, file_attr.kind);
+            //  tracing::warn!("🔎 LOOKUP MEDIA: name={} inode={} size={} perm={:o} kind={:?}", 
+            //                name_str, inode, file_attr.size, file_attr.perm, file_attr.kind);
         }
 
         // tracing::info!("✅ LOOKUP success: parent={} name={} -> inode={} size={} perm={:o} kind={:?}", parent, name_str, inode, file_attr.size, file_attr.perm, file_attr.kind);
@@ -189,6 +267,35 @@ impl Filesystem for GDriveFS {
     // Obtener atributos de un archivo (stat)
     async fn getattr(&self, _req: Request, inode: u64, _fh: Option<u64>, _flags: u32) -> Result<ReplyAttr> {
         // tracing::info!("📋 GETATTR called: inode={}", inode);
+
+        // Caso especial: Inodo virtual SHARED
+        if inode == SHARED_INODE {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            
+            let attr = FileAttr {
+                ino: SHARED_INODE,
+                size: 4096,
+                blocks: 8,
+                atime: Timestamp::new(now, 0),
+                mtime: Timestamp::new(now, 0),
+                ctime: Timestamp::new(now, 0),
+                kind: FileType::Directory,
+                perm: 0o755,
+                nlink: 2,
+                uid: unsafe { libc::getuid() },
+                gid: unsafe { libc::getgid() },
+                rdev: 0,
+                blksize: 4096,
+            };
+
+            return Ok(ReplyAttr {
+                ttl: Duration::from_secs(3600), // Directorio virtual estable
+                attr,
+            });
+        }
 
         let attrs = self.db.get_attrs(inode)
             .await
@@ -236,11 +343,11 @@ impl Filesystem for GDriveFS {
     }
     
     // Validar permisos de acceso (access)
-    async fn access(&self, _req: Request, inode: u64, mask: u32) -> Result<()> {
+    async fn access(&self, _req: Request, _inode: u64, mask: u32) -> Result<()> {
         if mask == 0 {
             return Ok(()); // F_OK check, ignore to reduce noise if needed, or log it.
         }
-        tracing::warn!("🛡️ WARNING access check: inode={} mask={:o}", inode, mask);
+        // tracing::warn!("🛡️ WARNING access check: inode={} mask={:o}", inode, mask);
         // Permitimos todo explícitamente para evitar problemas de permisos de kernel/sandbox
         Ok(())
     }
@@ -307,6 +414,11 @@ impl Filesystem for GDriveFS {
     async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
         tracing::trace!("📂 opendir: inode={}", inode);
         
+        // Caso especial: SHARED
+        if inode == SHARED_INODE {
+            return Ok(ReplyOpen { fh: 0, flags: 0 });
+        }
+
         // Verificar que el inode existe y es un directorio
         match self.db.get_attrs(inode).await {
             Ok(attrs) => {
@@ -327,9 +439,9 @@ impl Filesystem for GDriveFS {
 
 
     // Abrir archivo (open)
-    async fn open(&self, _req: Request, inode: u64, flags: u32) -> Result<ReplyOpen> {
-        // LUCERO DIAGNOSTIC: Log EARLY
-        tracing::warn!("🔓 OPEN request: inode={} flags={}", inode, flags);
+    async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
+        
+        // tracing::warn!("🔓 OPEN request: inode={} flags={}", inode, flags);
 
         // Validar que existe en DB y obtener metadatos
         let attrs = match self.db.get_attrs(inode).await {
@@ -352,6 +464,12 @@ impl Filesystem for GDriveFS {
         let is_workspace = attrs.mime_type.as_deref().map(shortcuts::is_workspace_file).unwrap_or(false);
 
         if attrs.size > 0 && !is_workspace {
+            // Guard: No reintentar descargas que ya fallaron con 403
+            if self.failed_downloads.contains(&inode) {
+                tracing::debug!("🚫 open() ignorado para inode={} (descarga 403 permanente)", inode);
+                return Ok(ReplyOpen { fh: 0, flags: 0 });
+            }
+
             // Obtener gdrive_id
             let gdrive_id = self.get_gdrive_id(inode).await.unwrap_or_default();
                 
@@ -363,10 +481,13 @@ impl Filesystem for GDriveFS {
                 let inode = inode;
 
                 let file_locks = self.file_locks.clone();
+                let history = self.history.clone();
+                let fuse_downloads = self.fuse_downloads.clone();
+                let failed_downloads = self.failed_downloads.clone();
 
                 // Fire-and-forget task: Streaming de fondo
                 tokio::spawn(async move {
-                     let _ = Self::start_background_download_stream(
+                     let result = Self::start_background_download_stream(
                          db,
                          drive_client,
                          inode,
@@ -374,7 +495,18 @@ impl Filesystem for GDriveFS {
                          cache_path,
                          file_size,
                          file_locks,
+                         history,
+                         fuse_downloads,
                      ).await;
+
+                     // Si el error contiene 403, marcar como fallo permanente
+                     if let Err(ref e) = result {
+                         let err_msg = format!("{}", e);
+                         if err_msg.contains("403") && err_msg.contains("cannot") {
+                             failed_downloads.insert(inode);
+                             tracing::warn!("🚫 Inode {} marcado como descarga prohibida (403 permanente)", inode);
+                         }
+                     }
                 });
                 
                 tracing::info!("🚀 Background streamer triggered for inode={} size={}", inode, file_size);
@@ -501,8 +633,19 @@ impl Filesystem for GDriveFS {
         
         // 3a. Asegurar que el rango solicitado esté disponible (Solo si no es Workspace Docs)
         if file_size > 0 && !is_workspace {
+            // Guard: No reintentar descargas que ya fallaron con 403
+            if self.failed_downloads.contains(&inode) {
+                tracing::debug!("🚫 read() bloqueado para inode={} (descarga 403 permanente)", inode);
+                return Err(Errno::from(libc::EIO));
+            }
+
             // Descargar solo lo necesario
             if let Err(e) = self.ensure_range_cached(inode, &gdrive_id, offset, size, file_size as u64).await {
+                let err_msg = format!("{}", e);
+                if err_msg.contains("403") && err_msg.contains("cannot") {
+                    self.failed_downloads.insert(inode);
+                    tracing::warn!("🚫 Inode {} marcado como descarga prohibida (403 en read)", inode);
+                }
                 error!("Error descargando chunk para inode {}: {}", inode, e);
                 return Err(Errno::from(libc::EIO));
             }
@@ -550,17 +693,45 @@ impl Filesystem for GDriveFS {
 
         let db = self.db.clone();
         
-        // 1. Verificación temprana: obtener conteo sin cargar datos
-        let child_count = match db.count_children(parent).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("❌ Error contando hijos de {}: {}", parent, e);
-                return Err(Errno::from(libc::EIO));
+        // 1. Carga de datos
+        let (children, child_count) = if parent == SHARED_INODE {
+             let items = db.list_non_owned_root_children().await
+                .map_err(|e| {
+                    error!("❌ Error listando compartidos (plus): {}", e);
+                    Errno::from(libc::EIO)
+                })?;
+            let count = items.len() as u64;
+            (items, count)
+        } else {
+            let mut items = match db.list_children_extended(parent).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("❌ Error listando hijos de {}: {}", parent, e);
+                    return Err(Errno::from(libc::EIO));
+                }
+            };
+
+            // Filtrar si es root
+            if parent == 1 {
+                let mut filtered = Vec::new();
+                for item in items {
+                    let attrs = db.get_attrs(item.0).await.map_err(|_| Errno::from(libc::EIO))?;
+                    if attrs.owned_by_me {
+                        filtered.push(item);
+                    }
+                }
+                items = filtered;
             }
+
+            let real_count = items.len() as u64;
+            (items, real_count)
         };
         
-        // Total = hijos + 2 (por . y ..)
-        let total_entries = child_count + 2;
+        // Total = hijos + 2 (por . y ..) + (1 si es root por el SHARED)
+        let mut total_entries = child_count + 2;
+        if parent == 1 {
+            total_entries += 1;
+        }
         
         // Short-circuit: si ya consumieron todo, retornar vacío sin consultar DB
         if offset >= total_entries {
@@ -570,20 +741,15 @@ impl Filesystem for GDriveFS {
             });
         }
 
-        // 2. Solo si hay entradas por retornar, consultar los datos
-        let children = match db.list_children_extended(parent).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("❌ Error listando hijos de {}: {}", parent, e);
-                return Err(Errno::from(libc::EIO));
-            }
-        };
-
-        // 3. Construir lista completa SIEMPRE (. y .. + hijos)
+        // 3. Construir lista completa SIEMPRE (. y .. + hijos + SHARED)
         let mut final_entries: Vec<(u64, String, bool, Option<String>, Option<String>)> = 
-            Vec::with_capacity(children.len() + 2);
+            Vec::with_capacity(children.len() + 3);
         final_entries.push((parent, ".".to_string(), true, None, None));
-        final_entries.push((1.max(parent), "..".to_string(), true, None, None));
+        final_entries.push((if parent == SHARED_INODE { 1 } else { 1.max(parent) }, "..".to_string(), true, None, None));
+
+        if parent == 1 {
+            final_entries.push((SHARED_INODE, "SHARED".to_string(), true, None, None));
+        }
 
         for (inode, name, is_dir, mime, gdrive_id) in children {
             final_entries.push((inode, name, is_dir, mime, Some(gdrive_id)));
@@ -596,7 +762,27 @@ impl Filesystem for GDriveFS {
             .then(move |(index, (inode, name, is_dir, mime, gdrive_id))| {
                 let db_clone = db.clone();
                 async move {
-                    let mut attr = if let Ok(a) = db_clone.get_attrs(inode).await {
+                    let mut attr = if inode == SHARED_INODE {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64;
+                        FileAttr {
+                            ino: SHARED_INODE,
+                            size: 4096,
+                            blocks: 8,
+                            atime: Timestamp::new(now, 0),
+                            mtime: Timestamp::new(now, 0),
+                            ctime: Timestamp::new(now, 0),
+                            kind: FileType::Directory,
+                            perm: 0o755,
+                            nlink: 2,
+                            uid: unsafe { libc::getuid() },
+                            gid: unsafe { libc::getgid() },
+                            rdev: 0,
+                            blksize: 4096,
+                        }
+                    } else if let Ok(a) = db_clone.get_attrs(inode).await {
                         a.to_file_attr()
                     } else {
                         // Si no hay atributos, crear unos por defecto
@@ -614,13 +800,14 @@ impl Filesystem for GDriveFS {
                             mime_type: None,
                             can_move: true,
                             shared: false,
+                            owned_by_me: true,
                         }.to_file_attr()
                     };
 
                     // Ajustar nombre y tamaño para archivos Workspace - SOLO para ARCHIVOS, no carpetas
                     // Añadimos .html porque Nautilus 3.30+ abre .desktop desde FUSE como texto
                     let mut display_name = name.clone();
-                    if !is_dir {
+                    if !is_dir && inode != SHARED_INODE {
                         if let (Some(m), Some(gid)) = (&mime, &gdrive_id) {
                             if shortcuts::is_workspace_file(m) {
                                 display_name = format!("{}.html", name);
@@ -635,7 +822,7 @@ impl Filesystem for GDriveFS {
                     Ok(DirectoryEntryPlus {
                         inode,
                         generation: 0,
-                        kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
+                        kind: if is_dir || inode == SHARED_INODE { FileType::Directory } else { FileType::RegularFile },
                         name: display_name.into(),
                         offset: (offset as i64 + index as i64 + 1),
                         attr,
@@ -661,12 +848,17 @@ impl Filesystem for GDriveFS {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        flags: u32,
+        _flags: u32,
     ) -> Result<ReplyCreated> {
         let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
-        tracing::trace!("✏️ create: parent={} name={} mode={:o} flags={}", parent, name_str, mode, flags);
+        tracing::info!("📝 CREATE request: parent={} name={} mode={:o}", parent, name_str, mode);
 
-        // Generar un gdrive_id temporal (será reemplazado al subir)
+        // Caso especial: SHARED es de solo lectura
+        if parent == SHARED_INODE {
+            return Err(Errno::from(libc::EROFS));
+        }
+
+        // Generar un gdrive_id temporal para el nuevo archivo (será reemplazado al subir)
         let temp_gdrive_id = format!("temp_{}", uuid::Uuid::new_v4());
         
         // Crear inode en la DB
@@ -692,6 +884,7 @@ impl Filesystem for GDriveFS {
             Some("application/octet-stream"),
             true, // can_move
             false, // shared (inicialmente falso)
+            true, // owned_by_me (archivos creados localmente)
         ).await.map_err(|e| {
             error!("Error insertando metadatos: {}", e);
             Errno::from(libc::EIO)
@@ -740,6 +933,11 @@ impl Filesystem for GDriveFS {
         let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
         debug!("📂 mkdir: parent={} name={} mode={:o}", parent, name_str, mode);
 
+        // Caso especial: SHARED es de solo lectura
+        if parent == SHARED_INODE {
+            return Err(Errno::from(libc::EROFS));
+        }
+
         // Generar un gdrive_id temporal
         let temp_gdrive_id = format!("temp_{}", uuid::Uuid::new_v4());
         
@@ -769,6 +967,7 @@ impl Filesystem for GDriveFS {
             Some("application/vnd.google-apps.folder"),
             true, // can_move
             false, // shared
+            true, // owned_by_me
         ).await.map_err(|e| {
             error!("Error insertando metadatos de directorio: {}", e);
             Errno::from(libc::EIO)
@@ -997,9 +1196,14 @@ impl Filesystem for GDriveFS {
         name: &OsStr,
     ) -> Result<()> {
         let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
-        debug!("🗑️ unlink: parent={} name={}", parent, name_str);
+        tracing::info!("🗑️ UNLINK: parent={} name={}", parent, name_str);
 
-        // Buscar el archivo
+        // Caso especial: SHARED es de solo lectura
+        if parent == SHARED_INODE {
+            return Err(Errno::from(libc::EROFS));
+        }
+
+        // 1. Resolver el archivo para obtener su inode
         let inode = self.db.lookup(parent, name_str).await
             .map_err(|_| Errno::from(libc::EIO))?
             .ok_or(Errno::from(libc::ENOENT))?;
@@ -1039,12 +1243,17 @@ impl Filesystem for GDriveFS {
         new_parent: u64,
         new_name: &OsStr,
     ) -> Result<()> {
-        let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
-        let new_name_str = new_name.to_str().ok_or(Errno::from(libc::EINVAL))?;
-        debug!("🔄 rename: parent={} name={} -> new_parent={} new_name={}", 
-               parent, name_str, new_parent, new_name_str);
+        let name_str = name.to_str().unwrap_or("???");
+        let new_name_str = new_name.to_str().unwrap_or("???");
+        tracing::info!("🔄 RENAME: parent={} name={} -> new_parent={} new_name={}", 
+                      parent, name_str, new_parent, new_name_str);
 
-        // Buscar el inode del archivo origen
+        // Caso especial: SHARED es de solo lectura
+        if parent == SHARED_INODE || new_parent == SHARED_INODE {
+            return Err(Errno::from(libc::EROFS));
+        }
+
+        // 1. Obtener inode origen
         let inode = self.db.lookup(parent, name_str).await
             .map_err(|_| Errno::from(libc::EIO))?
             .ok_or(Errno::from(libc::ENOENT))?;
@@ -1447,8 +1656,21 @@ impl GDriveFS {
         cache_path: std::path::PathBuf,
         file_size: u64,
         file_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+        history: Arc<ActionHistory>,
+        fuse_downloads_map: Arc<tokio::sync::Mutex<HashMap<u64, u64>>>,
     ) -> anyhow::Result<()> {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+        // --- QUICK CACHE CHECK ---
+        // Verificar instantáneamente si el archivo ya está 100% descargado
+        if file_size > 0 {
+            let total_missing = db.get_missing_ranges(inode, 0, file_size - 1).await.unwrap_or_default();
+            if total_missing.is_empty() {
+                // El archivo ya está local, ni siquiera iniciamos el streamer o creamos transfer.
+                tracing::debug!("✅ Archivo ({}) previamente cacheado. Streaming abortado.", file_size);
+                return Ok(());
+            }
+        }
 
         // Crear directorio de caché si no existe
         if let Some(parent) = cache_path.parent() {
@@ -1473,8 +1695,30 @@ impl GDriveFS {
         .await?
         .unwrap_or_else(|| format!("file_{}", inode));
 
-        // Para FUSE progresivo, el transfer_id podría colisionar o compartir con ensure_range_cached.
-        // Haremos que el transfer explícito sea gestionado allí, pero aquí lo actualizamos
+        // --- FUSE DOWNLOAD PROGRESS TRACKING ---
+        let transfer_id;
+        let mut f_dls = fuse_downloads_map.lock().await;
+
+        if let Some(existing_t_id) = f_dls.get(&inode) {
+            transfer_id = Some(*existing_t_id);
+        } else {
+            let t_id = history.start_transfer(
+                &file_name,
+                TransferOp::Download,
+                file_size
+            );
+            f_dls.insert(inode, t_id);
+            transfer_id = Some(t_id);
+        }
+
+        if let Some(t_id) = transfer_id {
+            if let Ok(cached_bytes) = db.get_cached_bytes_count(inode).await {
+                history.update_transfer_progress(t_id, cached_bytes);
+            }
+        }
+        
+        drop(f_dls); // Liberar lock antes de las tareas largas en red
+
         tracing::info!("🚀 Iniciando streaming en background para archivo grande: {} ({} bytes)", file_name, file_size);
 
         // Bloques grandes para maximizar la velocidad (2MB)
@@ -1507,6 +1751,8 @@ impl GDriveFS {
                 }
 
                 let file_locks_clone = file_locks.clone();
+                let history_clone = history.clone();
+                let tid_clone = transfer_id;
                 
                 let task = tokio::spawn(async move {
                     for (m_start, m_end) in missing {
@@ -1532,6 +1778,13 @@ impl GDriveFS {
                         file.flush().await?;
                         
                         db_clone.add_cached_chunk(inode, m_start, m_end).await?;
+                        
+                        // Actualizar UI
+                        if let Some(t_id) = tid_clone {
+                             if let Ok(cached_bytes) = db_clone.get_cached_bytes_count(inode).await {
+                                  history_clone.update_transfer_progress(t_id, cached_bytes);
+                             }
+                        }
                     }
                     Ok::<_, anyhow::Error>(())
                 });

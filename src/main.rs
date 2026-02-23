@@ -209,6 +209,18 @@ pub fn run_backend(
         // Reemplaza a LocalSyncManager
         // SE INICIA AHORA, con FUSE ya montado.
         tracing::info!("Iniciando MirrorManager (Arquitectura Espejo)...");
+
+        // SINCRONIZAR propiedad ANTES del bootstrap del espejo para evitar race condition:
+        if let Ok(None) = db.get_sync_meta("repair_ownership_done_v2").await {
+            tracing::info!("⚙️ Verificando consistencia de propiedad para limpieza de redundancias...");
+            if let Err(e) = sync::bootstrap::repair_ownership_metadata(&db, &drive_client).await {
+                tracing::error!("❌ Error reparando propiedad: {:?}", e);
+            } else {
+                let _ = db.set_sync_meta("repair_ownership_done_v2", "true").await;
+                tracing::info!("✅ Reparación de propiedad v2 completada");
+            }
+        }
+
         let (mirror_manager, mirror_sender) = mirror::MirrorManager::new(
             db.clone(),
             config.mirror_path.clone(),
