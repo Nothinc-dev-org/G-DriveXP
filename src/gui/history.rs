@@ -24,6 +24,7 @@ pub enum ActionType {
     Delete,
     Conflict,
     Error,
+    Stream,
 }
 
 impl ActionType {
@@ -37,6 +38,7 @@ impl ActionType {
             ActionType::Delete => "🗑️",
             ActionType::Conflict => "⚠️",
             ActionType::Error => "❌",
+            ActionType::Stream => "🎬",
         }
     }
 }
@@ -46,6 +48,7 @@ impl ActionType {
 pub enum TransferOp {
     Upload,
     Download,
+    Stream,
 }
 
 impl TransferOp {
@@ -53,6 +56,7 @@ impl TransferOp {
         match self {
             TransferOp::Upload => "📤",
             TransferOp::Download => "📥",
+            TransferOp::Stream => "🎬",
         }
     }
 }

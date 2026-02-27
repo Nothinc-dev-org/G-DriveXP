@@ -5,7 +5,7 @@
 use ksni::{menu::*, Tray, TrayService, ToolTip};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use super::history::ActionHistory;
+use super::history::{ActionHistory, TransferOp};
 
 
 
@@ -99,8 +99,10 @@ impl Tray for GDriveXPTray {
         let has_pending_downloads = progress.changes_detected != progress.changes_applied;
         let has_pending_uploads = progress.pending_uploads > 0;
 
+        let has_active_real_transfers = active_transfers.iter().any(|t| t.operation != TransferOp::Stream);
+
         // Determinar estado de sincronización
-        if !active_transfers.is_empty() || has_pending_downloads || has_pending_uploads {
+        if has_active_real_transfers || has_pending_downloads || has_pending_uploads {
             items.push(StandardItem {
                 label: "🔄 Syncronizando".to_string(),
                 enabled: false,
@@ -121,9 +123,10 @@ impl Tray for GDriveXPTray {
                     ..Default::default()
                 }.into());
             }
-            if !active_transfers.is_empty() {
+            let non_stream_transfers: Vec<_> = active_transfers.iter().filter(|t| t.operation != TransferOp::Stream).collect();
+            if !non_stream_transfers.is_empty() {
                 items.push(StandardItem {
-                    label: format!("{} transferencias activas", active_transfers.len()),
+                    label: format!("{} transferencias activas", non_stream_transfers.len()),
                     enabled: false,
                     ..Default::default()
                 }.into());

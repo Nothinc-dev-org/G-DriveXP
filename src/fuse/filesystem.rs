@@ -22,10 +22,13 @@ pub struct GDriveFS {
     drive_client: Arc<DriveClient>,
     cache_dir: std::path::PathBuf,
     history: Arc<ActionHistory>,
-    fuse_downloads: Arc<tokio::sync::Mutex<HashMap<u64, u64>>>,
+    /// Inodes que tienen un descargo activo en FUSE (Map de Inode -> (Transfer ID, Open Count))
+    fuse_downloads: Arc<tokio::sync::Mutex<HashMap<u64, (u64, usize)>>>,
     file_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     /// Inodes que recibieron 403 permanente de Drive API (no reintentar)
     failed_downloads: Arc<DashSet<u64>>,
+    /// Seguimiento de la última posición de lectura por inodo (para Smart Streamer)
+    read_offsets: Arc<DashMap<u64, u64>>,
 }
 
 impl GDriveFS {
@@ -43,6 +46,7 @@ impl GDriveFS {
             fuse_downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             file_locks: Arc::new(DashMap::new()),
             failed_downloads: Arc::new(DashSet::new()),
+            read_offsets: Arc::new(DashMap::new()),
         }
     }
 }
@@ -453,9 +457,11 @@ impl Filesystem for GDriveFS {
         };
 
         // Filtered detail logging
-        let is_audio = attrs.mime_type.as_deref().map(|m| m.starts_with("audio/")).unwrap_or(false);
-        if is_audio {
-             tracing::warn!("🔓 OPEN details: inode={} mime={:?} size={}", inode, attrs.mime_type, attrs.size);
+        let mime_lower = attrs.mime_type.as_deref().unwrap_or("").to_lowercase();
+        let is_media = mime_lower.starts_with("video/") || mime_lower.starts_with("audio/");
+        
+        if is_media {
+             tracing::warn!("🎬 OPEN media detected: inode={} mime={} size={}", inode, mime_lower, attrs.size);
         }
 
         // SMART PREFETCH:
@@ -484,6 +490,7 @@ impl Filesystem for GDriveFS {
                 let history = self.history.clone();
                 let fuse_downloads = self.fuse_downloads.clone();
                 let failed_downloads = self.failed_downloads.clone();
+                let read_offsets = self.read_offsets.clone();
 
                 // Fire-and-forget task: Streaming de fondo
                 tokio::spawn(async move {
@@ -497,6 +504,8 @@ impl Filesystem for GDriveFS {
                          file_locks,
                          history,
                          fuse_downloads,
+                         read_offsets,
+                         is_media,
                      ).await;
 
                      // Si el error contiene 403, marcar como fallo permanente
@@ -529,9 +538,17 @@ impl Filesystem for GDriveFS {
         tracing::trace!("release: inode={}", inode);
         
         let mut fuse_downloads = self.fuse_downloads.lock().await;
-        if let Some(t_id) = fuse_downloads.remove(&inode) {
-            self.history.complete_transfer(t_id);
-            tracing::debug!("✅ Transfer FUSE completado y removido de la interfaz: inode={}", inode);
+        let mut should_remove = false;
+        if let Some(entry) = fuse_downloads.get_mut(&inode) {
+            entry.1 = entry.1.saturating_sub(1);
+            if entry.1 == 0 {
+                should_remove = true;
+                self.history.complete_transfer(entry.0);
+                tracing::debug!("✅ Transfer FUSE completado y removido de la interfaz: inode={}", inode);
+            }
+        }
+        if should_remove {
+            fuse_downloads.remove(&inode);
         }
 
         Ok(())
@@ -598,6 +615,9 @@ impl Filesystem for GDriveFS {
         } else {
              // tracing::info!("📖 READ called: inode={} offset={} size={}", inode, offset, size);
         }
+
+        // GUARDAR OFFSET DE LECTURA para el Smart Streamer
+        self.read_offsets.insert(inode, offset + size as u64);
 
         // 2. Si es archivo de Google Workspace, generar .desktop file on-the-fly
         if let Some(ref mime) = mime_type {
@@ -1375,9 +1395,14 @@ impl GDriveFS {
     ) -> anyhow::Result<()> {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
         
-        // Calcular el rango solicitado (ajustado al tamaño del archivo)
-        let requested_start = offset;
-        let requested_end = (offset + size as u64 - 1).min(file_size.saturating_sub(1));
+        // SMART BURST: Alinear el rango solicitado a bloques de 2MB para evitar micro-descargas asfixiantes
+        const BURST_SIZE: u64 = 2 * 1024 * 1024; // 2MB
+        let aligned_start = (offset / BURST_SIZE) * BURST_SIZE;
+        let aligned_end_raw = ((offset + size as u64 + BURST_SIZE - 1) / BURST_SIZE) * BURST_SIZE - 1;
+        let aligned_end = aligned_end_raw.min(file_size.saturating_sub(1));
+
+        let requested_start = aligned_start;
+        let requested_end = aligned_end;
         
         if requested_start >= file_size {
             return Ok(()); // Fuera de rango, nada que hacer
@@ -1394,7 +1419,7 @@ impl GDriveFS {
              let file_size = meta.map(|m| m.len()).unwrap_or(0);
              let max_cached = self.db.get_max_cached_offset(inode).await.unwrap_or(0);
 
-             tracing::info!("🔍 Zombie Check: inode={} exists=true size={} max_cached_chunk={} has_chunks={}", 
+             tracing::trace!("🔍 Zombie Check: inode={} exists=true size={} max_cached_chunk={} has_chunks={}", 
                            inode, file_size, max_cached, has_chunks);
              
              // Caso 1: Archivo existe pero DB dice que no hay chunks -> Zombie (borrar archivo)
@@ -1445,7 +1470,7 @@ impl GDriveFS {
         let transfer_id;
         let mut fuse_downloads = self.fuse_downloads.lock().await;
 
-        if let Some(existing_t_id) = fuse_downloads.get(&inode) {
+        if let Some((existing_t_id, _)) = fuse_downloads.get(&inode) {
             // Ya hay un transfer en curso
             transfer_id = Some(*existing_t_id);
         } else {
@@ -1457,7 +1482,7 @@ impl GDriveFS {
                 TransferOp::Download,
                 file_size
             );
-            fuse_downloads.insert(inode, t_id);
+            fuse_downloads.insert(inode, (t_id, 1));
             transfer_id = Some(t_id);
         }
 
@@ -1657,7 +1682,9 @@ impl GDriveFS {
         file_size: u64,
         file_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
         history: Arc<ActionHistory>,
-        fuse_downloads_map: Arc<tokio::sync::Mutex<HashMap<u64, u64>>>,
+        fuse_downloads_map: Arc<tokio::sync::Mutex<HashMap<u64, (u64, usize)>>>,
+        read_offsets: Arc<DashMap<u64, u64>>,
+        is_media: bool,
     ) -> anyhow::Result<()> {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -1699,15 +1726,19 @@ impl GDriveFS {
         let transfer_id;
         let mut f_dls = fuse_downloads_map.lock().await;
 
-        if let Some(existing_t_id) = f_dls.get(&inode) {
-            transfer_id = Some(*existing_t_id);
+        if let Some((existing_t_id, count)) = f_dls.get_mut(&inode) {
+            *count += 1;
+            let _ = existing_t_id; // Marcar como usado para el compilador si fuese necesario
+            tracing::debug!("Background streamer ya activo para inode={} (open count: {}). Abortando duplicado.", inode, count);
+            return Ok(());
         } else {
+            let op = if is_media { TransferOp::Stream } else { TransferOp::Download };
             let t_id = history.start_transfer(
                 &file_name,
-                TransferOp::Download,
+                op,
                 file_size
             );
-            f_dls.insert(inode, t_id);
+            f_dls.insert(inode, (t_id, 1));
             transfer_id = Some(t_id);
         }
 
@@ -1719,90 +1750,143 @@ impl GDriveFS {
         
         drop(f_dls); // Liberar lock antes de las tareas largas en red
 
-        tracing::info!("🚀 Iniciando streaming en background para archivo grande: {} ({} bytes)", file_name, file_size);
+        tracing::info!("🚀 Iniciando {} inteligente para: {} ({} bytes)", 
+                      if is_media { "streaming" } else { "descarga" }, file_name, file_size);
 
         // Bloques grandes para maximizar la velocidad (2MB)
         const CHUNK_SIZE: u64 = 2 * 1024 * 1024; 
-        const MAX_CONCURRENT: usize = 4; // 4 descargas en paralelo = 8MB/s por archivo max
+        const MAX_CONCURRENT: usize = 4;
+        const MEDIA_PREFETCH_LIMIT: u64 = 20 * 1024 * 1024; // 20MB de buffer para media
         
-        // Calcular rangos que debemos iterar
-        let mut chunks: Vec<(u64, u64)> = Vec::new();
-        let mut offset = 0u64;
-        while offset < file_size {
-            let end = (offset + CHUNK_SIZE - 1).min(file_size - 1);
-            chunks.push((offset, end));
-            offset = end + 1;
-        }
+        let mut _iteration = 0;
         
-        // Descargar iterativamente en lotes de MAX_CONCURRENT
-        for batch in chunks.chunks(MAX_CONCURRENT) {
-            let mut download_tasks = Vec::new();
+        // El Smart Streamer itera buscando qué descargar basándose en el puntero de lectura
+        loop {
+            // VERIFICACIÓN ZOMBI: Asegurar que FUSE todavía tiene abierto este archivo
+            let is_active = fuse_downloads_map.lock().await.contains_key(&inode);
+            if !is_active {
+                tracing::debug!("El inode {} fue cerrado. Abortando streamer background (zombi dead).", inode);
+                break;
+            }
 
-            for &(start, end) in batch {
-                let db_clone = db.clone();
-                let client_clone = drive_client.clone();
-                let gdrive_id_clone = gdrive_id.clone();
-                let cache_path_clone = cache_path.clone();
-
-                // Revisar rápidamente si ESTE chunk específico ya está cacheado
-                let missing = db_clone.get_missing_ranges(inode, start, end).await.unwrap_or_default();
-                if missing.is_empty() {
-                    continue; // Chunk ya existe, pasamos al siguiente
+            // 1. Determinar el inicio de la descarga (basado en el offset actual del usuario o 0)
+            let user_offset = *read_offsets.get(&inode).as_deref().unwrap_or(&0);
+            
+            // 2. Buscar rangos faltantes a partir del offset del usuario
+            let missing_ranges = db.get_missing_ranges(inode, user_offset, file_size.saturating_sub(1)).await?;
+            
+            // Si no hay nada más que descargar desde aquí, o ya terminamos el archivo
+            if missing_ranges.is_empty() {
+                // Si todavía faltan partes al inicio del archivo (antes del puntero del usuario), ir por ellas
+                let early_missing = db.get_missing_ranges(inode, 0, user_offset.saturating_sub(1)).await?;
+                if early_missing.is_empty() {
+                    break; // Archivo 100% completo
                 }
-
-                let file_locks_clone = file_locks.clone();
-                let history_clone = history.clone();
-                let tid_clone = transfer_id;
                 
-                let task = tokio::spawn(async move {
-                    for (m_start, m_end) in missing {
-                        let m_size = (m_end - m_start + 1) as u32;
-                        tracing::debug!("📥 Streamer Background descargando: {}-{}", m_start, m_end);
+                // Si es media y ya descargamos todo a partir del puntero, descansamos un poco
+                if is_media {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+            }
+
+            // 3. Priorizar los primeros N chunks basándose en el puntero
+            let mut pending_chunks = Vec::new();
+            let mut data_to_fetch = 0;
+            
+            for (start, end) in missing_ranges {
+                let s_aligned = (start / CHUNK_SIZE) * CHUNK_SIZE;
+                let mut current = s_aligned;
+                
+                while current <= end {
+                    let c_end = (current + CHUNK_SIZE - 1).min(file_size - 1);
+                    
+                    // Verificar si este mini-chunk está realmente faltante
+                    let m = db.get_missing_ranges(inode, current, c_end).await?;
+                    if !m.is_empty() {
+                        pending_chunks.push((current, c_end));
+                        data_to_fetch += c_end - current + 1;
+                    }
+                    
+                    current += CHUNK_SIZE;
+                    
+                    // Límite de buffer para media para no asfixiar la red
+                    if is_media && data_to_fetch > MEDIA_PREFETCH_LIMIT {
+                        break;
+                    }
+                }
+                
+                if is_media && data_to_fetch > MEDIA_PREFETCH_LIMIT {
+                    break;
+                }
+                
+                if !is_media && pending_chunks.len() >= 20 { // 40MB per iteration for normal files
+                    break;
+                }
+            }
+
+            // Si no hay chunks inmediatos, pero el archivo no está completo, quizás el usuario saltó adelante
+            if pending_chunks.is_empty() {
+                 // Intentar de nuevo desde 0 si no hay progreso después de un salto
+                 let all_missing = db.get_missing_ranges(inode, 0, file_size.saturating_sub(1)).await?;
+                 if all_missing.is_empty() { break; }
+                 
+                 // Pequeña espera para evitar bucle infinito agresivo
+                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                 continue;
+            }
+
+            // 4. Descargar el lote actual
+            for batch in pending_chunks.chunks(MAX_CONCURRENT) {
+                let mut download_tasks = Vec::new();
+                for &(start, end) in batch {
+                    let db_clone = db.clone();
+                    let client_clone = drive_client.clone();
+                    let gdrive_id_clone = gdrive_id.clone();
+                    let cache_path_clone = cache_path.clone();
+                    let file_locks_clone = file_locks.clone();
+                    let history_clone = history.clone();
+                    let tid_clone = transfer_id;
+
+                    download_tasks.push(tokio::spawn(async move {
+                        let m_size = (end - start + 1) as u32;
+                        let data = client_clone.download_chunk(&gdrive_id_clone, start, m_size).await?;
                         
-                        let data = client_clone.download_chunk(&gdrive_id_clone, m_start, m_size).await?;
-                        
-                        // OBTENER LOCK ANTES DE MUTAR EL ARCHIVO CONJUNTO
                         let inode_lock = file_locks_clone
                             .entry(inode)
                             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                             .clone();
-                            
                         let _guard = inode_lock.lock().await;
 
-                        let mut file = tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&cache_path_clone)
-                            .await?;
-                        file.seek(std::io::SeekFrom::Start(m_start)).await?;
+                        let mut file = tokio::fs::OpenOptions::new().write(true).open(&cache_path_clone).await?;
+                        file.seek(std::io::SeekFrom::Start(start)).await?;
                         file.write_all(&data).await?;
                         file.flush().await?;
                         
-                        db_clone.add_cached_chunk(inode, m_start, m_end).await?;
-                        
-                        // Actualizar UI
+                        db_clone.add_cached_chunk(inode, start, end).await?;
                         if let Some(t_id) = tid_clone {
-                             if let Ok(cached_bytes) = db_clone.get_cached_bytes_count(inode).await {
-                                  history_clone.update_transfer_progress(t_id, cached_bytes);
+                             if let Ok(cb) = db_clone.get_cached_bytes_count(inode).await {
+                                  history_clone.update_transfer_progress(t_id, cb);
                              }
                         }
-                    }
-                    Ok::<_, anyhow::Error>(())
-                });
+                        Ok::<_, anyhow::Error>(())
+                    }));
+                }
                 
-                download_tasks.push(task);
+                for res in futures_util::future::join_all(download_tasks).await {
+                    if let Err(e) = res { tracing::error!("Task panic: {}", e); }
+                }
             }
             
-            // Esperar a que el lote complete
-            for result in futures_util::future::join_all(download_tasks).await {
-                match result {
-                    Ok(Ok(_)) => {},
-                    Ok(Err(e)) => tracing::error!("❌ Error en Background Streamer: {}", e),
-                    Err(e) => tracing::error!("❌ Panic en Background Streamer: {}", e),
-                }
+            _iteration += 1;
+            
+            // Si es media, pausar para permitir que el reproductor consuma
+            if is_media {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             }
         }
         
-        tracing::info!("✅ Streaming background completado: {}", file_name);
+        tracing::info!("✅ {} inteligente completado para: {}", 
+                      if is_media { "Streaming" } else { "Descarga" }, file_name);
         Ok(())
     }
 }

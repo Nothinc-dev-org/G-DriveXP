@@ -43,8 +43,9 @@ impl AppModel {
     fn sync_hint_text(&self) -> String {
         let has_pending_downloads = self.sync_detected != self.sync_applied;
         let has_pending_uploads = self.pending_uploads > 0;
+        let has_active_real_transfers = self.active_transfers.iter().any(|t| t.operation != TransferOp::Stream);
         
-        if !self.active_transfers.is_empty() || has_pending_downloads || has_pending_uploads {
+        if has_active_real_transfers || has_pending_downloads || has_pending_uploads {
             if has_pending_downloads {
                 format!("{}/{} Cambios aplicados", self.sync_applied, self.sync_detected)
             } else if has_pending_uploads {
@@ -366,14 +367,14 @@ impl Component for AppModel {
                                         add_prefix = &gtk::Image {
                                             #[watch]
                                             set_icon_name: Some(
-                                                if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                                if model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                                     "emblem-synchronizing-symbolic"
                                                 } else {
                                                     "emblem-ok-symbolic"
                                                 }
                                             ),
                                             #[watch]
-                                            set_css_classes: if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                            set_css_classes: if model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                                 &["accent"]
                                             } else {
                                                 &["success"]
@@ -515,14 +516,14 @@ impl Component for AppModel {
                                 add_prefix = &gtk::Image {
                                     #[watch]
                                     set_icon_name: Some(
-                                        if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                        if model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                             "emblem-synchronizing-symbolic"
                                         } else {
                                             "emblem-ok-symbolic"
                                         }
                                     ),
                                     #[watch]
-                                    set_css_classes: if !model.active_transfers.is_empty() || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                    set_css_classes: if model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                         &["accent"]
                                     } else {
                                         &["success"]
@@ -898,7 +899,7 @@ impl Component for AppModel {
                 }
                 if let Some(ref downloads_box) = self.downloads_listbox {
                     let downloads: Vec<&ActiveTransfer> = self.active_transfers.iter()
-                        .filter(|t| t.operation == TransferOp::Download).collect();
+                        .filter(|t| t.operation == TransferOp::Download).collect(); // Esto ya filtra por Download (excluyendo Stream)
                     Self::rebuild_transfers_box(downloads_box, &downloads);
                 }
                 if let Some(ref history_box) = self.history_listbox {

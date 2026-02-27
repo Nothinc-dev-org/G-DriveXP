@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{info, error, warn};
 
 use crate::db::MetadataRepository;
-use crate::gui::history::{ActionHistory, ActionType};
+use crate::gui::history::{ActionHistory, ActionType, TransferOp};
 
 /// Comandos para el MirrorManager (desde IPC o GUI)
 #[derive(Debug)]
@@ -561,10 +561,33 @@ impl MirrorManager {
         let fuse_path_clone = fuse_path.clone();
         let tmp_path_copy = tmp_path.clone();
         
+        let total_bytes = tokio::fs::metadata(&fuse_path).await.map(|m| m.len()).unwrap_or(0);
+        let transfer_id = ctx.history.start_transfer(file_name.to_string(), TransferOp::Download, total_bytes);
+        let history_clone = ctx.history.clone();
+        
         tracing::debug!("🪞 Copiando {:?} -> {:?}", fuse_path, tmp_path);
         let copy_result = tokio::task::spawn_blocking(move || {
-            std::fs::copy(&fuse_path_clone, &tmp_path_copy)
+            use std::io::{Read, Write};
+            let mut src = std::fs::File::open(&fuse_path_clone)?;
+            let mut dst = std::fs::File::create(&tmp_path_copy)?;
+            
+            let mut buffer = vec![0u8; 2 * 1024 * 1024]; // 2MB buffer
+            let mut copied = 0u64;
+            
+            loop {
+                let n = src.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                dst.write_all(&buffer[..n])?;
+                copied += n as u64;
+                history_clone.update_transfer_progress(transfer_id, copied);
+            }
+            dst.sync_all()?;
+            Ok::<u64, std::io::Error>(copied)
         }).await;
+        
+        ctx.history.complete_transfer(transfer_id);
         
         match copy_result {
             Ok(Ok(_)) => {
