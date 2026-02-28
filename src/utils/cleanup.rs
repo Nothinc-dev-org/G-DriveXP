@@ -21,29 +21,21 @@ pub fn perform_hard_reset() -> Result<()> {
     let tokens_path = PathBuf::from(format!("{}/.config/fedoradrive/tokens.json", home));
     let cache_dir = PathBuf::from(format!("{}/.cache/fedoradrive", home));
     let mirror_dir = PathBuf::from(format!("{}/GoogleDrive", home));
-    let mount_point = PathBuf::from(format!("{}/GoogleDrive/.cloud_mount", home));
 
-    // 1. Desmontar FUSE
-    // Intentamos fusermount3 primero, luego umount -l como fallback
-    tracing::info!("Desmontando sistema de archivos...");
-    let umount_status = Command::new("fusermount3")
-        .arg("-u")
-        .arg(&mount_point)
-        .status();
-        
-    if umount_status.is_err() || !umount_status.unwrap().success() {
-        tracing::warn!("fusermount3 falló, intentando lazy unmount...");
-        let _ = Command::new("pkexec")
-            .arg("umount")
-            .arg("-l")
-            .arg(&mount_point)
-            .status();
-    }
-
-    // 2. Eliminar Base de Datos
+    // 2. Eliminar Base de Datos y sus archivos de Journaling (WAL/SHM)
     if db_path.exists() {
         tracing::info!("Eliminando base de datos: {:?}", db_path);
         fs::remove_file(&db_path).context("Fallo al eliminar metadata.db")?;
+
+        let db_wal = PathBuf::from(format!("{}/.config/fedoradrive/metadata.db-wal", home));
+        let db_shm = PathBuf::from(format!("{}/.config/fedoradrive/metadata.db-shm", home));
+        
+        if db_wal.exists() {
+            let _ = fs::remove_file(&db_wal);
+        }
+        if db_shm.exists() {
+            let _ = fs::remove_file(&db_shm);
+        }
     }
 
     // 3. Eliminar Tokens

@@ -862,14 +862,8 @@ impl MirrorManager {
              return;
         }
 
-        // 6. Marcar DIRTY para que el Uploader verifique metadata
-        let dirty_sql = "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 1, 0, 'local_online')
-                         ON CONFLICT(inode) DO UPDATE SET dirty=1";
-        if let Err(e) = sqlx::query(dirty_sql)
-             .bind(inode as i64)
-             .execute(db.pool())
-             .await
-        {
+        // 6. Marcar DIRTY y burbujear estado a ancestros
+        if let Err(e) = db.set_dirty_and_bubble(inode).await {
              error!("Error marcando dirty tras Rename: {:?}", e);
         }
 
@@ -1067,15 +1061,16 @@ impl MirrorManager {
              error!("Error actualizando dentry: {:?}", e);
         }
 
-        // 6. Marcar DIRTY y LocalOnline
-        let sql = "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 1, 0, 'local_online') 
-                   ON CONFLICT(inode) DO UPDATE SET dirty=1, availability='local_online'";
-        
-        if let Err(e) = sqlx::query(sql)
-            .bind(inode as i64)
-            .execute(db.pool())
-            .await 
-        {
+        // 6. Marcar DIRTY, LocalOnline y burbujear estado
+        // Primero asegurar availability='local_online'
+        let _ = sqlx::query(
+            "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 0, 0, 'local_online') ON CONFLICT(inode) DO UPDATE SET availability='local_online'"
+        )
+        .bind(inode as i64)
+        .execute(db.pool())
+        .await;
+        // Luego set_dirty_and_bubble (detecta estado previo automáticamente)
+        if let Err(e) = db.set_dirty_and_bubble(inode).await {
              error!("Error marcando dirty: {:?}", e);
         }
         

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::db::MetadataRepository;
@@ -36,6 +36,9 @@ async fn ensure_root_exists(db: &Arc<MetadataRepository>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Inicializar dir_counters para root
+    db.ensure_dir_counter(1).await?;
+
     tracing::debug!("Inode raíz (1) verificado/creado en la base de datos");
 
     // FIX MIGRATION: Update existing incorrect permissions
@@ -43,103 +46,211 @@ async fn ensure_root_exists(db: &Arc<MetadataRepository>) -> Result<()> {
     let _ = sqlx::query("UPDATE attrs SET mode = 493 WHERE is_dir = 1 AND mode = 420")
         .execute(pool)
         .await;
-        
+
     let _ = sqlx::query("UPDATE attrs SET mode = 420 WHERE is_dir = 0 AND mode != 420")
         .execute(pool)
         .await;
-        
+
     Ok(())
 }
 
-/// Ejecuta la sincronización inicial de metadatos
-pub async fn sync_all_metadata(
+/// Helper: procesa un archivo de Drive e inserta inode + attrs.
+/// Retorna (inode, is_dir).
+async fn insert_file_metadata(
+    db: &Arc<MetadataRepository>,
+    file: &google_drive3::api::File,
+) -> Result<Option<(u64, bool)>> {
+    let id = match &file.id {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    let inode = db.get_or_create_inode(id).await?;
+    let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
+    let size = file.size.unwrap_or(0);
+    let mtime = file.modified_time
+        .as_ref()
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
+    let mode = if is_dir { 0o755 } else { 0o644 };
+    let can_move = file.capabilities.as_ref()
+        .and_then(|c| c.can_move_item_within_drive)
+        .unwrap_or(true);
+    let shared = file.shared.unwrap_or(false);
+
+    db.upsert_file_metadata(
+        inode, size, mtime, mode, is_dir,
+        file.mime_type.as_deref(), can_move, shared,
+        file.owned_by_me.unwrap_or(true),
+    ).await?;
+
+    // Inicializar dir_counters para directorios
+    if is_dir {
+        db.ensure_dir_counter(inode).await?;
+    }
+
+    Ok(Some((inode, is_dir)))
+}
+
+/// Bootstrap Fase 1: Solo los hijos directos del root.
+/// Retorna rápidamente (~1 segundo) permitiendo que la app funcione de inmediato.
+pub async fn bootstrap_level1(
     db: &Arc<MetadataRepository>,
     client: &Arc<DriveClient>,
     root_id: &str,
 ) -> Result<()> {
-    tracing::info!("Iniciando bootstrapping de metadatos...");
+    tracing::info!("Bootstrap nivel 1: cargando hijos directos del root...");
 
-    // 1. Obtener todos los archivos de Drive
-    let files = client.list_all_files().await?;
-    
-    // 2. Mapeo temporal de DriveID -> Inode
-    // Esto nos ayudará a resolver los padres
-    let mut drive_id_to_inode = HashMap::new();
-    
-    // 3. Primero, asegurar que el root existe en la base de datos
-    // Esto es CRÍTICO: el inode 1 debe existir como registro en `inodes` y `attrs`
-    // para que las referencias foreign key en `dentry` sean válidas
     ensure_root_exists(db).await?;
-    // Mapear tanto el string literal "root" como el ID canónico real de Drive
-    // (la API devuelve el ID canónico como padre, no el string "root")
+
+    // Fetch rápido: solo hijos de root
+    let root_children = client.list_root_children(root_id).await?;
+    tracing::info!("Bootstrap nivel 1: {} items encontrados en root", root_children.len());
+
+    // Insertar inodes + attrs + dentries para nivel 1
+    for file in &root_children {
+        if let Some((inode, _is_dir)) = insert_file_metadata(db, file).await? {
+            if let Some(name) = &file.name {
+                db.upsert_dentry(1, inode, name).await?;
+            }
+        }
+    }
+
+    // Recalcular contadores del root después de insertar nivel 1
+    // (todos los archivos nuevos del bootstrap son synced por defecto)
+    db.rebuild_all_dir_counters().await?;
+
+    tracing::info!("Bootstrap nivel 1 completado");
+    Ok(())
+}
+
+/// Bootstrap Fase 2: Completa el resto del árbol usando BFS.
+/// Diseñado para ejecutarse en un tokio::spawn dedicado (no bloquea el flujo principal).
+pub async fn bootstrap_remaining_bfs(
+    db: &Arc<MetadataRepository>,
+    client: &Arc<DriveClient>,
+    root_id: &str,
+) -> Result<()> {
+    tracing::info!("Bootstrap BFS: descargando árbol completo en segundo plano...");
+
+    // Obtener TODOS los archivos via list_all_files (más eficiente que una llamada por carpeta)
+    let all_files = client.list_all_files().await?;
+    tracing::info!("Bootstrap BFS: {} archivos totales obtenidos de Drive", all_files.len());
+
+    // Mapeo de DriveID -> Inode
+    let mut drive_id_to_inode: HashMap<String, u64> = HashMap::new();
     drive_id_to_inode.insert("root".to_string(), 1u64);
     if !root_id.is_empty() {
         drive_id_to_inode.insert(root_id.to_string(), 1u64);
     }
 
-    // 4. Procesar archivos en dos pasadas o con recursión
-    // Primera pasada: Crear todos los inodos y guardar sus metadatos básicos
-    for file in &files {
+    // Agrupar archivos por padre para procesarlos en BFS
+    let mut by_parent: HashMap<String, Vec<&google_drive3::api::File>> = HashMap::new();
+    let mut root_level_dir_ids: Vec<String> = Vec::new();
+
+    // Primera pasada: crear inodes y metadata para TODOS los archivos
+    // y agrupar por padre
+    for file in &all_files {
         if let Some(id) = &file.id {
+            // INSERT OR IGNORE: si ya existe del nivel 1, no lo sobreescribe
             let inode = db.get_or_create_inode(id).await?;
             drive_id_to_inode.insert(id.clone(), inode);
 
-            // Determinar si es directorio
             let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
-            
-            // Metadatos
             let size = file.size.unwrap_or(0);
             let mtime = file.modified_time
                 .as_ref()
                 .map(|t| t.timestamp())
                 .unwrap_or(0);
-            
-            // Modo POSIX básico
             let mode = if is_dir { 0o755 } else { 0o644 };
-
             let can_move = file.capabilities.as_ref()
                 .and_then(|c| c.can_move_item_within_drive)
                 .unwrap_or(true);
-
             let shared = file.shared.unwrap_or(false);
 
             db.upsert_file_metadata(
-                inode,
-                size,
-                mtime,
-                mode,
-                is_dir,
-                file.mime_type.as_deref(),
-                can_move,
-                shared,
-                file.owned_by_me.unwrap_or(true)
+                inode, size, mtime, mode, is_dir,
+                file.mime_type.as_deref(), can_move, shared,
+                file.owned_by_me.unwrap_or(true),
             ).await?;
-        }
-    }
 
-    // Segunda pasada: Construir el árbol (dentries)
-    for file in &files {
-        if let (Some(id), Some(name)) = (&file.id, &file.name) {
-            let child_inode = drive_id_to_inode.get(id).cloned().context("Inode no encontrado para ID")?;
-            
+            if is_dir {
+                db.ensure_dir_counter(inode).await?;
+            }
+
+            // Agrupar por padre
             if let Some(parents) = &file.parents {
                 for parent_id in parents {
-                    if let Some(&parent_inode) = drive_id_to_inode.get(parent_id) {
-                        db.upsert_dentry(parent_inode, child_inode, name).await?;
-                    } else {
-                        // Si el padre no está en nuestro set (ej. compartido fuera del drive principal)
-                        // lo colgamos del root por ahora
-                        db.upsert_dentry(1, child_inode, name).await?;
+                    by_parent.entry(parent_id.clone()).or_default().push(file);
+
+                    // Identificar directorios de nivel 1 (hijos del root)
+                    if (parent_id == "root" || parent_id == root_id) && is_dir {
+                        root_level_dir_ids.push(id.clone());
                     }
                 }
-            } else {
-                // Sin padres explícitos -> Colgar del root
-                db.upsert_dentry(1, child_inode, name).await?;
             }
         }
     }
 
-    tracing::info!("Bootstrapping completado exitosamente");
+    // BFS: construir dentries nivel por nivel
+    // Nivel 1 ya se insertó en bootstrap_level1, pero usamos INSERT OR IGNORE
+    // para manejar el caso idempotente
+    let mut current_level_ids = vec!["root".to_string()];
+    if !root_id.is_empty() {
+        current_level_ids.push(root_id.to_string());
+    }
+    let mut level = 1u32;
+    let mut processed_parents: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while !current_level_ids.is_empty() {
+        let mut next_level_ids = Vec::new();
+
+        for parent_gdrive_id in &current_level_ids {
+            if processed_parents.contains(parent_gdrive_id) {
+                continue;
+            }
+            processed_parents.insert(parent_gdrive_id.clone());
+
+            if let Some(children) = by_parent.get(parent_gdrive_id) {
+                let parent_inode = drive_id_to_inode.get(parent_gdrive_id)
+                    .cloned()
+                    .unwrap_or(1);
+
+                for file in children {
+                    if let (Some(id), Some(name)) = (&file.id, &file.name) {
+                        if let Some(&child_inode) = drive_id_to_inode.get(id.as_str()) {
+                            // INSERT OR IGNORE: idempotente si ya existe del nivel 1
+                            db.upsert_dentry(parent_inode, child_inode, name).await?;
+
+                            // Si es directorio, añadir a la cola BFS
+                            let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
+                            if is_dir {
+                                next_level_ids.push(id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if level > 1 {
+            tracing::debug!("Bootstrap BFS: nivel {} procesado ({} directorios)", level, next_level_ids.len());
+        }
+
+        current_level_ids = next_level_ids;
+        level += 1;
+
+        // Yield periódico para no acaparar el executor
+        if level % 5 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Recalcular TODOS los contadores de directorio ahora que el árbol está completo
+    tracing::info!("Bootstrap BFS: recalculando contadores de directorio...");
+    db.rebuild_all_dir_counters().await?;
+
+    tracing::info!("Bootstrap BFS completado: {} niveles procesados", level - 1);
     Ok(())
 }
 
@@ -149,12 +260,12 @@ pub async fn repair_ownership_metadata(
     db: &Arc<MetadataRepository>,
     client: &Arc<DriveClient>,
 ) -> Result<()> {
-    tracing::info!("🛠️ Iniciando REPARACIÓN de metadatos de propiedad...");
+    tracing::info!("Iniciando REPARACIÓN de metadatos de propiedad...");
 
     // 1. Obtener lista mínima de Google Drive (solo IDs y propiedad)
     let files = client.list_all_files().await?;
     let total = files.len();
-    
+
     let mut repaired_count = 0;
     for file in files {
         if let Some(id) = file.id {
@@ -167,6 +278,6 @@ pub async fn repair_ownership_metadata(
         }
     }
 
-    tracing::info!("✅ Reparación completada: {}/{} archivos actualizados", repaired_count, total);
+    tracing::info!("Reparación completada: {}/{} archivos actualizados", repaired_count, total);
     Ok(())
 }

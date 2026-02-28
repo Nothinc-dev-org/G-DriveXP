@@ -21,9 +21,21 @@ impl MetadataRepository {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(60)) // Add a timeout to wait for a database lock
             .connect(&format!("sqlite://{}", db_path.display()))
             .await?;
         
+        // Configurar opciones pragma en la conexión para mejorar la concurrencia en SQLite
+        sqlx::query("PRAGMA journal_mode = WAL;")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous = NORMAL;")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout = 60000;")
+            .execute(&pool)
+            .await?;
+
         // Inicializar esquema (crea tablas si no existen)
         sqlx::query(include_str!("schema.sql"))
             .execute(&pool)
@@ -258,6 +270,33 @@ impl MetadataRepository {
             sqlx::query("ALTER TABLE attrs ADD COLUMN owned_by_me BOOLEAN DEFAULT 1")
                 .execute(&self.pool)
                 .await?;
+        }
+
+        // 10. Crear tabla dir_counters (Protocolo Burbujeo de Estados)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS dir_counters (
+                inode INTEGER PRIMARY KEY,
+                dirty_desc_count INTEGER NOT NULL DEFAULT 0,
+                synced_desc_count INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (inode) REFERENCES inodes(inode) ON DELETE CASCADE
+            )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Si la tabla existe pero está vacía y hay datos en dentry, recalcular contadores
+        let counters_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dir_counters")
+            .fetch_one(&self.pool)
+            .await?;
+        let dirs_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attrs WHERE is_dir = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        if counters_count == 0 && dirs_count > 0 {
+            tracing::info!("Migrando: recalculando contadores de directorio (dir_counters)...");
+            self.rebuild_all_dir_counters().await?;
+            tracing::info!("Migración de dir_counters completada");
         }
 
         Ok(())
@@ -611,14 +650,24 @@ impl MetadataRepository {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        let id = sqlx::query("INSERT INTO inodes (gdrive_id, created_at) VALUES (?, ?)")
+        let insert_result = sqlx::query("INSERT INTO inodes (gdrive_id, created_at) VALUES (?, ?)")
             .bind(gdrive_id)
             .bind(now)
             .execute(&self.pool)
-            .await?
-            .last_insert_rowid();
+            .await;
 
-        Ok(id as u64)
+        match insert_result {
+            Ok(result) => Ok(result.last_insert_rowid() as u64),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                // Si hubo una colisión durante la inserción simultánea, simplemente lo leemos
+                let existing = sqlx::query_scalar::<_, i64>("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                    .bind(gdrive_id)
+                    .fetch_one(&self.pool)
+                    .await?;
+                Ok(existing as u64)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Inserta o actualiza metadatos de un archivo
@@ -789,6 +838,231 @@ impl MetadataRepository {
         Ok(())
     }
 
+    // ============================================================
+    // Protocolo "Burbujeo de Estados" — Contadores pre-calculados
+    // ============================================================
+
+    /// Burbujea un cambio de estado desde un archivo hacia todos sus directorios ancestros.
+    /// `delta_dirty` y `delta_synced` son incrementos (pueden ser negativos).
+    /// Ejemplo: archivo pasa de synced→dirty → delta_dirty=+1, delta_synced=-1
+    pub async fn bubble_state_change(
+        &self,
+        child_inode: u64,
+        delta_dirty: i32,
+        delta_synced: i32,
+    ) -> Result<()> {
+        if delta_dirty == 0 && delta_synced == 0 {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            WITH RECURSIVE ancestors AS (
+                SELECT parent_inode FROM dentry WHERE child_inode = ?1
+                UNION ALL
+                SELECT d.parent_inode FROM dentry d
+                JOIN ancestors a ON d.child_inode = a.parent_inode
+                WHERE a.parent_inode > 1
+            )
+            UPDATE dir_counters
+            SET dirty_desc_count = MAX(0, dirty_desc_count + ?2),
+                synced_desc_count = MAX(0, synced_desc_count + ?3)
+            WHERE inode IN (SELECT parent_inode FROM ancestors)
+            "#
+        )
+        .bind(child_inode as i64)
+        .bind(delta_dirty)
+        .bind(delta_synced)
+        .execute(&self.pool)
+        .await?;
+
+        // También actualizar root (inode 1) si el archivo cuelga de él
+        sqlx::query(
+            r#"
+            UPDATE dir_counters
+            SET dirty_desc_count = MAX(0, dirty_desc_count + ?2),
+                synced_desc_count = MAX(0, synced_desc_count + ?3)
+            WHERE inode = 1 AND EXISTS (
+                WITH RECURSIVE ancestors AS (
+                    SELECT parent_inode FROM dentry WHERE child_inode = ?1
+                    UNION ALL
+                    SELECT d.parent_inode FROM dentry d
+                    JOIN ancestors a ON d.child_inode = a.parent_inode
+                    WHERE a.parent_inode > 1
+                )
+                SELECT 1 FROM ancestors WHERE parent_inode = 1
+            )
+            "#
+        )
+        .bind(child_inode as i64)
+        .bind(delta_dirty)
+        .bind(delta_synced)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Inicializa una fila en dir_counters para un directorio si no existe.
+    pub async fn ensure_dir_counter(&self, inode: u64) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO dir_counters (inode, dirty_desc_count, synced_desc_count) VALUES (?, 0, 0)"
+        )
+        .bind(inode as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Marca un inode como dirty y burbujea el cambio a sus ancestros.
+    /// Detecta automáticamente el estado previo para calcular el delta correcto.
+    /// Solo burbujea para archivos (is_dir=0).
+    pub async fn set_dirty_and_bubble(&self, inode: u64) -> Result<()> {
+        // Obtener estado previo y si es directorio
+        let prev = sqlx::query_as::<_, (Option<bool>, Option<i64>)>(
+            "SELECT s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let was_dirty = prev.as_ref().map(|(d, del)| {
+            d.unwrap_or(false) || del.map(|v| v > 0).unwrap_or(false)
+        }).unwrap_or(false);
+
+        // Marcar como dirty
+        sqlx::query(
+            "INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1"
+        )
+        .bind(inode as i64)
+        .execute(&self.pool)
+        .await?;
+
+        // Solo burbujear para archivos
+        let is_dir: Option<bool> = sqlx::query_scalar(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if is_dir == Some(false) {
+            if was_dirty {
+                // Ya era dirty, no hay cambio en contadores
+            } else if prev.is_some() {
+                // Era synced (o existía sin dirty), ahora es dirty
+                self.bubble_state_change(inode, 1, -1).await?;
+            } else {
+                // Archivo nuevo (no existía en sync_state), ahora es dirty
+                self.bubble_state_change(inode, 1, 0).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Limpia el flag dirty y burbujea el cambio a los ancestros.
+    /// Solo burbujea para archivos (is_dir=0).
+    pub async fn clear_dirty_and_bubble(&self, inode: u64) -> Result<()> {
+        // Verificar estado previo
+        let prev = sqlx::query_as::<_, (bool, Option<i64>)>(
+            "SELECT dirty, deleted_at FROM sync_state WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let was_dirty = prev.as_ref().map(|(d, del)| {
+            *d || del.map(|v| v > 0).unwrap_or(false)
+        }).unwrap_or(false);
+
+        // Limpiar dirty
+        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        // Solo burbujear para archivos
+        let is_dir: Option<bool> = sqlx::query_scalar(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if is_dir == Some(false) && was_dirty {
+            // Era dirty, ahora es synced
+            self.bubble_state_change(inode, -1, 1).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Recalcula todos los contadores de directorio desde cero.
+    /// Usado para migración y como mecanismo de auto-reparación.
+    pub async fn rebuild_all_dir_counters(&self) -> Result<()> {
+        // Limpiar tabla
+        sqlx::query("DELETE FROM dir_counters").execute(&self.pool).await?;
+
+        // Insertar fila para cada directorio
+        sqlx::query(
+            "INSERT INTO dir_counters (inode, dirty_desc_count, synced_desc_count) SELECT inode, 0, 0 FROM attrs WHERE is_dir = 1"
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Recalcular usando la CTE recursiva original (one-time cost)
+        // Para cada directorio, contar descendientes dirty y synced
+        sqlx::query(
+            r#"
+            UPDATE dir_counters SET
+                dirty_desc_count = (
+                    WITH RECURSIVE descendants AS (
+                        SELECT d.child_inode, a.is_dir
+                        FROM dentry d
+                        JOIN attrs a ON d.child_inode = a.inode
+                        WHERE d.parent_inode = dir_counters.inode
+                        UNION ALL
+                        SELECT d.child_inode, a.is_dir
+                        FROM dentry d
+                        JOIN attrs a ON d.child_inode = a.inode
+                        JOIN descendants dt ON d.parent_inode = dt.child_inode
+                        WHERE dt.is_dir = 1
+                    )
+                    SELECT COUNT(*) FROM descendants d
+                    LEFT JOIN sync_state s ON d.child_inode = s.inode
+                    WHERE d.is_dir = 0
+                      AND (s.dirty = 1 OR (s.deleted_at IS NOT NULL AND s.deleted_at > 0))
+                ),
+                synced_desc_count = (
+                    WITH RECURSIVE descendants AS (
+                        SELECT d.child_inode, a.is_dir
+                        FROM dentry d
+                        JOIN attrs a ON d.child_inode = a.inode
+                        WHERE d.parent_inode = dir_counters.inode
+                        UNION ALL
+                        SELECT d.child_inode, a.is_dir
+                        FROM dentry d
+                        JOIN attrs a ON d.child_inode = a.inode
+                        JOIN descendants dt ON d.parent_inode = dt.child_inode
+                        WHERE dt.is_dir = 1
+                    )
+                    SELECT COUNT(*) FROM descendants d
+                    LEFT JOIN sync_state s ON d.child_inode = s.inode
+                    WHERE d.is_dir = 0
+                      AND COALESCE(s.availability, 'online_only') = 'local_online'
+                      AND COALESCE(s.dirty, 0) = 0
+                      AND (s.deleted_at IS NULL OR s.deleted_at = 0)
+                )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        tracing::info!("Contadores de directorio recalculados");
+        Ok(())
+    }
+
     /// Verifica si un inode tiene cambios locales pendientes de subir
     pub async fn is_dirty(&self, inode: u64) -> Result<bool> {
         let dirty = sqlx::query_scalar::<_, bool>(
@@ -806,86 +1080,42 @@ impl MetadataRepository {
     /// descendientes de un directorio, de forma recursiva via CTE.
     /// Retorna (has_local_only, has_synced, total_files).
     pub async fn get_directory_aggregate_status(&self, parent_inode: u64) -> Result<(bool, bool, i64)> {
-        let row = sqlx::query_as::<_, (i32, i32, i64)>(
-            r#"
-            WITH RECURSIVE descendants AS (
-                SELECT d.child_inode, a.is_dir
-                FROM dentry d
-                JOIN attrs a ON d.child_inode = a.inode
-                WHERE d.parent_inode = ?1
-                UNION ALL
-                SELECT d.child_inode, a.is_dir
-                FROM dentry d
-                JOIN attrs a ON d.child_inode = a.inode
-                JOIN descendants dt ON d.parent_inode = dt.child_inode
-                WHERE dt.is_dir = 1
-            )
-            SELECT
-                COALESCE(MAX(CASE
-                    WHEN s.dirty = 1 THEN 1
-                    WHEN s.deleted_at IS NOT NULL AND s.deleted_at > 0 THEN 1
-                    ELSE 0
-                END), 0) as has_local_only,
-                COALESCE(MAX(CASE
-                    WHEN COALESCE(s.availability, 'online_only') = 'local_online'
-                         AND COALESCE(s.dirty, 0) = 0
-                         AND (s.deleted_at IS NULL OR s.deleted_at = 0)
-                    THEN 1
-                    ELSE 0
-                END), 0) as has_synced,
-                COUNT(*) as total_files
-            FROM descendants d
-            LEFT JOIN sync_state s ON d.child_inode = s.inode
-            WHERE d.is_dir = 0
-            "#
+        // O(1): lectura directa de contadores pre-calculados
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT dirty_desc_count, synced_desc_count FROM dir_counters WHERE inode = ?"
         )
         .bind(parent_inode as i64)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok((row.0 != 0, row.1 != 0, row.2))
+        match row {
+            Some((dirty, synced)) => {
+                let total = dirty + synced;
+                Ok((dirty > 0, synced > 0, total))
+            }
+            None => Ok((false, false, 0)),
+        }
     }
 
-    /// Calcula el estado agregado para la carpeta virtual SHARED.
-    /// Los hijos de SHARED son items en root (parent_inode=1) con owned_by_me=0.
+    /// Estado agregado para la carpeta virtual SHARED.
+    /// Usa contadores pre-calculados con SHARED_INODE como clave.
     pub async fn get_shared_directory_aggregate_status(&self) -> Result<(bool, bool, i64)> {
-        let row = sqlx::query_as::<_, (i32, i32, i64)>(
-            r#"
-            WITH RECURSIVE descendants AS (
-                SELECT d.child_inode, a.is_dir
-                FROM dentry d
-                JOIN attrs a ON d.child_inode = a.inode
-                WHERE d.parent_inode = 1 AND a.owned_by_me = 0
-                UNION ALL
-                SELECT d.child_inode, a.is_dir
-                FROM dentry d
-                JOIN attrs a ON d.child_inode = a.inode
-                JOIN descendants dt ON d.parent_inode = dt.child_inode
-                WHERE dt.is_dir = 1
-            )
-            SELECT
-                COALESCE(MAX(CASE
-                    WHEN s.dirty = 1 THEN 1
-                    WHEN s.deleted_at IS NOT NULL AND s.deleted_at > 0 THEN 1
-                    ELSE 0
-                END), 0) as has_local_only,
-                COALESCE(MAX(CASE
-                    WHEN COALESCE(s.availability, 'online_only') = 'local_online'
-                         AND COALESCE(s.dirty, 0) = 0
-                         AND (s.deleted_at IS NULL OR s.deleted_at = 0)
-                    THEN 1
-                    ELSE 0
-                END), 0) as has_synced,
-                COUNT(*) as total_files
-            FROM descendants d
-            LEFT JOIN sync_state s ON d.child_inode = s.inode
-            WHERE d.is_dir = 0
-            "#
+        // SHARED_INODE = 0xFFFFFFFFFFFFFFFE
+        let shared_inode = 0xFFFFFFFFFFFFFFFEu64;
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT dirty_desc_count, synced_desc_count FROM dir_counters WHERE inode = ?"
         )
-        .fetch_one(&self.pool)
+        .bind(shared_inode as i64)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok((row.0 != 0, row.1 != 0, row.2))
+        match row {
+            Some((dirty, synced)) => {
+                let total = dirty + synced;
+                Ok((dirty > 0, synced > 0, total))
+            }
+            None => Ok((false, false, 0)),
+        }
     }
 
     // ============================================================
@@ -915,8 +1145,50 @@ impl MetadataRepository {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
+        // 0. Burbujeo: contar archivos descendientes que estaban synced (no dirty)
+        // antes de marcarlos como dirty. Estos son los que cambian de estado.
+        let synced_becoming_dirty: i64 = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            SELECT COUNT(*) FROM subordinates sub
+            JOIN attrs a ON sub.child_inode = a.inode
+            LEFT JOIN sync_state ss ON sub.child_inode = ss.inode
+            WHERE a.is_dir = 0
+              AND (COALESCE(ss.dirty, 0) = 0)
+              AND (ss.deleted_at IS NULL OR ss.deleted_at = 0)
+            "#
+        )
+        .bind(root_inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+
+
+
+        // Archivos nuevos sin sync_state
+        let new_files: i64 = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            SELECT COUNT(*) FROM subordinates sub
+            JOIN attrs a ON sub.child_inode = a.inode
+            WHERE a.is_dir = 0
+              AND sub.child_inode NOT IN (SELECT inode FROM sync_state)
+            "#
+        )
+        .bind(root_inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+
         // 1. Identificar recursivamente todos los inodos hijos (incluyendo el raíz)
-        // Usamos una CTE para encontrar toda la descendencia.
         let sql_deleted_dentries = r#"
             WITH RECURSIVE subordinates AS (
                 SELECT child_inode, parent_inode, name FROM dentry WHERE child_inode = ?
@@ -936,7 +1208,6 @@ impl MetadataRepository {
             .await?;
 
         // 2. Marcar sync_state para todos los inodos afectados
-        // Primero intentamos actualizar los existentes
         let sql_update_sync = r#"
             WITH RECURSIVE subordinates AS (
                 SELECT child_inode FROM dentry WHERE child_inode = ?
@@ -945,8 +1216,8 @@ impl MetadataRepository {
                 FROM dentry d
                 JOIN subordinates s ON d.parent_inode = s.child_inode
             )
-            UPDATE sync_state 
-            SET deleted_at = ?, dirty = 1 
+            UPDATE sync_state
+            SET deleted_at = ?, dirty = 1
             WHERE inode IN (SELECT child_inode FROM subordinates)
         "#;
 
@@ -956,7 +1227,7 @@ impl MetadataRepository {
             .execute(&self.pool)
             .await?;
 
-        // Luego insertamos los que falten
+        // Insertar los que falten
         let sql_insert_sync = r#"
             WITH RECURSIVE subordinates AS (
                 SELECT child_inode FROM dentry WHERE child_inode = ?
@@ -966,8 +1237,8 @@ impl MetadataRepository {
                 JOIN subordinates s ON d.parent_inode = s.child_inode
             )
             INSERT INTO sync_state (inode, dirty, version, deleted_at)
-            SELECT child_inode, 1, 0, ? 
-            FROM subordinates 
+            SELECT child_inode, 1, 0, ?
+            FROM subordinates
             WHERE child_inode NOT IN (SELECT inode FROM sync_state)
         "#;
 
@@ -976,6 +1247,14 @@ impl MetadataRepository {
             .bind(now)
             .execute(&self.pool)
             .await?;
+
+        // 2.5. Burbujear el cambio de estado ANTES de eliminar dentries
+        // (bubble_state_change necesita las dentries para caminar hacia los ancestros)
+        let delta_dirty = synced_becoming_dirty + new_files; // Nuevos dirty
+        let delta_synced = -synced_becoming_dirty; // Dejaron de ser synced
+        if delta_dirty != 0 || delta_synced != 0 {
+            self.bubble_state_change(root_inode, delta_dirty as i32, delta_synced as i32).await?;
+        }
 
         // 3. Limpiar dentry original para todos los inodos afectados
         // IMPORTANTE: Esto debe ser lo ÚLTIMO porque las CTEs anteriores dependen de dentry.
@@ -1030,6 +1309,21 @@ impl MetadataRepository {
             .bind(inode as i64)
             .execute(&self.pool)
             .await?;
+
+        // 4. Burbujear: era dirty (deleted_at), ahora es synced
+        let is_dir: Option<bool> = sqlx::query_scalar(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if is_dir == Some(false) {
+            self.bubble_state_change(inode, -1, 1).await?;
+        } else if is_dir == Some(true) {
+            // Restaurar directorio: asegurar que tiene fila en dir_counters
+            self.ensure_dir_counter(inode).await?;
+        }
 
         tracing::debug!("Archivo restaurado: gdrive_id={}, inode={}", gdrive_id, inode);
         Ok(true)
@@ -1087,6 +1381,35 @@ impl MetadataRepository {
     async fn hard_delete_inode(&self, inode: u64) -> Result<()> {
         let inode_i64 = inode as i64;
 
+        // Burbujear: decrementar contadores de ancestros según estado previo del archivo
+        // (solo para archivos, no directorios — los directorios eliminados ya tuvieron
+        // sus descendientes procesados en soft_delete)
+        let is_dir: Option<bool> = sqlx::query_scalar(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode_i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if is_dir == Some(false) {
+            // Verificar estado actual del archivo para calcular delta
+            let state = sqlx::query_as::<_, (Option<bool>, Option<i64>)>(
+                "SELECT dirty, deleted_at FROM sync_state WHERE inode = ?"
+            )
+            .bind(inode_i64)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some((dirty, deleted_at)) = state {
+                let was_dirty = dirty.unwrap_or(false) || deleted_at.map(|v| v > 0).unwrap_or(false);
+                if was_dirty {
+                    self.bubble_state_change(inode, -1, 0).await?;
+                } else {
+                    self.bubble_state_change(inode, 0, -1).await?;
+                }
+            }
+        }
+
         // Eliminar de todas las tablas relacionadas
         sqlx::query("DELETE FROM dentry WHERE child_inode = ?")
             .bind(inode_i64)
@@ -1097,12 +1420,12 @@ impl MetadataRepository {
             .bind(inode_i64)
             .execute(&self.pool)
             .await?;
-        
+
         sqlx::query("DELETE FROM sync_state WHERE inode = ?")
             .bind(inode_i64)
             .execute(&self.pool)
             .await?;
-        
+
         sqlx::query("DELETE FROM attrs WHERE inode = ?")
             .bind(inode_i64)
             .execute(&self.pool)
@@ -1112,7 +1435,13 @@ impl MetadataRepository {
             .bind(inode_i64)
             .execute(&self.pool)
             .await?;
-        
+
+        // Limpiar dir_counters si era directorio
+        sqlx::query("DELETE FROM dir_counters WHERE inode = ?")
+            .bind(inode_i64)
+            .execute(&self.pool)
+            .await?;
+
         sqlx::query("DELETE FROM inodes WHERE inode = ?")
             .bind(inode_i64)
             .execute(&self.pool)

@@ -208,10 +208,7 @@ impl Uploader {
                 warn!("⚠️ Modificación concurrente detectada durante creación de carpeta (inode={}). Manteniendo dirty=1.", inode);
                 // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
             } else {
-                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                    .bind(inode as i64)
-                    .execute(self.db.pool())
-                    .await?;
+                self.db.clear_dirty_and_bubble(inode).await?;
             }
             
             info!("✅ Carpeta creada en GDrive: {} (inode={})", real_gdrive_id, inode);
@@ -280,10 +277,7 @@ impl Uploader {
             warn!("⚠️ Modificación concurrente detectada durante creación de archivo (inode={}). Manteniendo dirty=1.", inode);
             // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
         } else {
-            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                .bind(inode as i64)
-                .execute(self.db.pool())
-                .await?;
+            self.db.clear_dirty_and_bubble(inode).await?;
         }
         
         info!("✅ Archivo creado en GDrive: {} (inode={})", real_gdrive_id, inode);
@@ -361,10 +355,7 @@ impl Uploader {
                     .execute(self.db.pool())
                     .await?;
                 // Limpiar dirty
-                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                    .bind(inode as i64)
-                    .execute(self.db.pool())
-                    .await?;
+                self.db.clear_dirty_and_bubble(inode).await?;
                 return Ok(());
             }
 
@@ -445,10 +436,7 @@ impl Uploader {
                 let correct_rel = self.db.resolve_inode_to_relative_path(inode).await?.unwrap_or_default();
 
                 // 4. Limpiar dirty
-                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                    .bind(inode as i64)
-                    .execute(self.db.pool())
-                    .await?;
+                self.db.clear_dirty_and_bubble(inode).await?;
 
                 if !unauthorized_rel.is_empty() && !correct_rel.is_empty() && unauthorized_rel != correct_rel {
                     warn!("🔄 Ejecutando Rollback Físico: {} -> {}", unauthorized_rel, correct_rel);
@@ -500,10 +488,7 @@ impl Uploader {
             if metadata_updated {
                 info!("✅ Renombrado completado sin cambios de contenido (sin caché).");
                 // Marcar como limpio
-                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                    .bind(inode as i64)
-                    .execute(self.db.pool())
-                    .await?;
+                self.db.clear_dirty_and_bubble(inode).await?;
                 if add_parent.is_some() {
                     self.history.log(ActionType::Sync, format!("Movido: {} → {}", current_remote_name, local_name));
                 } else {
@@ -519,10 +504,7 @@ impl Uploader {
             // y permitir que se muestre como CloudOnly/Synced.
             info!("⚠️ Corrigiendo estado inconsistente: dirty=1 pero sin caché local. Reseteando a dirty=0.");
             
-            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                .bind(inode as i64)
-                .execute(self.db.pool())
-                .await?;
+            self.db.clear_dirty_and_bubble(inode).await?;
                 
             self.history.log(ActionType::Sync, format!("Estado corregido (sin caché): {}", gdrive_id));
 
@@ -541,10 +523,7 @@ impl Uploader {
                          // Actualizar estado para reflejar que está sincronizado
                          self.db.set_remote_md5(inode, remote_md5).await?;
                          
-                         sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                            .bind(inode as i64)
-                            .execute(self.db.pool())
-                            .await?;
+                         self.db.clear_dirty_and_bubble(inode).await?;
                             
                          self.history.log(ActionType::Sync, format!("Verificado sin cambios: {}", gdrive_id));
                          return Ok(());
@@ -568,10 +547,7 @@ impl Uploader {
                  tokio::fs::remove_file(&cache_path).await.ok();
              }
 
-             sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                .bind(inode as i64)
-                .execute(self.db.pool())
-                .await?;
+             self.db.clear_dirty_and_bubble(inode).await?;
              
              return Ok(());
         }
@@ -609,10 +585,7 @@ impl Uploader {
             warn!("⚠️ Modificación concurrente detectada durante actualización (inode={}). Manteniendo dirty=1.", inode);
             // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
         } else {
-            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                .bind(inode as i64)
-                .execute(self.db.pool())
-                .await?;
+            self.db.clear_dirty_and_bubble(inode).await?;
         }
         
         info!("✅ Archivo actualizado en GDrive: {} (inode={})", gdrive_id, inode);
@@ -651,10 +624,7 @@ impl Uploader {
                         .await?;
                     
                     // Marcar como limpio (no reintentar)
-                    sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                        .bind(inode as i64)
-                        .execute(self.db.pool())
-                        .await?;
+                    self.db.clear_dirty_and_bubble(inode).await?;
                     
                     self.history.log(
                         ActionType::Sync, 
@@ -677,10 +647,7 @@ impl Uploader {
         }
         
         // Marcar como limpio (eliminación exitosa)
-        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await?;
+        self.db.clear_dirty_and_bubble(inode).await?;
         
         Ok(())
     }
@@ -747,10 +714,7 @@ impl Uploader {
         ).await.context("Error subiendo copia de conflicto")?;
         
         // 5. Marcar el archivo original como limpio (no lo modificamos)
-        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await?;
+        self.db.clear_dirty_and_bubble(inode).await?;
         
         warn!("✅ Conflicto resuelto: copia local guardada como {}", conflict_gdrive_id);
         warn!("   El archivo original permanece sin cambios en la nube");

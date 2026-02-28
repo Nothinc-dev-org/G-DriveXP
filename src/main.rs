@@ -116,9 +116,29 @@ pub fn run_backend(
         );
         
         // Fase 2.1: Bootstrapping (Sincronización de metadatos)
-        if db.is_empty().await? {
-            ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Sincronización inicial (esto puede tardar)...".to_string()));
-            sync::bootstrap::sync_all_metadata(&db, &drive_client, &root_id).await?;
+        let bootstrap_done = db.get_sync_meta("bootstrap_complete").await?;
+        if bootstrap_done.is_none() {
+            if db.is_empty().await? {
+                // Primera vez: nivel 1
+                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cargando estructura inicial...".to_string()));
+                sync::bootstrap::bootstrap_level1(&db, &drive_client, &root_id).await?;
+                // Base de datos nueva: no necesitamos reparar ownership legacy, los datos ya vienen bien.
+                let _ = db.set_sync_meta("repair_ownership_done_v2", "true").await;
+            }
+            // Siempre: lanzar BFS background para completar
+            let db_bg = db.clone();
+            let client_bg = drive_client.clone();
+            let root_id_bg = root_id.clone();
+            ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Escaneando Drive en segundo plano...".to_string()));
+            tokio::spawn(async move {
+                tracing::info!("Iniciando bootstrap BFS en background...");
+                if let Err(e) = sync::bootstrap::bootstrap_remaining_bfs(&db_bg, &client_bg, &root_id_bg).await {
+                    tracing::error!("Error en bootstrap BFS background: {:?}", e);
+                } else {
+                    let _ = db_bg.set_sync_meta("bootstrap_complete", "true").await;
+                    tracing::info!("Bootstrap BFS completado y marcado como finalizado.");
+                }
+            });
         }
         
         // Fase 2.15: Instanciar MirrorManager tempranamente para compartir su sender
@@ -220,17 +240,21 @@ pub fn run_backend(
         tracing::info!("Iniciando MirrorManager (Arquitectura Espejo)...");
 
         // SINCRONIZAR propiedad ANTES del bootstrap del espejo para evitar race condition:
-        if let Ok(None) = db.get_sync_meta("repair_ownership_done_v2").await {
-            tracing::info!("⚙️ Verificando consistencia de propiedad para limpieza de redundancias...");
-            if let Err(e) = sync::bootstrap::repair_ownership_metadata(&db, &drive_client).await {
-                tracing::error!("❌ Error reparando propiedad: {:?}", e);
-            } else {
-                let _ = db.set_sync_meta("repair_ownership_done_v2", "true").await;
-                tracing::info!("✅ Reparación de propiedad v2 completada");
+        let db_mirror = db.clone();
+        let client_mirror = drive_client.clone();
+        tokio::spawn(async move {
+            if let Ok(None) = db_mirror.get_sync_meta("repair_ownership_done_v2").await {
+                tracing::info!("⚙️ Verificando consistencia de propiedad para limpieza de redundancias...");
+                if let Err(e) = sync::bootstrap::repair_ownership_metadata(&db_mirror, &client_mirror).await {
+                    tracing::error!("❌ Error reparando propiedad: {:?}", e);
+                } else {
+                    let _ = db_mirror.set_sync_meta("repair_ownership_done_v2", "true").await;
+                    tracing::info!("✅ Reparación de propiedad v2 completada");
+                }
             }
-        }
 
-        let _mirror_handle = mirror_manager.spawn();
+            let _mirror_handle = mirror_manager.spawn();
+        });
         
         // Fase 2.5: Servidor IPC para extensiones externas (Nautilus)
         tracing::info!("Iniciando servidor IPC...");

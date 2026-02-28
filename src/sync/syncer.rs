@@ -307,6 +307,11 @@ impl BackgroundSyncer {
                 );
             }
 
+            // Asegurar dir_counters para directorios nuevos
+            if is_dir {
+                self.db.ensure_dir_counter(inode).await?;
+            }
+
             // Actualizar remote_md5 si está disponible (para detección de conflictos)
             if let Some(md5) = file.md5_checksum.clone() {
                 self.db.set_remote_md5(inode, &md5).await?;

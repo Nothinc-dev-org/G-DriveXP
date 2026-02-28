@@ -943,11 +943,8 @@ impl Filesystem for GDriveFS {
                 Errno::from(libc::EIO)
             })?;
 
-        // Marcar como dirty (pendiente de subida)
-        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await
+        // Marcar como dirty y burbujear estado a ancestros
+        self.db.set_dirty_and_bubble(inode).await
             .map_err(|e| {
                 error!("Error marcando archivo como dirty: {}", e);
                 Errno::from(libc::EIO)
@@ -1027,12 +1024,16 @@ impl Filesystem for GDriveFS {
             })?;
 
         // Marcar como dirty (pendiente de creación en GDrive)
-        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await
+        // Directorios: set_dirty_and_bubble no burbujea para is_dir=true (correcto)
+        self.db.set_dirty_and_bubble(inode).await
             .map_err(|e| {
                 error!("Error marcando directorio como dirty: {}", e);
+                Errno::from(libc::EIO)
+            })?;
+        // Asegurar que el nuevo directorio tiene fila en dir_counters
+        self.db.ensure_dir_counter(inode).await
+            .map_err(|e| {
+                error!("Error inicializando dir_counter: {}", e);
                 Errno::from(libc::EIO)
             })?;
 
@@ -1138,11 +1139,8 @@ impl Filesystem for GDriveFS {
                 Errno::from(libc::EIO)
             })?;
 
-        // Marcar como dirty
-        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await
+        // Marcar como dirty y burbujear estado
+        self.db.set_dirty_and_bubble(inode).await
             .map_err(|e| {
                 error!("Error marcando como dirty: {}", e);
                 Errno::from(libc::EIO)
@@ -1197,11 +1195,8 @@ impl Filesystem for GDriveFS {
                 .await
                 .map_err(|_| Errno::from(libc::EIO))?;
 
-            // Marcar como dirty
-            sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
-                .bind(inode as i64)
-                .execute(self.db.pool())
-                .await
+            // Marcar como dirty y burbujear estado
+            self.db.set_dirty_and_bubble(inode).await
                 .map_err(|_| Errno::from(libc::EIO))?;
         }
 
@@ -1268,11 +1263,9 @@ impl Filesystem for GDriveFS {
                 Errno::from(libc::EIO)
             })?;
 
-        // Marcar como dirty para que el uploader lo envíe como delete a GDrive
-        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await
+        // Marcar como dirty y burbujear (soft_delete_by_gdrive_id ya burbujea internamente,
+        // pero el set_dirty aquí es para el caso donde no hubo soft_delete recursivo)
+        self.db.set_dirty_and_bubble(inode).await
             .map_err(|_| Errno::from(libc::EIO))?;
 
         debug!("✅ Archivo marcado para eliminación: {}", name_str);
@@ -1345,11 +1338,105 @@ impl Filesystem for GDriveFS {
                 Errno::from(libc::EIO)
             })?;
 
+        // Burbujeo para rename/move
+        let is_dir: Option<bool> = sqlx::query_scalar::<_, bool>(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|_| Errno::from(libc::EIO))?;
+
+        if parent != new_parent {
+            // Mover entre directorios: transferir contadores
+            if is_dir == Some(true) {
+                // Mover un directorio: transferir sus contadores de descendientes
+                let counters = sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT dirty_desc_count, synced_desc_count FROM dir_counters WHERE inode = ?"
+                )
+                .bind(inode as i64)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(|_| Errno::from(libc::EIO))?;
+
+                if let Some((dirty, synced)) = counters {
+                    // Decrementar ancestros del viejo padre
+                    let _ = self.db.bubble_state_change(inode, -(dirty as i32), -(synced as i32)).await;
+                    // Ahora la dentry apunta al nuevo padre, re-burbujear
+                    let _ = self.db.bubble_state_change(inode, dirty as i32, synced as i32).await;
+                }
+            } else if is_dir == Some(false) {
+                // Mover un archivo: determinar su estado y transferir
+                let state = sqlx::query_as::<_, (Option<bool>, Option<i64>)>(
+                    "SELECT dirty, deleted_at FROM sync_state WHERE inode = ?"
+                )
+                .bind(inode as i64)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(|_| Errno::from(libc::EIO))?;
+
+                let (d_dirty, d_synced) = match state {
+                    Some((dirty, deleted_at)) => {
+                        let was_dirty = dirty.unwrap_or(false) || deleted_at.map(|v| v > 0).unwrap_or(false);
+                        if was_dirty { (1i32, 0i32) } else { (0, 1) }
+                    }
+                    None => (0, 0),
+                };
+                // La dentry ya apunta al nuevo padre, así que bubble_state_change
+                // actuará sobre los nuevos ancestros. Necesitamos corregir los viejos manualmente.
+                // Usamos un UPDATE directo sobre los ancestros del viejo parent.
+                if d_dirty != 0 || d_synced != 0 {
+                    // Decrementar viejo padre y sus ancestros
+                    sqlx::query(
+                        r#"
+                        WITH RECURSIVE ancestors AS (
+                            SELECT ?1 as anc_inode
+                            UNION ALL
+                            SELECT d.parent_inode FROM dentry d
+                            JOIN ancestors a ON d.child_inode = a.anc_inode
+                            WHERE a.anc_inode > 0
+                        )
+                        UPDATE dir_counters
+                        SET dirty_desc_count = MAX(0, dirty_desc_count - ?2),
+                            synced_desc_count = MAX(0, synced_desc_count - ?3)
+                        WHERE inode IN (SELECT anc_inode FROM ancestors)
+                        "#
+                    )
+                    .bind(parent as i64)
+                    .bind(d_dirty)
+                    .bind(d_synced)
+                    .execute(self.db.pool())
+                    .await
+                    .map_err(|_| Errno::from(libc::EIO))?;
+
+                    // Incrementar nuevo padre y sus ancestros
+                    sqlx::query(
+                        r#"
+                        WITH RECURSIVE ancestors AS (
+                            SELECT ?1 as anc_inode
+                            UNION ALL
+                            SELECT d.parent_inode FROM dentry d
+                            JOIN ancestors a ON d.child_inode = a.anc_inode
+                            WHERE a.anc_inode > 0
+                        )
+                        UPDATE dir_counters
+                        SET dirty_desc_count = dirty_desc_count + ?2,
+                            synced_desc_count = synced_desc_count + ?3
+                        WHERE inode IN (SELECT anc_inode FROM ancestors)
+                        "#
+                    )
+                    .bind(new_parent as i64)
+                    .bind(d_dirty)
+                    .bind(d_synced)
+                    .execute(self.db.pool())
+                    .await
+                    .map_err(|_| Errno::from(libc::EIO))?;
+                }
+            }
+        }
+
         // Marcar como dirty para sincronizar el cambio de nombre
-        sqlx::query("INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await
+        self.db.set_dirty_and_bubble(inode).await
             .map_err(|_| Errno::from(libc::EIO))?;
 
         debug!("✅ Archivo renombrado: {} -> {}", name_str, new_name_str);

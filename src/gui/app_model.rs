@@ -781,24 +781,46 @@ impl Component for AppModel {
                 std::process::exit(0);
             }
             AppMsg::HardReset => {
-                tracing::warn!("Ejecutando Hard Reset y reiniciando...");
+                tracing::warn!("Ejecutando Hard Reset delegado a hilo secundario...");
 
-                // 1. Programar el reinicio (delayed)
-                // Usamos sh para dormir un poco y permitir que esta instancia se cierre y libere recursos
-                if let Ok(exe) = std::env::current_exe() {
-                    let _ = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(format!("sleep 3; {:?} &", exe)) // 3 segundos para asegurar limpieza
-                        .spawn();
-                }
+                // 1. Detener nuevos ciclos de sincronización/descarga de inmediato
+                self.sync_paused.store(true, Ordering::Relaxed);
+                
+                // 2. Dar retroalimentación en UI
+                self.status_message = "Purgando sistema, por favor espere...".to_string();
 
-                // 2. Ejecutar limpieza
-                if let Err(e) = crate::utils::cleanup::perform_hard_reset() {
-                    tracing::error!("Error durante el Hard Reset: {:?}", e);
-                }
+                // 3. Clonar parámetros necesarios antes de mover al hilo
+                let fuse_path = self.fuse_mount_path.clone();
 
-                // 3. Salir de la aplicación forzosamente
-                std::process::exit(0);
+                // 4. Delegar trabajo pesado (I/O bloqueante) a un hilo de sistema
+                std::thread::spawn(move || {
+                    tracing::info!("Hilo de limpieza en background iniciado.");
+
+                    // Desmontar FUSE para detener lecturas/escrituras locales concurrentes
+                    if let Some(path) = fuse_path {
+                        let _ = crate::utils::mount::unmount_and_wait(&path);
+                    }
+                    
+                    // Pausar el hilo esclavo para permitir que Tokio cierre sus rutinas
+                    tracing::info!("Drenando I/O en vuelo...");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+
+                    // Programar el auto-reinicio
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(format!("sleep 3; {:?} &", exe))
+                            .spawn();
+                    }
+
+                    // Ejecutar limpieza de datos (aisladamente)
+                    if let Err(e) = crate::utils::cleanup::perform_hard_reset() {
+                        tracing::error!("Error durante limpieza profunda: {:?}", e);
+                    }
+
+                    tracing::warn!("Auto-terminación tras limpieza exitosa.");
+                    std::process::exit(0);
+                });
             }
             AppMsg::Login => {
                 if let Some(ref url) = self.login_url {

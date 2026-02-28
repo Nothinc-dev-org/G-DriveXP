@@ -140,6 +140,65 @@ impl DriveClient {
         Ok(bytes.to_vec())
     }
 
+    /// Lista solo los hijos inmediatos del root de Drive.
+    /// Usado para el primer nivel del bootstrap BFS (respuesta rápida ~1s).
+    pub async fn list_root_children(&self, root_id: &str) -> Result<Vec<google_drive3::api::File>> {
+        let mut all_files = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        tracing::info!("Consultando hijos directos del root en Google Drive...");
+
+        let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
+            .await
+            .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
+            .context("No se obtuvo ningún token válido")?;
+
+        let client = reqwest::Client::new();
+        let query = format!("'{}' in parents and trashed = false", root_id);
+
+        loop {
+            let mut url = format!(
+                "https://www.googleapis.com/drive/v3/files?q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
+                urlencoding::encode(&query)
+            );
+
+            if let Some(ref token_str) = page_token {
+                url.push_str(&format!("&pageToken={}", token_str));
+            }
+
+            let response = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Error de red al listar hijos del root")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!("Error API Drive (list_root_children): {} - {}", status, body);
+                anyhow::bail!("Error API Drive: {} - {}", status, body);
+            }
+
+            let file_list: google_drive3::api::FileList = response.json()
+                .await
+                .context("Error al parsear respuesta JSON de Drive")?;
+
+            if let Some(files) = file_list.files {
+                tracing::debug!("Recibidos {} hijos del root en esta página", files.len());
+                all_files.extend(files);
+            }
+
+            page_token = file_list.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        tracing::info!("📊 Bootstrap nivel 1: {} items en root", all_files.len());
+        Ok(all_files)
+    }
+
     /// Lista todos los archivos de Google Drive con los campos necesarios para el bootstrapping
     /// NOTA: Usamos reqwest directamente para evitar que google-drive3 añada scopes automáticos
     pub async fn list_all_files(&self) -> Result<Vec<google_drive3::api::File>> {
