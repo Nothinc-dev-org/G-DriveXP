@@ -11,6 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use crate::db::MetadataRepository;
+use crate::fuse::filesystem::SHARED_INODE;
 use crate::mirror::MirrorCommand;
 use super::{IpcRequest, IpcResponse, SyncStatus, FileAvailability};
 use tokio::sync::mpsc;
@@ -211,7 +212,7 @@ async fn get_extended_file_status(
 
     // 1. Determinar Disponibilidad
     data.availability = get_file_availability(db, mirror_path, file_path).await;
-    
+
     // 2. Determinar SyncStatus
     if data.availability != FileAvailability::NotTracked {
         // Resolver inode para obtener status y shared
@@ -219,18 +220,36 @@ async fn get_extended_file_status(
         if path_str.starts_with(mirror_str.as_ref()) {
             if let Some(relative_path) = path_str.strip_prefix(mirror_str.as_ref()) {
                 let rel = relative_path.trim_start_matches('/');
-                if let Ok(Some((inode, gdrive_id))) = resolve_path_to_inode_and_gdrive_id(db, rel).await {
-                    // Obtener status
-                    data.status = get_sync_state(db, cache_dir, inode, &gdrive_id, &path_str)
-                        .await
-                        .unwrap_or(SyncStatus::Unknown);
-                    
-                    // Obtener flag de compartido
-                    if let Ok(attrs) = db.get_attrs(inode).await {
-                        data.is_shared = attrs.shared;
+                match resolve_path_to_inode_and_gdrive_id(db, rel).await {
+                    Ok(Some((inode, gdrive_id))) => {
+                        // Obtener status
+                        match get_sync_state(db, cache_dir, inode, &gdrive_id, &path_str).await {
+                            Ok(status) => {
+                                data.status = status;
+                            }
+                            Err(e) => {
+                                tracing::warn!("[IPC] path={} get_sync_state ERROR: {}", rel, e);
+                                data.status = SyncStatus::Unknown;
+                            }
+                        }
+
+                        // Obtener flag de compartido
+                        if let Ok(attrs) = db.get_attrs(inode).await {
+                            data.is_shared = attrs.shared;
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::info!("[IPC] path={} resolve returned None", rel);
+                    }
+                    Err(e) => {
+                        tracing::warn!("[IPC] path={} resolve ERROR: {}", rel, e);
                     }
                 }
+            } else {
+                tracing::info!("[IPC] path={} strip_prefix failed (mirror={})", path_str, mirror_str);
             }
+        } else {
+            tracing::info!("[IPC] path={} NOT in mirror={}", path_str, mirror_str);
         }
     }
 
@@ -243,16 +262,43 @@ async fn resolve_path_to_inode_and_gdrive_id(
     relative_path: &str,
 ) -> Result<Option<(u64, String)>> {
     let parts: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
-    
+
+    // Caso especial: carpeta virtual SHARED
+    if !parts.is_empty() && parts[0] == "SHARED" {
+        if parts.len() == 1 {
+            // La carpeta SHARED en sí
+            return Ok(Some((SHARED_INODE, "SHARED_VIRTUAL".to_string())));
+        }
+        // Hijos de SHARED están bajo root (inode 1) con owned_by_me=0
+        // Saltar "SHARED" y resolver normalmente desde root
+        let mut current_inode = 1u64;
+        for part in &parts[1..] {
+            match db.lookup(current_inode, part).await? {
+                Some(child_inode) => current_inode = child_inode,
+                None => return Ok(None),
+            }
+        }
+        let gdrive_id: Option<String> = sqlx::query_scalar(
+            "SELECT gdrive_id FROM inodes WHERE inode = ?"
+        )
+        .bind(current_inode as i64)
+        .fetch_optional(db.pool())
+        .await?;
+        return match gdrive_id {
+            Some(id) => Ok(Some((current_inode, id))),
+            None => Ok(None),
+        };
+    }
+
     let mut current_inode = 1u64; // Root inode
-    
+
     for part in parts {
         match db.lookup(current_inode, part).await? {
             Some(child_inode) => current_inode = child_inode,
             None => return Ok(None),
         }
     }
-    
+
     // Obtener gdrive_id del inode final
     let gdrive_id: Option<String> = sqlx::query_scalar(
         "SELECT gdrive_id FROM inodes WHERE inode = ?"
@@ -260,7 +306,7 @@ async fn resolve_path_to_inode_and_gdrive_id(
     .bind(current_inode as i64)
     .fetch_optional(db.pool())
     .await?;
-    
+
     match gdrive_id {
         Some(id) => Ok(Some((current_inode, id))),
         None => Ok(None),
@@ -275,11 +321,27 @@ async fn get_sync_state(
     _gdrive_id: &str,
     abs_path: &str,
 ) -> Result<SyncStatus> {
+    // Caso especial: carpeta virtual SHARED
+    if inode == SHARED_INODE {
+        let (has_local_only, has_synced, total_files) =
+            db.get_shared_directory_aggregate_status().await?;
+
+        return Ok(if total_files == 0 {
+            SyncStatus::Synced
+        } else if has_local_only {
+            SyncStatus::LocalOnly
+        } else if has_synced {
+            SyncStatus::Synced
+        } else {
+            SyncStatus::CloudOnly
+        });
+    }
+
     // 1. Verificación Física (Source of Truth para UI)
     // Si es un Symlink -> CloudOnly
     // Si es File -> Synced
     // Si no existe -> CloudOnly (o Deleted)
-    
+
     let path = std::path::Path::new(abs_path);
     let physical_state = match tokio::fs::symlink_metadata(path).await {
         Ok(meta) => {
@@ -307,9 +369,20 @@ async fn get_sync_state(
     .fetch_optional(db.pool())
     .await?;
     
-    // Los directorios siempre se consideran "sincronizados" (solo contienen metadata)
+    // Directorios: calcular estado agregado recursivo de todos sus descendientes
     if is_dir == Some(true) {
-        return Ok(SyncStatus::Synced);
+        let (has_local_only, has_synced, total_files) =
+            db.get_directory_aggregate_status(inode).await?;
+
+        return Ok(if total_files == 0 {
+            SyncStatus::Synced // Carpeta vacía
+        } else if has_local_only {
+            SyncStatus::LocalOnly // Naranja: al menos 1 hijo con cambios pendientes
+        } else if has_synced {
+            SyncStatus::Synced // Verde: al menos 1 hijo sincronizado
+        } else {
+            SyncStatus::CloudOnly // Azul: todos los hijos solo en la nube
+        });
     }
     
     // Obtener el tamaño esperado del archivo desde la base de datos

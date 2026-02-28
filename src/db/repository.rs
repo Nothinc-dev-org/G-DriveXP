@@ -802,6 +802,92 @@ impl MetadataRepository {
         Ok(dirty)
     }
 
+    /// Calcula el estado de sincronización agregado de todos los archivos
+    /// descendientes de un directorio, de forma recursiva via CTE.
+    /// Retorna (has_local_only, has_synced, total_files).
+    pub async fn get_directory_aggregate_status(&self, parent_inode: u64) -> Result<(bool, bool, i64)> {
+        let row = sqlx::query_as::<_, (i32, i32, i64)>(
+            r#"
+            WITH RECURSIVE descendants AS (
+                SELECT d.child_inode, a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                WHERE d.parent_inode = ?1
+                UNION ALL
+                SELECT d.child_inode, a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                JOIN descendants dt ON d.parent_inode = dt.child_inode
+                WHERE dt.is_dir = 1
+            )
+            SELECT
+                COALESCE(MAX(CASE
+                    WHEN s.dirty = 1 THEN 1
+                    WHEN s.deleted_at IS NOT NULL AND s.deleted_at > 0 THEN 1
+                    ELSE 0
+                END), 0) as has_local_only,
+                COALESCE(MAX(CASE
+                    WHEN COALESCE(s.availability, 'online_only') = 'local_online'
+                         AND COALESCE(s.dirty, 0) = 0
+                         AND (s.deleted_at IS NULL OR s.deleted_at = 0)
+                    THEN 1
+                    ELSE 0
+                END), 0) as has_synced,
+                COUNT(*) as total_files
+            FROM descendants d
+            LEFT JOIN sync_state s ON d.child_inode = s.inode
+            WHERE d.is_dir = 0
+            "#
+        )
+        .bind(parent_inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((row.0 != 0, row.1 != 0, row.2))
+    }
+
+    /// Calcula el estado agregado para la carpeta virtual SHARED.
+    /// Los hijos de SHARED son items en root (parent_inode=1) con owned_by_me=0.
+    pub async fn get_shared_directory_aggregate_status(&self) -> Result<(bool, bool, i64)> {
+        let row = sqlx::query_as::<_, (i32, i32, i64)>(
+            r#"
+            WITH RECURSIVE descendants AS (
+                SELECT d.child_inode, a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                WHERE d.parent_inode = 1 AND a.owned_by_me = 0
+                UNION ALL
+                SELECT d.child_inode, a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                JOIN descendants dt ON d.parent_inode = dt.child_inode
+                WHERE dt.is_dir = 1
+            )
+            SELECT
+                COALESCE(MAX(CASE
+                    WHEN s.dirty = 1 THEN 1
+                    WHEN s.deleted_at IS NOT NULL AND s.deleted_at > 0 THEN 1
+                    ELSE 0
+                END), 0) as has_local_only,
+                COALESCE(MAX(CASE
+                    WHEN COALESCE(s.availability, 'online_only') = 'local_online'
+                         AND COALESCE(s.dirty, 0) = 0
+                         AND (s.deleted_at IS NULL OR s.deleted_at = 0)
+                    THEN 1
+                    ELSE 0
+                END), 0) as has_synced,
+                COUNT(*) as total_files
+            FROM descendants d
+            LEFT JOIN sync_state s ON d.child_inode = s.inode
+            WHERE d.is_dir = 0
+            "#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((row.0 != 0, row.1 != 0, row.2))
+    }
+
     // ============================================================
     // Métodos para Soft Delete (Tombstones)
     // ============================================================

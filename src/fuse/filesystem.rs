@@ -22,8 +22,8 @@ pub struct GDriveFS {
     drive_client: Arc<DriveClient>,
     cache_dir: std::path::PathBuf,
     history: Arc<ActionHistory>,
-    /// Inodes que tienen un descargo activo en FUSE (Map de Inode -> (Transfer ID, Open Count))
-    fuse_downloads: Arc<tokio::sync::Mutex<HashMap<u64, (u64, usize)>>>,
+    /// Inodes que tienen un descargo activo en FUSE (Map de Inode -> (Option<Transfer ID>, Open Count, Session Bytes Read))
+    fuse_downloads: Arc<tokio::sync::Mutex<HashMap<u64, (Option<u64>, usize, u64)>>>,
     file_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     /// Inodes que recibieron 403 permanente de Drive API (no reintentar)
     failed_downloads: Arc<DashSet<u64>>,
@@ -464,9 +464,10 @@ impl Filesystem for GDriveFS {
              tracing::warn!("🎬 OPEN media detected: inode={} mime={} size={}", inode, mime_lower, attrs.size);
         }
 
-        // SMART PREFETCH:
-        // Iniciar descarga continua en background para TODOS los archivos (excepto Documentos de Google Workspace).
-        // Esto permite que las peticiones 'read' del kernel de Linux se sirvan desde la caché local sin latencia.
+        // SMART PREFETCH (Lazy Eval):
+        // Registramos que el archivo fue abierto. No iniciaremos la descarga agresiva
+        // inmediatamente, ya que thumbnailers abren el archivo pero nunca leen 
+        // volumen real de datos. read() se encargará de promocionarlo a stream oficial.
         let is_workspace = attrs.mime_type.as_deref().map(shortcuts::is_workspace_file).unwrap_or(false);
 
         if attrs.size > 0 && !is_workspace {
@@ -476,49 +477,12 @@ impl Filesystem for GDriveFS {
                 return Ok(ReplyOpen { fh: 0, flags: 0 });
             }
 
-            // Obtener gdrive_id
-            let gdrive_id = self.get_gdrive_id(inode).await.unwrap_or_default();
-                
-            if !gdrive_id.is_empty() {
-                let db = self.db.clone();
-                let drive_client = self.drive_client.clone();
-                let cache_path = self.get_cache_path(&gdrive_id);
-                let file_size = attrs.size as u64;
-                let inode = inode;
-
-                let file_locks = self.file_locks.clone();
-                let history = self.history.clone();
-                let fuse_downloads = self.fuse_downloads.clone();
-                let failed_downloads = self.failed_downloads.clone();
-                let read_offsets = self.read_offsets.clone();
-
-                // Fire-and-forget task: Streaming de fondo
-                tokio::spawn(async move {
-                     let result = Self::start_background_download_stream(
-                         db,
-                         drive_client,
-                         inode,
-                         gdrive_id,
-                         cache_path,
-                         file_size,
-                         file_locks,
-                         history,
-                         fuse_downloads,
-                         read_offsets,
-                         is_media,
-                     ).await;
-
-                     // Si el error contiene 403, marcar como fallo permanente
-                     if let Err(ref e) = result {
-                         let err_msg = format!("{}", e);
-                         if err_msg.contains("403") && err_msg.contains("cannot") {
-                             failed_downloads.insert(inode);
-                             tracing::warn!("🚫 Inode {} marcado como descarga prohibida (403 permanente)", inode);
-                         }
-                     }
-                });
-                
-                tracing::info!("🚀 Background streamer triggered for inode={} size={}", inode, file_size);
+            // Sync FD tracking
+            let mut f_dls = self.fuse_downloads.lock().await;
+            if let Some((_, count, _)) = f_dls.get_mut(&inode) {
+                *count += 1;
+            } else {
+                f_dls.insert(inode, (None, 1, 0));
             }
         }
         
@@ -539,16 +503,22 @@ impl Filesystem for GDriveFS {
         
         let mut fuse_downloads = self.fuse_downloads.lock().await;
         let mut should_remove = false;
+        let mut completed_transfer_id = None;
         if let Some(entry) = fuse_downloads.get_mut(&inode) {
             entry.1 = entry.1.saturating_sub(1);
             if entry.1 == 0 {
                 should_remove = true;
-                self.history.complete_transfer(entry.0);
-                tracing::debug!("✅ Transfer FUSE completado y removido de la interfaz: inode={}", inode);
+                completed_transfer_id = entry.0;
             }
         }
         if should_remove {
             fuse_downloads.remove(&inode);
+            if let Some(t_id) = completed_transfer_id {
+                self.history.complete_transfer(t_id);
+                tracing::debug!("✅ Transfer FUSE completado y removido de la interfaz: inode={}", inode);
+            } else {
+                tracing::debug!("✅ Archivo cerrado sin iniciar streaming (Thumbnailer/Metadata): inode={}", inode);
+            }
         }
 
         Ok(())
@@ -657,6 +627,62 @@ impl Filesystem for GDriveFS {
             if self.failed_downloads.contains(&inode) {
                 tracing::debug!("🚫 read() bloqueado para inode={} (descarga 403 permanente)", inode);
                 return Err(Errno::from(libc::EIO));
+            }
+
+            // --- HEURÍSTICA DE VOLUMEN (Smart Streamer Lazy Trigger) ---
+            // Si el volumen ACUMULADO de lecturas para este descriptor supera 1MB, oficializamos el "Stream".
+            // Esto descarta a thumbnailers que saltan rápido por todo el archivo buscando XREFs de PDFs.
+            let stream_threshold = 1024 * 1024; // 1 MB
+            let is_media = mime_type.as_deref().map(|m| m.starts_with("video/") || m.starts_with("audio/")).unwrap_or(false);
+            
+            let mut trigger_smart_stream = false;
+            
+            {
+                let mut f_dls = self.fuse_downloads.lock().await;
+                if let Some((t_id_opt, _, session_bytes)) = f_dls.get_mut(&inode) {
+                    *session_bytes += size as u64; // Acumular bytes leídos
+                    
+                    if *session_bytes >= stream_threshold && t_id_opt.is_none() {
+                        trigger_smart_stream = true;
+                        
+                        // Oficializamos la transferencia
+                        let db = self.db.clone();
+                        let file_name = sqlx::query_scalar::<_, String>("SELECT name FROM dentry WHERE child_inode = ? LIMIT 1")
+                            .bind(inode as i64).fetch_optional(db.pool()).await.unwrap_or_default().unwrap_or_else(|| format!("file_{}", inode));
+                        
+                        let op = if is_media { TransferOp::Stream } else { TransferOp::Download };
+                        let new_t_id = self.history.start_transfer(&file_name, op, file_size as u64);
+                        *t_id_opt = Some(new_t_id);
+                    }
+                }
+            }
+            
+            if trigger_smart_stream {
+                // Lanzar el streamer
+                let drive_client = self.drive_client.clone();
+                let cache_path_bg = cache_path.clone();
+                let file_locks = self.file_locks.clone();
+                let history = self.history.clone();
+                let fuse_downloads_clone = self.fuse_downloads.clone();
+                let failed_downloads = self.failed_downloads.clone();
+                let read_offsets = self.read_offsets.clone();
+                let gd_id_bg = gdrive_id.clone();
+                let db_clone = self.db.clone();
+
+                tokio::spawn(async move {
+                    let result = Self::start_background_download_stream(
+                        db_clone, drive_client, inode, gd_id_bg, cache_path_bg, file_size as u64,
+                        file_locks, history, fuse_downloads_clone, read_offsets, is_media
+                    ).await;
+
+                    if let Err(ref e) = result {
+                        let err_msg = format!("{}", e);
+                        if err_msg.contains("403") && err_msg.contains("cannot") {
+                            failed_downloads.insert(inode);
+                        }
+                    }
+                });
+                tracing::info!("🚀 Heurística de volumen disparada (>1MB reales leídos). Smart Streamer iniciado para inode={}", inode);
             }
 
             // Descargar solo lo necesario
@@ -1470,9 +1496,9 @@ impl GDriveFS {
         let transfer_id;
         let mut fuse_downloads = self.fuse_downloads.lock().await;
 
-        if let Some((existing_t_id, _)) = fuse_downloads.get(&inode) {
+        if let Some((existing_t_id, _, _)) = fuse_downloads.get(&inode) {
             // Ya hay un transfer en curso
-            transfer_id = Some(*existing_t_id);
+            transfer_id = *existing_t_id;
         } else {
             // Registrar nuevo transfer de FUSE Download
             let file_name = self.get_file_name(inode).await.unwrap_or_else(|_| format!("file_{}", inode));
@@ -1482,7 +1508,7 @@ impl GDriveFS {
                 TransferOp::Download,
                 file_size
             );
-            fuse_downloads.insert(inode, (t_id, 1));
+            fuse_downloads.insert(inode, (Some(t_id), 1, 0));
             transfer_id = Some(t_id);
         }
 
@@ -1682,7 +1708,7 @@ impl GDriveFS {
         file_size: u64,
         file_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
         history: Arc<ActionHistory>,
-        fuse_downloads_map: Arc<tokio::sync::Mutex<HashMap<u64, (u64, usize)>>>,
+        fuse_downloads_map: Arc<tokio::sync::Mutex<HashMap<u64, (Option<u64>, usize, u64)>>>,
         read_offsets: Arc<DashMap<u64, u64>>,
         is_media: bool,
     ) -> anyhow::Result<()> {
@@ -1723,23 +1749,13 @@ impl GDriveFS {
         .unwrap_or_else(|| format!("file_{}", inode));
 
         // --- FUSE DOWNLOAD PROGRESS TRACKING ---
-        let transfer_id;
-        let mut f_dls = fuse_downloads_map.lock().await;
-
-        if let Some((existing_t_id, count)) = f_dls.get_mut(&inode) {
-            *count += 1;
-            let _ = existing_t_id; // Marcar como usado para el compilador si fuese necesario
-            tracing::debug!("Background streamer ya activo para inode={} (open count: {}). Abortando duplicado.", inode, count);
-            return Ok(());
-        } else {
-            let op = if is_media { TransferOp::Stream } else { TransferOp::Download };
-            let t_id = history.start_transfer(
-                &file_name,
-                op,
-                file_size
-            );
-            f_dls.insert(inode, (t_id, 1));
-            transfer_id = Some(t_id);
+        // La transferencia ya fue inicializada oficialmente por la heurística de read()
+        let mut transfer_id = None;
+        {
+            let f_dls = fuse_downloads_map.lock().await;
+            if let Some((Some(t_id), _, _)) = f_dls.get(&inode) {
+                transfer_id = Some(*t_id);
+            }
         }
 
         if let Some(t_id) = transfer_id {
@@ -1747,8 +1763,6 @@ impl GDriveFS {
                 history.update_transfer_progress(t_id, cached_bytes);
             }
         }
-        
-        drop(f_dls); // Liberar lock antes de las tareas largas en red
 
         tracing::info!("🚀 Iniciando {} inteligente para: {} ({} bytes)", 
                       if is_media { "streaming" } else { "descarga" }, file_name, file_size);
