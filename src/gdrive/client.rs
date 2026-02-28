@@ -240,8 +240,8 @@ impl DriveClient {
     }
 
     /// Lista cambios desde un page_token dado
-    /// Retorna: (cambios, nuevo_start_page_token si es la última página)
-    pub async fn list_changes(&self, page_token: &str) -> Result<(Vec<google_drive3::api::Change>, Option<String>)> {
+    /// Retorna: (cambios, nuevo_start_page_token si es la última página, has_more)
+    pub async fn list_changes(&self, page_token: &str) -> Result<(Vec<google_drive3::api::Change>, Option<String>, bool)> {
         let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
             .await
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
@@ -274,18 +274,19 @@ impl DriveClient {
             .context("Error al parsear respuesta de changes")?;
 
         let changes = change_list.changes.unwrap_or_default();
-        let new_start_token = change_list.new_start_page_token;
+        let has_more = change_list.next_page_token.is_some();
+        let next_token = change_list.next_page_token.clone().or(change_list.new_start_page_token.clone());
 
         tracing::debug!(
             "Changes: {} cambios, next_page={:?}, new_start={:?}",
             changes.len(),
             change_list.next_page_token,
-            new_start_token
+            change_list.new_start_page_token
         );
 
-        // Si hay new_start_page_token, es la última página
-        // Si hay next_page_token, hay más páginas (pero no lo procesamos aquí, el syncer hará loop)
-        Ok((changes, new_start_token))
+        // Retornamos el siguiente token a usar (ya sea next_page_token para seguir iterando
+        // o new_start_page_token si llegamos al final de los cambios actuales)
+        Ok((changes, next_token, has_more))
     }
 
     /// Obtiene el MD5 checksum de un archivo remoto (para detectar conflictos)

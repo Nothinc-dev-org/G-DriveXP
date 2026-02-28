@@ -121,6 +121,14 @@ pub fn run_backend(
             sync::bootstrap::sync_all_metadata(&db, &drive_client, &root_id).await?;
         }
         
+        // Fase 2.15: Instanciar MirrorManager tempranamente para compartir su sender
+        let (mirror_manager, mirror_sender) = mirror::MirrorManager::new(
+            db.clone(),
+            config.mirror_path.clone(),
+            config.fuse_mount_path.clone(),
+            history.clone(),
+        );
+
         // Fase 2.2: Background Syncer (sincronización continua)
         tracing::info!("Iniciando sincronizador en background...");
         let syncer = sync::syncer::BackgroundSyncer::new(
@@ -129,6 +137,7 @@ pub fn run_backend(
             60, // Intervalo base: 60 segundos
             history.clone(),
             sync_paused.clone(),
+            mirror_sender.clone(),
         );
         let _syncer_handle = syncer.spawn();
         
@@ -221,12 +230,6 @@ pub fn run_backend(
             }
         }
 
-        let (mirror_manager, mirror_sender) = mirror::MirrorManager::new(
-            db.clone(),
-            config.mirror_path.clone(),
-            config.fuse_mount_path.clone(),
-            history.clone(),
-        );
         let _mirror_handle = mirror_manager.spawn();
         
         // Fase 2.5: Servidor IPC para extensiones externas (Nautilus)

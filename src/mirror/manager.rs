@@ -17,6 +17,8 @@ pub enum MirrorCommand {
     /// Reprocesar todo el directorio espejo
     #[allow(dead_code)]
     Refresh,
+    /// Notificación de archivos eliminados en Google Drive
+    RemoteDeleted { paths: Vec<String> },
 }
 
 use crate::mirror::watcher::MirrorWatcher;
@@ -272,6 +274,21 @@ impl MirrorManager {
                              tokio::spawn(async move {
                                  let _ = Self::run_bootstrap(ctx_refresh).await;
                              });
+                        }
+                        MirrorCommand::RemoteDeleted { paths } => {
+                            for relative in paths {
+                                let path_to_check = self.ctx.mirror_path.join(&relative);
+                                if path_to_check.exists() || tokio::fs::symlink_metadata(&path_to_check).await.is_ok() {
+                                    tracing::info!("🗑️ MirrorManager eliminando reflejo obsoleto de eliminación remota: {:?}", path_to_check);
+                                    if let Ok(meta) = tokio::fs::symlink_metadata(&path_to_check).await {
+                                        if meta.is_dir() {
+                                            let _ = tokio::fs::remove_dir_all(&path_to_check).await;
+                                        } else {
+                                            let _ = tokio::fs::remove_file(&path_to_check).await;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

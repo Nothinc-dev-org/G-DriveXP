@@ -34,6 +34,7 @@ pub struct BackgroundSyncer {
     history: ActionHistory,
     sync_paused: Arc<AtomicBool>,
     root_id_cache: Arc<RwLock<Option<String>>>,
+    mirror_tx: tokio::sync::mpsc::Sender<crate::mirror::manager::MirrorCommand>,
 }
 
 impl BackgroundSyncer {
@@ -44,6 +45,7 @@ impl BackgroundSyncer {
         interval_secs: u64,
         history: ActionHistory,
         sync_paused: Arc<AtomicBool>,
+        mirror_tx: tokio::sync::mpsc::Sender<crate::mirror::manager::MirrorCommand>,
     ) -> Self {
         Self {
             db,
@@ -52,6 +54,7 @@ impl BackgroundSyncer {
             history,
             sync_paused,
             root_id_cache: Arc::new(RwLock::new(None)),
+            mirror_tx,
         }
     }
 
@@ -106,7 +109,7 @@ impl BackgroundSyncer {
         let root_id = self.get_cached_root_id().await?;
 
         // 1. Obtener page_token guardado o solicitar uno nuevo
-        let page_token = match self.db.get_sync_meta(SYNC_META_PAGE_TOKEN).await? {
+        let mut page_token = match self.db.get_sync_meta(SYNC_META_PAGE_TOKEN).await? {
             Some(token) => token,
             None => {
                 // Primera vez: obtener startPageToken
@@ -117,44 +120,56 @@ impl BackgroundSyncer {
             }
         };
 
-        // 2. Consultar cambios
-        let (changes, new_start_token) = self.client.list_changes(&page_token).await?;
-        
-        let changes_count = changes.len();
+        let mut total_fetched = 0;
+        let mut total_applied = 0;
 
-        // 3. Procesar cada cambio (con tracking de progreso)
-        if changes_count > 0 {
-            self.history.set_sync_progress(changes_count, 0);
-        }
-        
-        let root_id_arc = Arc::new(root_id);
+        loop {
+            // 2. Consultar cambios
+            let (changes, next_token, has_more) = self.client.list_changes(&page_token).await?;
+            
+            let changes_count = changes.len();
+            total_fetched += changes_count;
 
-        let process_results = stream::iter(changes)
-            .map(|change| {
-                let root_id_ref = root_id_arc.clone();
-                async move {
-                    self.process_change(change, &root_id_ref).await
-                }
-            })
-            .buffer_unordered(4)
-            .collect::<Vec<_>>()
-            .await;
-
-        for res in process_results {
-            if let Err(e) = res {
-                tracing::warn!("Error procesando cambio individual: {:?}", e);
+            // 3. Procesar cada cambio (con tracking de progreso)
+            if changes_count > 0 {
+                self.history.set_sync_progress(total_fetched, total_applied);
             }
-            self.history.increment_applied();
+            
+            let root_id_arc = Arc::new(root_id.clone());
+
+            let process_results = stream::iter(changes)
+                .map(|change| {
+                    let root_id_ref = root_id_arc.clone();
+                    async move {
+                        self.process_change(change, &root_id_ref).await
+                    }
+                })
+                .buffer_unordered(4)
+                .collect::<Vec<_>>()
+                .await;
+
+            for res in process_results {
+                if let Err(e) = res {
+                    tracing::warn!("Error procesando cambio individual: {:?}", e);
+                }
+                self.history.increment_applied();
+                total_applied += 1;
+            }
+
+            // 4. Guardar nuevo token (puede ser de siguiente página o start page)
+            if let Some(new_token) = next_token {
+                self.db.set_sync_meta(SYNC_META_PAGE_TOKEN, &new_token).await?;
+                tracing::debug!("Nuevo pageToken guardado: {}", new_token);
+                page_token = new_token;
+            }
+
+            if !has_more {
+                break;
+            }
         }
 
-        if changes_count > 0 {
+        if total_fetched > 0 {
             self.history.mark_all_synced();
-        }
-
-        // 4. Guardar nuevo token si es la última página
-        if let Some(new_token) = new_start_token {
-            self.db.set_sync_meta(SYNC_META_PAGE_TOKEN, &new_token).await?;
-            tracing::debug!("Nuevo pageToken guardado: {}", new_token);
         }
 
         // 5. Purgar tombstones expirados (cada ciclo, es barato)
@@ -163,7 +178,7 @@ impl BackgroundSyncer {
             tracing::info!("Purgados {} tombstones expirados", purged);
         }
 
-        Ok(changes_count)
+        Ok(total_fetched)
     }
 
     /// Obtiene el root_id cacheado o lo descarga
@@ -181,6 +196,19 @@ impl BackgroundSyncer {
         Ok(id)
     }
 
+    async fn get_relative_path_for_deletion(&self, file_id: &str) -> Option<String> {
+        if let Ok(Some(inode)) = sqlx::query_scalar::<_, i64>("SELECT inode FROM inodes WHERE gdrive_id = ?")
+            .bind(file_id)
+            .fetch_optional(self.db.pool())
+            .await 
+        {
+            if let Ok(Some(rel_path)) = self.db.resolve_inode_to_relative_path(inode as u64).await {
+                return Some(rel_path);
+            }
+        }
+        None
+    }
+
     /// Procesa un cambio individual de la API
     async fn process_change(&self, change: google_drive3::api::Change, root_id: &str) -> Result<()> {
         let file_id = change.file_id.as_deref()
@@ -189,9 +217,13 @@ impl BackgroundSyncer {
         // Caso 1: Archivo eliminado permanentemente (ya no existe en Drive)
         if change.removed == Some(true) {
             tracing::debug!("Cambio detectado: REMOVED (hard delete) file_id={}", file_id);
+            let path_to_delete = self.get_relative_path_for_deletion(file_id).await;
             // El archivo fue eliminado permanentemente de Drive (incluyendo papelera vacía)
             // → Hard delete: eliminar completamente de la DB local
             self.db.hard_delete_by_gdrive_id(file_id).await?;
+            if let Some(p) = path_to_delete {
+                let _ = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await;
+            }
             return Ok(());
         }
 
@@ -200,7 +232,11 @@ impl BackgroundSyncer {
             // Verificar si está en la papelera
             if file.trashed == Some(true) {
                 tracing::debug!("Cambio detectado: TRASHED file_id={}", file_id);
+                let path_to_delete = self.get_relative_path_for_deletion(file_id).await;
                 self.db.soft_delete_by_gdrive_id(file_id).await?;
+                if let Some(p) = path_to_delete {
+                    let _ = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await;
+                }
                 return Ok(());
             }
 
