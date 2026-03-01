@@ -119,6 +119,14 @@ pub fn run_backend(
             Arc::new(history.clone()),
         );
         
+        // Fase 2.15: Instanciar MirrorManager tempranamente para compartir su sender
+        let (mirror_manager, mirror_sender) = mirror::MirrorManager::new(
+            db.clone(),
+            config.mirror_path.clone(),
+            config.fuse_mount_path.clone(),
+            history.clone(),
+        );
+
         // Fase 2.1: Bootstrapping (Sincronización de metadatos)
         let bootstrap_done = db.get_sync_meta("bootstrap_complete").await?;
         if bootstrap_done.is_none() {
@@ -133,6 +141,7 @@ pub fn run_backend(
             let db_bg = db.clone();
             let client_bg = drive_client.clone();
             let root_id_bg = root_id.clone();
+            let mirror_tx_bg = mirror_sender.clone();
             ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Escaneando Drive en segundo plano...".to_string()));
             tokio::spawn(async move {
                 tracing::info!("Iniciando bootstrap BFS en background...");
@@ -141,18 +150,13 @@ pub fn run_backend(
                 } else {
                     let _ = db_bg.set_sync_meta("bootstrap_complete", "true").await;
                     tracing::info!("Bootstrap BFS completado y marcado como finalizado.");
+                    
+                    // Notificar al MirrorManager que el árbol ha sido completado y hay archivos compartidos nuevos
+                    let _ = mirror_tx_bg.send(mirror::MirrorCommand::Refresh).await;
                 }
             });
         }
         
-        // Fase 2.15: Instanciar MirrorManager tempranamente para compartir su sender
-        let (mirror_manager, mirror_sender) = mirror::MirrorManager::new(
-            db.clone(),
-            config.mirror_path.clone(),
-            config.fuse_mount_path.clone(),
-            history.clone(),
-        );
-
         // Fase 2.2: Background Syncer (sincronización continua)
         tracing::info!("Iniciando sincronizador en background...");
         let syncer = sync::syncer::BackgroundSyncer::new(

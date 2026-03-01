@@ -442,11 +442,8 @@ impl MetadataRepository {
             .map(|(inode, path)| (inode as u64, path))
             .collect();
 
-        // Inyectar el directorio virtual SHARED si hay ítems no propios en la raíz
-        let count_non_owned = self.count_non_owned_root_children().await.unwrap_or(0);
-        if count_non_owned > 0 {
-            results.insert(0, (0xFFFF_FFFF_FFFF_FFFE, "SHARED".to_string()));
-        }
+        // Inyectar el directorio virtual SHARED incondicionalmente
+        results.insert(0, (0xFFFF_FFFF_FFFF_FFFE, "SHARED".to_string()));
 
         Ok(results)
     }
