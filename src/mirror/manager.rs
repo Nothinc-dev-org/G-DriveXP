@@ -134,7 +134,7 @@ impl MirrorManager {
         info!("📁 Se encontraron {} directorios activos en DB", dirs.len());
         for (_inode, relative_path) in dirs {
             let mirror_dir = ctx.mirror_path.join(&relative_path);
-            if !mirror_dir.exists() {
+            if tokio::fs::symlink_metadata(&mirror_dir).await.is_err() {
                 if let Err(e) = tokio::fs::create_dir_all(&mirror_dir).await {
                     warn!("No se pudo crear directorio {:?}: {:?}", mirror_dir, e);
                 }
@@ -142,22 +142,37 @@ impl MirrorManager {
         }
 
         let files = ctx.db.get_all_active_files().await?;
-        info!("📂 Se encontraron {} archivos activos en DB", files.len());
-        
+        let total = files.len();
+        info!("📂 Se encontraron {} archivos activos en DB", total);
+
+        let mut processed = 0u64;
+        let mut repaired = 0u64;
+
         for (_inode, relative_path, availability) in files {
+            processed += 1;
+            if processed % 5000 == 0 || processed == total as u64 {
+                info!("🔄 Bootstrap progreso: {}/{} archivos verificados ({} reparados)", processed, total, repaired);
+            }
+
             let mirror_file = ctx.mirror_path.join(&relative_path);
-            
-            // Asegurar que el directorio padre existe
+
+            // Asegurar que el directorio padre existe (async, no sigue symlinks)
             if let Some(parent) = mirror_file.parent() {
-                if !parent.exists() {
+                if tokio::fs::symlink_metadata(parent).await.is_err() {
                     let _ = tokio::fs::create_dir_all(parent).await;
                 }
             }
-            
+
+            // Una sola llamada async para obtener metadata del mirror file (lstat, NO sigue symlinks)
+            let meta = tokio::fs::symlink_metadata(&mirror_file).await;
+            let file_exists = meta.is_ok();
+            let is_symlink = meta.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
+            // is_file() sobre symlink_metadata retorna true solo para archivos reales, no symlinks
+            let is_real_file = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
+
             match availability.as_str() {
                 "online_only" => {
-                    // Verificar si existe y si apunta al lugar correcto
-                    let should_recreate = if mirror_file.is_symlink() {
+                    let should_recreate = if is_symlink {
                         match tokio::fs::read_link(&mirror_file).await {
                             Ok(target) => {
                                 // Si no empieza con el path de montaje actual, está roto/obsoleto
@@ -166,33 +181,30 @@ impl MirrorManager {
                             Err(_) => true,
                         }
                     } else {
-                        !mirror_file.exists()
+                        !file_exists
                     };
 
                     if should_recreate {
-                        // FIX CRÍTICO: No borrar el archivo explícitamente.
-                        // `remove_file` dispara un evento de eliminación que el Watcher captura
-                        // y el Uploader procesa borrando el archivo remoto.
-                        // `static_handle_set_online_only` usa `rename` atómico que sobrescribe el destino.
-                        Self::static_handle_set_online_only(&ctx, &mirror_file.to_string_lossy()).await;
-                    } else if mirror_file.is_file() && !mirror_file.is_symlink() {
-                        // Caso delicado: DB dice OnlineOnly, FS tiene archivo real.
+                        // bubble=false: no burbujear dir_counters individualmente; se reconstruyen al final.
+                        Self::static_handle_set_online_only_opt(&ctx, &mirror_file.to_string_lossy(), false).await;
+                        repaired += 1;
+                    } else if is_real_file {
+                        // Caso delicado: DB dice OnlineOnly, FS tiene archivo real (no symlink).
                         warn!("CONFLICTO: DB dice OnlineOnly pero existe archivo local: {:?}", relative_path);
                     }
                 }
                 "local_online" => {
-                    // Queremos archivo real. Si es symlink o no existe, descargamos.
-                    let is_symlink = tokio::fs::symlink_metadata(&mirror_file).await
-                        .map(|m| m.is_symlink())
-                        .unwrap_or(false);
-                        
-                    if !mirror_file.exists() || is_symlink {
-                        Self::static_handle_set_local_online(&ctx, &mirror_file.to_string_lossy()).await;
+                    // Queremos archivo real. Si es symlink o no existe, reparamos.
+                    if !file_exists || is_symlink {
+                        // bubble=false: no burbujear dir_counters individualmente; se reconstruyen al final.
+                        Self::static_handle_set_local_online_opt(&ctx, &mirror_file.to_string_lossy(), false).await;
+                        repaired += 1;
                     }
                 }
                 _ => {}
             }
         }
+        info!("🔄 Bootstrap: {} archivos verificados, {} reparados", processed, repaired);
         // PASO 3: LIMPIEZA DE SYMLINKS OBSOLETOS EN ROOT
         // En versiones anteriores, los archivos compartidos (owned_by_me=0) se colocaban
         // en la raíz del espejo. Ahora se colocan bajo SHARED/. Este paso detecta y elimina
@@ -253,6 +265,13 @@ impl MirrorManager {
             }
         }
 
+        // PASO FINAL: Reconstruir dir_counters en una sola pasada CTE.
+        // Durante el bootstrap, las llamadas a set_availability usaron bubble=false
+        // para evitar N burbujeos individuales. Consolidamos todo aquí.
+        if let Err(e) = ctx.db.rebuild_all_dir_counters().await {
+            error!("Error reconstruyendo dir_counters post-bootstrap: {:?}", e);
+        }
+
         info!("✅ Bootstrap completado");
         Ok(())
     }
@@ -306,9 +325,15 @@ impl MirrorManager {
     // Funciones estáticas que reciben contexto en lugar de &self
     
     async fn static_handle_set_online_only(ctx: &MirrorContext, path_str: &str) {
+        Self::static_handle_set_online_only_opt(ctx, path_str, true).await;
+    }
+
+    /// `bubble`: si es true, propaga cambios de dir_counters (runtime normal).
+    /// Si es false, omite el burbujeo (bootstrap masivo — se invoca rebuild al final).
+    async fn static_handle_set_online_only_opt(ctx: &MirrorContext, path_str: &str, bubble: bool) {
         let path = PathBuf::from(path_str);
         tracing::info!("🪞 Procesando SetOnlineOnly para: {:?}", path);
-        
+
         // 1. Validar que el path está dentro del mirror
         if !path.starts_with(&ctx.mirror_path) {
             warn!("Intento de modificar archivo fuera del mirror: {}", path_str);
@@ -322,7 +347,7 @@ impl MirrorManager {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| path_str.to_string());
                     ctx.history.log(ActionType::Sync, format!("Liberando espacio en carpeta: {}", name_display));
-                    
+
                     let mut stack = vec![path.clone()];
                     while let Some(current_dir) = stack.pop() {
                         if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
@@ -332,7 +357,7 @@ impl MirrorManager {
                                     if m.is_dir() {
                                         stack.push(child_path);
                                     } else {
-                                        Self::do_handle_set_online_only(ctx, &child_path, false).await;
+                                        Self::do_handle_set_online_only_opt(ctx, &child_path, false, bubble).await;
                                     }
                                 }
                             }
@@ -350,19 +375,19 @@ impl MirrorManager {
                 }
             }
         }
-        
-        Self::do_handle_set_online_only(ctx, &path, true).await;
+
+        Self::do_handle_set_online_only_opt(ctx, &path, true, bubble).await;
     }
 
-    async fn do_handle_set_online_only(ctx: &MirrorContext, path: &PathBuf, log_history: bool) {
+    async fn do_handle_set_online_only_opt(ctx: &MirrorContext, path: &PathBuf, log_history: bool, bubble: bool) {
         // 2. Calcular path relativo y path FUSE
         let relative = match path.strip_prefix(&ctx.mirror_path) {
             Ok(p) => p,
             Err(_) => return,
         };
-        
+
         let fuse_path = ctx.fuse_mount_path.join(relative);
-        
+
         // 3. Database is source of truth - No FUSE access to avoid deadlock
 
         // If inode exists in DB with valid gdrive_id, file WILL exist in FUSE when accessed
@@ -401,27 +426,27 @@ impl MirrorManager {
         let file_name = path.file_name()
             .map(|f| f.to_string_lossy())
             .unwrap_or_else(|| "unknown".into());
-            
+
         // Usar UUID o random, pero por simplicidad usaremos un prefijo único simple
         // para evitar colisiones si hay múltiples operaciones en el mismo archivo.
         let unique_name = format!("{}.{}.link.tmp", uuid::Uuid::new_v4(), file_name);
         let tmp_symlink_path = temp_dir_root.join(&unique_name);
-        
+
         let fuse_path_clone = fuse_path.clone();
         let tmp_path_clone = tmp_symlink_path.clone();
-        
+
         tracing::debug!("🪞 Creando symlink temporal en zona segura: {:?} -> {:?}", tmp_symlink_path, fuse_path);
-        
+
         // Crear el symlink en ubicación temporal externa (blocking)
         let create_result = tokio::task::spawn_blocking(move || {
             std::os::unix::fs::symlink(&fuse_path_clone, &tmp_path_clone)
         }).await;
-        
+
         match create_result {
             Ok(Ok(())) => {
                 // 6. ACTUALIZAR DB ANTES DEL RENAME
                 if let Ok(Some(inode)) = ctx.db.resolve_relative_path_to_inode(relative.to_str().unwrap_or("")).await {
-                    if let Err(e) = ctx.db.set_availability(inode, "online_only").await {
+                    if let Err(e) = ctx.db.set_availability(inode, "online_only", bubble).await {
                         warn!("Error actualizando disponibilidad en DB para {:?}: {:?}", relative, e);
                     }
                 } else {
@@ -481,9 +506,15 @@ impl MirrorManager {
     }
 
     async fn static_handle_set_local_online(ctx: &MirrorContext, path_str: &str) {
+        Self::static_handle_set_local_online_opt(ctx, path_str, true).await;
+    }
+
+    /// `bubble`: si es true, propaga cambios de dir_counters (runtime normal).
+    /// Si es false, omite el burbujeo (bootstrap masivo — se invoca rebuild al final).
+    async fn static_handle_set_local_online_opt(ctx: &MirrorContext, path_str: &str, bubble: bool) {
         let path = PathBuf::from(path_str);
         tracing::info!("🪞 Procesando SetLocalOnline para: {:?}", path);
-        
+
         // 1. Validar path
         if !path.starts_with(&ctx.mirror_path) {
             tracing::warn!("Path fuera del mirror");
@@ -497,7 +528,7 @@ impl MirrorManager {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| path_str.to_string());
                     ctx.history.log(ActionType::Download, format!("Descargando carpeta: {}", name_display));
-                    
+
                     let mut stack = vec![path.clone()];
                     while let Some(current_dir) = stack.pop() {
                         if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
@@ -507,7 +538,7 @@ impl MirrorManager {
                                     if m.is_dir() {
                                         stack.push(child_path);
                                     } else {
-                                        Self::do_handle_set_local_online(ctx, &child_path, false).await;
+                                        Self::do_handle_set_local_online_opt(ctx, &child_path, false, bubble).await;
                                     }
                                 }
                             }
@@ -519,30 +550,30 @@ impl MirrorManager {
             Err(_) => {} // Proceed as normal if error, maybe file doesn't exist but is in DB
         }
 
-        Self::do_handle_set_local_online(ctx, &path, true).await;
+        Self::do_handle_set_local_online_opt(ctx, &path, true, bubble).await;
     }
 
-    async fn do_handle_set_local_online(ctx: &MirrorContext, path: &PathBuf, log_history: bool) {
+    async fn do_handle_set_local_online_opt(ctx: &MirrorContext, path: &PathBuf, log_history: bool, bubble: bool) {
         let relative = match path.strip_prefix(&ctx.mirror_path) {
            Ok(p) => p,
            Err(_) => return,
         };
-        
+
         let fuse_path = ctx.fuse_mount_path.join(relative);
         tracing::debug!("🪞 Fuse path objetivo: {:?}", fuse_path);
-        
+
         let meta = tokio::fs::symlink_metadata(&path).await;
         if let Ok(m) = meta {
             if !m.is_symlink() && m.is_file() {
                 info!("El archivo ya es local y real: {:?}", relative);
                 // Asegurar que DB esté sincronizada
                  if let Ok(Some(inode)) = ctx.db.resolve_relative_path_to_inode(relative.to_str().unwrap_or("")).await {
-                    let _ = ctx.db.set_availability(inode, "local_online").await;
+                    let _ = ctx.db.set_availability(inode, "local_online", bubble).await;
                 }
                 return;
             }
         }
-        
+
         // 2. Database is source of truth - If DB has inode, we proceed
         // FUSE will serve the file on-demand when accessed
 
@@ -553,7 +584,7 @@ impl MirrorManager {
             ctx.history.log(ActionType::Download, format!("Descargando: {}", name_display));
         }
         info!("📥 Iniciando descarga: {:?}", relative);
-        
+
         // 3. Copiar contenido usando spawn_blocking (evitar bloqueo de runtime)
         // La lectura de FUSE es bloqueante, debe ejecutarse en thread separado
         // 3. Copiar contenido usando spawn_blocking (evitar bloqueo de runtime)
@@ -572,25 +603,25 @@ impl MirrorManager {
             .unwrap_or_else(|| "unknown".into());
 
         let unique_name = format!("{}.{}.tmp_download", uuid::Uuid::new_v4(), file_name);
-        
+
         let tmp_path = temp_dir_root.join(&unique_name);
-        
+
         let fuse_path_clone = fuse_path.clone();
         let tmp_path_copy = tmp_path.clone();
-        
+
         let total_bytes = tokio::fs::metadata(&fuse_path).await.map(|m| m.len()).unwrap_or(0);
         let transfer_id = ctx.history.start_transfer(file_name.to_string(), TransferOp::Download, total_bytes);
         let history_clone = ctx.history.clone();
-        
+
         tracing::debug!("🪞 Copiando {:?} -> {:?}", fuse_path, tmp_path);
         let copy_result = tokio::task::spawn_blocking(move || {
             use std::io::{Read, Write};
             let mut src = std::fs::File::open(&fuse_path_clone)?;
             let mut dst = std::fs::File::create(&tmp_path_copy)?;
-            
+
             let mut buffer = vec![0u8; 2 * 1024 * 1024]; // 2MB buffer
             let mut copied = 0u64;
-            
+
             loop {
                 let n = src.read(&mut buffer)?;
                 if n == 0 {
@@ -603,9 +634,9 @@ impl MirrorManager {
             dst.sync_all()?;
             Ok::<u64, std::io::Error>(copied)
         }).await;
-        
+
         ctx.history.complete_transfer(transfer_id);
-        
+
         match copy_result {
             Ok(Ok(_)) => {
                 tracing::debug!("🪞 Copia finalizada. Preparando intercambio...");
@@ -617,14 +648,14 @@ impl MirrorManager {
             }
             Err(e) => {
                 error!("Error en spawn_blocking: {:?}", e);
-                let _ = tokio::fs::remove_file(&tmp_path).await; 
+                let _ = tokio::fs::remove_file(&tmp_path).await;
                 return;
             }
         }
-        
+
         // 4. ACTUALIZAR DB ANTES DEL SWAP FINAL
         if let Ok(Some(inode)) = ctx.db.resolve_relative_path_to_inode(relative.to_str().unwrap_or("")).await {
-            if let Err(e) = ctx.db.set_availability(inode, "local_online").await {
+            if let Err(e) = ctx.db.set_availability(inode, "local_online", bubble).await {
                 warn!("Error actualizando disponibilidad en DB para {:?}: {:?}", relative, e);
             }
         }
@@ -641,7 +672,7 @@ impl MirrorManager {
                   ctx.history.log(ActionType::Download, format!("Descargado: {}", name_display));
               }
               info!("✅ Archivo descargado exitosamente (External Temp): {:?}", relative);
-              
+
               // 6. FORCE NAUTILUS REFRESH
               let path_clone = path.clone();
               tokio::spawn(async move {
@@ -1063,12 +1094,10 @@ impl MirrorManager {
 
         // 6. Marcar DIRTY, LocalOnline y burbujear estado
         // Primero asegurar availability='local_online'
-        let _ = sqlx::query(
-            "INSERT INTO sync_state (inode, dirty, version, availability) VALUES (?, 0, 0, 'local_online') ON CONFLICT(inode) DO UPDATE SET availability='local_online'"
-        )
-        .bind(inode as i64)
-        .execute(db.pool())
-        .await;
+        // Primero asegurar availability='local_online' y burbujear si aplica
+        if let Err(e) = db.set_availability(inode, "local_online", true).await {
+            error!("Error asegurando availability='local_online': {:?}", e);
+        }
         // Luego set_dirty_and_bubble (detecta estado previo automáticamente)
         if let Err(e) = db.set_dirty_and_bubble(inode).await {
              error!("Error marcando dirty: {:?}", e);

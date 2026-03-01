@@ -314,8 +314,43 @@ impl MetadataRepository {
         Ok(row.unwrap_or_else(|| "online_only".to_string()))
     }
 
-    /// Establece la disponibilidad de un archivo
-    pub async fn set_availability(&self, inode: u64, availability: &str) -> Result<()> {
+    /// Establece la disponibilidad de un archivo.
+    /// Si `bubble` es true, propaga el cambio de estado hacia los directorios ancestros
+    /// (comportamiento normal en runtime). Si es false, solo escribe el UPDATE sin
+    /// burbujear — útil durante bootstrap masivo donde se invoca rebuild_all_dir_counters al final.
+    pub async fn set_availability(&self, inode: u64, availability: &str, bubble: bool) -> Result<()> {
+        // 1. Obtener estado previo
+        let prev = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+            "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        // OPTIMIZACIÓN CRÍTICA (Cortocircuito):
+        // 1. Si existe el registro y coincide, ahorramos los INSERT/UPDATE.
+        // 2. Si NO existe el registro (ej. primer arranque), el estado por defecto
+        // implícito es 'online_only'. Si nos piden 'online_only', no necesitamos
+        // escribir una fila nueva, ahorrando miles de INSERTS en el primer bootstrap.
+        match prev {
+            Some((Some(ref prev_av), _, _)) if prev_av == availability => {
+                return Ok(());
+            }
+            // Si la DB (sync_state) dice None, tratarlo por defecto como 'online_only'
+            None if availability == "online_only" => {
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let was_synced = prev.as_ref().map(|(av, d, del)| {
+            let is_local_online = av.as_deref().unwrap_or("online_only") == "local_online";
+            let not_dirty = !d.unwrap_or(false);
+            let not_deleted = del.unwrap_or(0) == 0;
+            is_local_online && not_dirty && not_deleted
+        }).unwrap_or(false);
+
+        // 2. Aplicar cambio
         sqlx::query(
             r#"
             INSERT INTO sync_state (inode, availability, dirty, version)
@@ -327,6 +362,38 @@ impl MetadataRepository {
         .bind(availability)
         .execute(&self.pool)
         .await?;
+
+        // 3. Burbujear solo si se solicitó (runtime normal)
+        if bubble {
+            let is_dir: Option<bool> = sqlx::query_scalar(
+                "SELECT is_dir FROM attrs WHERE inode = ?"
+            )
+            .bind(inode as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if is_dir == Some(false) {
+                let curr = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+                    "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+                )
+                .bind(inode as i64)
+                .fetch_one(&self.pool)
+                .await?;
+
+                let is_synced = {
+                    let is_local_online = curr.0.as_deref().unwrap_or("online_only") == "local_online";
+                    let not_dirty = !curr.1.unwrap_or(false);
+                    let not_deleted = curr.2.unwrap_or(0) == 0;
+                    is_local_online && not_dirty && not_deleted
+                };
+
+                if was_synced && !is_synced {
+                    self.bubble_state_change(inode, 0, -1).await?;
+                } else if !was_synced && is_synced {
+                    self.bubble_state_change(inode, 0, 1).await?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -919,15 +986,22 @@ impl MetadataRepository {
     /// Solo burbujea para archivos (is_dir=0).
     pub async fn set_dirty_and_bubble(&self, inode: u64) -> Result<()> {
         // Obtener estado previo y si es directorio
-        let prev = sqlx::query_as::<_, (Option<bool>, Option<i64>)>(
-            "SELECT s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+        let prev = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+            "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
         )
         .bind(inode as i64)
         .fetch_optional(&self.pool)
         .await?;
 
-        let was_dirty = prev.as_ref().map(|(d, del)| {
+        let was_dirty = prev.as_ref().map(|(_, d, del)| {
             d.unwrap_or(false) || del.map(|v| v > 0).unwrap_or(false)
+        }).unwrap_or(false);
+
+        let was_synced = prev.as_ref().map(|(av, d, del)| {
+            let is_local_online = av.as_deref().unwrap_or("online_only") == "local_online";
+            let not_dirty = !d.unwrap_or(false);
+            let not_deleted = del.unwrap_or(0) == 0;
+            is_local_online && not_dirty && not_deleted
         }).unwrap_or(false);
 
         // Marcar como dirty
@@ -947,13 +1021,14 @@ impl MetadataRepository {
         .await?;
 
         if is_dir == Some(false) {
+            // El archivo ahora es dirty seguro
             if was_dirty {
                 // Ya era dirty, no hay cambio en contadores
-            } else if prev.is_some() {
-                // Era synced (o existía sin dirty), ahora es dirty
+            } else if was_synced {
+                // Era synced, ahora es dirty
                 self.bubble_state_change(inode, 1, -1).await?;
             } else {
-                // Archivo nuevo (no existía en sync_state), ahora es dirty
+                // Archivo no era dirty ni synced (ej: online_only), ahora es dirty
                 self.bubble_state_change(inode, 1, 0).await?;
             }
         }
@@ -965,15 +1040,22 @@ impl MetadataRepository {
     /// Solo burbujea para archivos (is_dir=0).
     pub async fn clear_dirty_and_bubble(&self, inode: u64) -> Result<()> {
         // Verificar estado previo
-        let prev = sqlx::query_as::<_, (bool, Option<i64>)>(
-            "SELECT dirty, deleted_at FROM sync_state WHERE inode = ?"
+        let prev = sqlx::query_as::<_, (Option<String>, bool, Option<i64>)>(
+            "SELECT availability, dirty, deleted_at FROM sync_state WHERE inode = ?"
         )
         .bind(inode as i64)
         .fetch_optional(&self.pool)
         .await?;
 
-        let was_dirty = prev.as_ref().map(|(d, del)| {
+        let was_dirty = prev.as_ref().map(|(_, d, del)| {
             *d || del.map(|v| v > 0).unwrap_or(false)
+        }).unwrap_or(false);
+
+        let was_synced = prev.as_ref().map(|(av, d, del)| {
+            let is_local_online = av.as_deref().unwrap_or("online_only") == "local_online";
+            let not_dirty = !d;
+            let not_deleted = del.unwrap_or(0) == 0;
+            is_local_online && not_dirty && not_deleted
         }).unwrap_or(false);
 
         // Limpiar dirty
@@ -990,9 +1072,28 @@ impl MetadataRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        if is_dir == Some(false) && was_dirty {
-            // Era dirty, ahora es synced
-            self.bubble_state_change(inode, -1, 1).await?;
+        if is_dir == Some(false) {
+            let curr = sqlx::query_as::<_, (Option<String>, bool, Option<i64>)>(
+                "SELECT availability, dirty, deleted_at FROM sync_state WHERE inode = ?"
+            )
+            .bind(inode as i64)
+            .fetch_one(&self.pool)
+            .await?;
+
+            let is_dirty = curr.1 || curr.2.unwrap_or(0) > 0;
+            let is_synced = {
+                let is_local_online = curr.0.as_deref().unwrap_or("online_only") == "local_online";
+                let not_dirty = !curr.1;
+                let not_deleted = curr.2.unwrap_or(0) == 0;
+                is_local_online && not_dirty && not_deleted
+            };
+
+            let delta_dirty = if was_dirty && !is_dirty { -1 } else if !was_dirty && is_dirty { 1 } else { 0 };
+            let delta_synced = if was_synced && !is_synced { -1 } else if !was_synced && is_synced { 1 } else { 0 };
+
+            if delta_dirty != 0 || delta_synced != 0 {
+                self.bubble_state_change(inode, delta_dirty, delta_synced).await?;
+            }
         }
 
         Ok(())
@@ -1159,6 +1260,7 @@ impl MetadataRepository {
             JOIN attrs a ON sub.child_inode = a.inode
             LEFT JOIN sync_state ss ON sub.child_inode = ss.inode
             WHERE a.is_dir = 0
+              AND (COALESCE(ss.availability, 'online_only') = 'local_online')
               AND (COALESCE(ss.dirty, 0) = 0)
               AND (ss.deleted_at IS NULL OR ss.deleted_at = 0)
             "#
@@ -1286,6 +1388,25 @@ impl MetadataRepository {
             None => return Ok(false),
         };
 
+        // Estado previo
+        let prev = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+            "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let was_dirty = prev.as_ref().map(|(_, d, del)| {
+            d.unwrap_or(false) || del.map(|v| v > 0).unwrap_or(false)
+        }).unwrap_or(false);
+
+        let was_synced = prev.as_ref().map(|(av, d, del)| {
+            let is_local_online = av.as_deref().unwrap_or("online_only") == "local_online";
+            let not_dirty = !d.unwrap_or(false);
+            let not_deleted = del.unwrap_or(0) == 0;
+            is_local_online && not_dirty && not_deleted
+        }).unwrap_or(false);
+
         // 1. Restaurar dentry desde dentry_deleted
         sqlx::query(
             r#"
@@ -1310,7 +1431,7 @@ impl MetadataRepository {
             .execute(&self.pool)
             .await?;
 
-        // 4. Burbujear: era dirty (deleted_at), ahora es synced
+        // 4. Burbujear
         let is_dir: Option<bool> = sqlx::query_scalar(
             "SELECT is_dir FROM attrs WHERE inode = ?"
         )
@@ -1319,7 +1440,27 @@ impl MetadataRepository {
         .await?;
 
         if is_dir == Some(false) {
-            self.bubble_state_change(inode, -1, 1).await?;
+            let curr = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+                "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+            )
+            .bind(inode as i64)
+            .fetch_one(&self.pool)
+            .await?;
+
+            let is_dirty = curr.1.unwrap_or(false) || curr.2.unwrap_or(0) > 0;
+            let is_synced = {
+                let is_local_online = curr.0.as_deref().unwrap_or("online_only") == "local_online";
+                let not_dirty = !curr.1.unwrap_or(false);
+                let not_deleted = curr.2.unwrap_or(0) == 0;
+                is_local_online && not_dirty && not_deleted
+            };
+
+            let delta_dirty = if was_dirty && !is_dirty { -1 } else if !was_dirty && is_dirty { 1 } else { 0 };
+            let delta_synced = if was_synced && !is_synced { -1 } else if !was_synced && is_synced { 1 } else { 0 };
+
+            if delta_dirty != 0 || delta_synced != 0 {
+                self.bubble_state_change(inode, delta_dirty, delta_synced).await?;
+            }
         } else if is_dir == Some(true) {
             // Restaurar directorio: asegurar que tiene fila en dir_counters
             self.ensure_dir_counter(inode).await?;

@@ -323,12 +323,10 @@ async fn get_sync_state(
 ) -> Result<SyncStatus> {
     // Caso especial: carpeta virtual SHARED
     if inode == SHARED_INODE {
-        let (has_local_only, has_synced, total_files) =
+        let (has_local_only, has_synced, _total_files) =
             db.get_shared_directory_aggregate_status().await?;
 
-        return Ok(if total_files == 0 {
-            SyncStatus::Synced
-        } else if has_local_only {
+        return Ok(if has_local_only {
             SyncStatus::LocalOnly
         } else if has_synced {
             SyncStatus::Synced
@@ -371,17 +369,15 @@ async fn get_sync_state(
     
     // Directorios: calcular estado agregado recursivo de todos sus descendientes
     if is_dir == Some(true) {
-        let (has_local_only, has_synced, total_files) =
+        let (has_local_only, has_synced, _total_files) =
             db.get_directory_aggregate_status(inode).await?;
 
-        return Ok(if total_files == 0 {
-            SyncStatus::Synced // Carpeta vacía
-        } else if has_local_only {
+        return Ok(if has_local_only {
             SyncStatus::LocalOnly // Naranja: al menos 1 hijo con cambios pendientes
         } else if has_synced {
             SyncStatus::Synced // Verde: al menos 1 hijo sincronizado
         } else {
-            SyncStatus::CloudOnly // Azul: todos los hijos solo en la nube
+            SyncStatus::CloudOnly // Azul: todos los hijos solo en la nube o vacía
         });
     }
     
