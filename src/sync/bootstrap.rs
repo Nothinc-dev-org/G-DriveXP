@@ -246,6 +246,70 @@ pub async fn bootstrap_remaining_bfs(
         }
     }
 
+    // Post-BFS: Vincular archivos compartidos huérfanos al root.
+    // Los archivos "Shared with me" tienen parents en el Drive del propietario original,
+    // no en el árbol del usuario. El BFS desde root nunca los alcanza, así que sus inodes
+    // y attrs se crearon pero nunca recibieron una entrada en dentry.
+    tracing::info!("Bootstrap BFS: vinculando archivos compartidos huérfanos...");
+    let mut orphan_count = 0u32;
+    let mut orphan_dirs: Vec<String> = Vec::new();
+
+    for file in &all_files {
+        if let (Some(id), Some(name)) = (&file.id, &file.name) {
+            let owned = file.owned_by_me.unwrap_or(true);
+            if !owned {
+                if let Some(&inode) = drive_id_to_inode.get(id.as_str()) {
+                    if !db.has_dentry(inode).await.unwrap_or(true) {
+                        db.upsert_dentry(1, inode, name).await?;
+                        orphan_count += 1;
+
+                        let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
+                        if is_dir {
+                            orphan_dirs.push(id.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // BFS desde directorios compartidos recién vinculados para conectar sus hijos
+    if !orphan_dirs.is_empty() {
+        tracing::info!("Bootstrap BFS: procesando {} directorios compartidos recién vinculados...", orphan_dirs.len());
+        let mut queue = orphan_dirs;
+        let mut visited = processed_parents.clone();
+
+        while !queue.is_empty() {
+            let mut next_queue = Vec::new();
+            for parent_id in &queue {
+                if visited.contains(parent_id) { continue; }
+                visited.insert(parent_id.clone());
+
+                if let Some(children) = by_parent.get(parent_id) {
+                    let parent_inode = drive_id_to_inode.get(parent_id.as_str()).cloned().unwrap_or(1);
+                    for file in children {
+                        if let (Some(id), Some(name)) = (&file.id, &file.name) {
+                            if let Some(&child_inode) = drive_id_to_inode.get(id.as_str()) {
+                                db.upsert_dentry(parent_inode, child_inode, name).await?;
+                                orphan_count += 1;
+
+                                let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
+                                if is_dir {
+                                    next_queue.push(id.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            queue = next_queue;
+        }
+    }
+
+    if orphan_count > 0 {
+        tracing::info!("Bootstrap BFS: {} archivos/carpetas compartidos vinculados al root", orphan_count);
+    }
+
     // Recalcular TODOS los contadores de directorio ahora que el árbol está completo
     tracing::info!("Bootstrap BFS: recalculando contadores de directorio...");
     db.rebuild_all_dir_counters().await?;

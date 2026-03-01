@@ -516,6 +516,17 @@ impl MetadataRepository {
         Ok(row.map(|i| i as u64))
     }
 
+    /// Verifica si un inode tiene al menos una entrada en la tabla dentry.
+    pub async fn has_dentry(&self, inode: u64) -> Result<bool> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dentry WHERE child_inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
+    }
+
     /// Obtener atributos de archivo (operación getattr)
     pub async fn get_attrs(&self, inode: u64) -> Result<crate::fuse::attr::FileAttributes> {
         // Caso especial: Root

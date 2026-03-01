@@ -198,7 +198,7 @@ pub enum AppMsg {
     SetPaths { mirror: std::path::PathBuf, fuse: std::path::PathBuf },
     SetDatabase(Arc<crate::db::MetadataRepository>),
     OpenInNautilus,
-    TogglePauseSync,
+    SetPauseSync(bool),
     Logout,
     Hide,
     Quit,
@@ -403,8 +403,8 @@ impl Component for AppModel {
                                         #[watch]
                                         set_active: model.sync_paused.load(Ordering::Relaxed),
 
-                                        connect_active_notify[sender] => move |_| {
-                                            sender.input(AppMsg::TogglePauseSync);
+                                        connect_active_notify[sender] => move |switch| {
+                                            sender.input(AppMsg::SetPauseSync(switch.is_active()));
                                         },
                                     },
                                 },
@@ -728,15 +728,17 @@ impl Component for AppModel {
                         .spawn();
                 }
             }
-            AppMsg::TogglePauseSync => {
+            AppMsg::SetPauseSync(paused) => {
                 let current = self.sync_paused.load(Ordering::Relaxed);
-                self.sync_paused.store(!current, Ordering::Relaxed);
-                if current {
-                    tracing::info!("Sincronización reanudada");
-                    self.history.log(ActionType::Sync, "Sincronización reanudada");
-                } else {
-                    tracing::info!("Sincronización pausada");
-                    self.history.log(ActionType::Sync, "Sincronización pausada");
+                if current != paused {
+                    self.sync_paused.store(paused, Ordering::Relaxed);
+                    if paused {
+                        tracing::info!("Sincronización pausada");
+                        self.history.log(ActionType::Sync, "Sincronización pausada");
+                    } else {
+                        tracing::info!("Sincronización reanudada");
+                        self.history.log(ActionType::Sync, "Sincronización reanudada");
+                    }
                 }
             }
             AppMsg::Logout => {
@@ -783,7 +785,10 @@ impl Component for AppModel {
             AppMsg::HardReset => {
                 tracing::warn!("Ejecutando Hard Reset delegado a hilo secundario...");
 
-                // 1. Detener nuevos ciclos de sincronización/descarga de inmediato
+                // 1. Señalar que Hard Reset está en curso (evita que main.rs haga exit)
+                crate::HARD_RESET_IN_PROGRESS.store(true, Ordering::SeqCst);
+
+                // 2. Detener nuevos ciclos de sincronización/descarga de inmediato
                 self.sync_paused.store(true, Ordering::Relaxed);
                 
                 // 2. Dar retroalimentación en UI
@@ -796,29 +801,35 @@ impl Component for AppModel {
                 std::thread::spawn(move || {
                     tracing::info!("Hilo de limpieza en background iniciado.");
 
-                    // Desmontar FUSE para detener lecturas/escrituras locales concurrentes
+                    // ORDEN CRÍTICO:
+                    // 1) Desmontar FUSE primero — si no, `rm -rf ~/GoogleDrive`
+                    //    atraviesa el mount FUSE y cada UNLINK propaga soft-deletes
+                    //    a Google Drive (¡borra datos de la nube!).
+                    // 2) Ejecutar limpieza (ahora ~/GoogleDrive es un dir normal).
+                    // 3) process::exit(0) inmediato — gana la carrera contra
+                    //    el exit de main.rs que reacciona al FUSE handle terminado.
+
+                    // Paso 1: Desmontar FUSE
                     if let Some(path) = fuse_path {
                         let _ = crate::utils::mount::unmount_and_wait(&path);
                     }
-                    
-                    // Pausar el hilo esclavo para permitir que Tokio cierre sus rutinas
-                    tracing::info!("Drenando I/O en vuelo...");
-                    std::thread::sleep(std::time::Duration::from_millis(500));
 
-                    // Programar el auto-reinicio
-                    if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(format!("sleep 3; {:?} &", exe))
-                            .spawn();
-                    }
-
-                    // Ejecutar limpieza de datos (aisladamente)
+                    // Paso 2: Limpieza de datos locales (FUSE ya desmontado,
+                    //         rm -rf no pasa por el filesystem virtual)
                     if let Err(e) = crate::utils::cleanup::perform_hard_reset() {
                         tracing::error!("Error durante limpieza profunda: {:?}", e);
                     }
 
-                    tracing::warn!("Auto-terminación tras limpieza exitosa.");
+                    // Paso 3: Programar auto-reinicio
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(format!("sleep 2; {:?} &", exe))
+                            .spawn();
+                    }
+
+                    // Paso 4: Terminar proceso inmediatamente
+                    tracing::warn!("Hard Reset completado. Terminando proceso.");
                     std::process::exit(0);
                 });
             }

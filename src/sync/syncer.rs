@@ -284,6 +284,7 @@ impl BackgroundSyncer {
             // de una operación previa nuestra, y el estado local (posiblemente un
             // segundo movimiento) tiene prioridad.
             let is_dirty = self.db.is_dirty(inode).await.unwrap_or(false);
+            let owned = file.owned_by_me.unwrap_or(true);
             if !is_dirty {
                 if let Some(parents) = &file.parents {
                     for parent_id in parents {
@@ -292,7 +293,16 @@ impl BackgroundSyncer {
                         let parent_inode = if parent_id == "root" || parent_id == root_id {
                             1u64
                         } else {
-                            self.db.get_or_create_inode(parent_id).await?
+                            let pi = self.db.get_or_create_inode(parent_id).await?;
+                            // Si el archivo no es nuestro y su padre no está conectado
+                            // al árbol (no tiene dentry), vincularlo directamente al root.
+                            // Los archivos "Shared with me" tienen padres en el Drive
+                            // del propietario original, inalcanzables desde nuestro root.
+                            if !owned && !self.db.has_dentry(pi).await.unwrap_or(true) {
+                                1u64
+                            } else {
+                                pi
+                            }
                         };
                         self.db.upsert_dentry(parent_inode, inode, name).await?;
                     }

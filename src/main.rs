@@ -13,11 +13,15 @@ use anyhow::{Context, Result};
 use fuse3::MountOptions;
 use fuse3::raw::Session;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use relm4::{RelmApp, ComponentSender};
 
 use config::Config;
 use fuse::GDriveFS;
+
+/// Flag global: cuando Hard Reset está en curso, main.rs NO debe hacer process::exit.
+pub static HARD_RESET_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     // Inicializar sistema de logging
@@ -288,12 +292,19 @@ pub fn run_backend(
             }
         }
         
+        // Si un Hard Reset está en curso, dejar que su hilo maneje el cierre.
+        // Este hilo simplemente se duerme para no competir con process::exit.
+        if HARD_RESET_IN_PROGRESS.load(Ordering::SeqCst) {
+            tracing::info!("Hard Reset en curso, cediendo control al hilo de limpieza...");
+            loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
+        }
+
         tracing::info!("🛑 Desmontando sistema de archivos y cerrando...");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Desmontando...".to_string()));
-        
+
         // El drop de 'handle' debería intentar desmontar, pero lo forzamos por seguridad
         let _ = utils::mount::unmount_and_wait(&config.fuse_mount_path);
-        
+
         // Forzar salida del proceso (GTK no responde a señales del backend)
         tracing::info!("👋 Cerrando aplicación...");
         std::process::exit(0);
