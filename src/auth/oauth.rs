@@ -6,6 +6,9 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use yup_oauth2::{ApplicationSecret, InstalledFlowAuthenticator, InstalledFlowReturnMethod};
+use yup_oauth2::authenticator_delegate::InstalledFlowDelegate;
+use std::future::Future;
+use std::pin::Pin;
 
 use super::TokenStorage;
 
@@ -14,6 +17,30 @@ pub struct OAuth2Manager {
     app_secret: ApplicationSecret,
     #[allow(dead_code)] // Será usado para logout
     token_storage: Arc<TokenStorage>,
+}
+
+/// Delegado para capturar la URL de autenticación y enviarla a la GUI
+struct LoginUrlDelegate {
+    ui_sender: Option<relm4::ComponentSender<crate::gui::app_model::AppModel>>,
+}
+
+impl InstalledFlowDelegate for LoginUrlDelegate {
+    fn present_user_url<'a>(
+        &'a self,
+        url: &'a str,
+        _need_code: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        let url = url.to_string();
+        let ui_sender = self.ui_sender.clone();
+        
+        Box::pin(async move {
+            tracing::info!("captured URL: {}", url);
+            if let Some(sender) = ui_sender {
+                sender.input(crate::gui::app_model::AppMsg::SetLoginUrl(url));
+            }
+            Ok(String::new())
+        })
+    }
 }
 
 impl OAuth2Manager {
@@ -34,7 +61,7 @@ impl OAuth2Manager {
     }
     
     /// Construye y retorna el autenticador configurado
-    pub async fn get_authenticator(&self) -> Result<yup_oauth2::authenticator::Authenticator<yup_oauth2::hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>> {
+    pub async fn get_authenticator(&self, ui_sender: Option<relm4::ComponentSender<crate::gui::app_model::AppModel>>) -> Result<yup_oauth2::authenticator::Authenticator<yup_oauth2::hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>> {
         // Resolver la ruta del home correctamente (~ no funciona en Rust)
         let home = std::env::var("HOME").context("No se pudo obtener variable HOME")?;
         let token_path = format!("{}/.config/fedoradrive/tokens.json", home);
@@ -45,21 +72,26 @@ impl OAuth2Manager {
             std::fs::create_dir_all(dir).ok();
         }
         
-        InstalledFlowAuthenticator::builder(
+        let mut builder = InstalledFlowAuthenticator::builder(
             self.app_secret.clone(),
             InstalledFlowReturnMethod::HTTPRedirect,
-        )
-        .persist_tokens_to_disk(&token_path)
-        .build()
-        .await
-        .context("Error al construir el autenticador OAuth2")
+        );
+
+        if ui_sender.is_some() {
+            builder = builder.flow_delegate(Box::new(LoginUrlDelegate { ui_sender }));
+        }
+
+        builder.persist_tokens_to_disk(&token_path)
+            .build()
+            .await
+            .context("Error al construir el autenticador OAuth2")
     }
 
     /// Ejecuta el flujo completo de autenticación OAuth2
-    pub async fn authenticate(&self) -> Result<()> {
+    pub async fn authenticate(&self, ui_sender: Option<relm4::ComponentSender<crate::gui::app_model::AppModel>>) -> Result<()> {
         tracing::info!("Iniciando proceso de autenticación OAuth2");
         
-        let auth = self.get_authenticator().await?;
+        let auth = self.get_authenticator(ui_sender).await?;
         
         let scopes = &["https://www.googleapis.com/auth/drive"];
         let token = auth

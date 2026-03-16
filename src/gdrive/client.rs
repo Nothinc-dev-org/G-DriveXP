@@ -2,7 +2,47 @@ use anyhow::{Context, Result};
 use google_drive3::DriveHub;
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
+use std::io::{Read, Seek, SeekFrom};
 use yup_oauth2::authenticator::Authenticator;
+
+/// Tipo para callback de progreso de upload
+pub type ProgressCallback = Box<dyn Fn(u64) + Send>;
+
+/// Reader que envuelve otro Read y reporta progreso via callback
+struct ProgressReader<R: Read + Seek> {
+    inner: R,
+    bytes_read: u64,
+    callback: ProgressCallback,
+}
+
+impl<R: Read + Seek> ProgressReader<R> {
+    fn new(inner: R, callback: ProgressCallback) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+            callback,
+        }
+    }
+}
+
+impl<R: Read + Seek> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.bytes_read += n as u64;
+            (self.callback)(self.bytes_read);
+        }
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for ProgressReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let result = self.inner.seek(pos)?;
+        self.bytes_read = result;
+        Ok(result)
+    }
+}
 
 /// Cliente Wrapper para Google Drive API
 pub struct DriveClient {
@@ -73,8 +113,8 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido para la descarga")?;
 
-        // 2. Construir URL de descarga
-        let url = format!("https://www.googleapis.com/drive/v3/files/{}?alt=media", file_id);
+        // 2. Construir URL de descarga (Incluyendo acknowledgeAbuse=true para evitar 403 en falsos positivos de malware)
+        let url = format!("https://www.googleapis.com/drive/v3/files/{}?alt=media&acknowledgeAbuse=true", file_id);
 
         // 3. Realizar petición con reqwest
         let client = reqwest::Client::new();
@@ -100,6 +140,65 @@ impl DriveClient {
         Ok(bytes.to_vec())
     }
 
+    /// Lista solo los hijos inmediatos del root de Drive.
+    /// Usado para el primer nivel del bootstrap BFS (respuesta rápida ~1s).
+    pub async fn list_root_children(&self, root_id: &str) -> Result<Vec<google_drive3::api::File>> {
+        let mut all_files = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        tracing::info!("Consultando hijos directos del root en Google Drive...");
+
+        let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
+            .await
+            .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
+            .context("No se obtuvo ningún token válido")?;
+
+        let client = reqwest::Client::new();
+        let query = format!("'{}' in parents and trashed = false", root_id);
+
+        loop {
+            let mut url = format!(
+                "https://www.googleapis.com/drive/v3/files?q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
+                urlencoding::encode(&query)
+            );
+
+            if let Some(ref token_str) = page_token {
+                url.push_str(&format!("&pageToken={}", token_str));
+            }
+
+            let response = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await
+                .context("Error de red al listar hijos del root")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!("Error API Drive (list_root_children): {} - {}", status, body);
+                anyhow::bail!("Error API Drive: {} - {}", status, body);
+            }
+
+            let file_list: google_drive3::api::FileList = response.json()
+                .await
+                .context("Error al parsear respuesta JSON de Drive")?;
+
+            if let Some(files) = file_list.files {
+                tracing::debug!("Recibidos {} hijos del root en esta página", files.len());
+                all_files.extend(files);
+            }
+
+            page_token = file_list.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        tracing::info!("📊 Bootstrap nivel 1: {} items en root", all_files.len());
+        Ok(all_files)
+    }
+
     /// Lista todos los archivos de Google Drive con los campos necesarios para el bootstrapping
     /// NOTA: Usamos reqwest directamente para evitar que google-drive3 añada scopes automáticos
     pub async fn list_all_files(&self) -> Result<Vec<google_drive3::api::File>> {
@@ -117,7 +216,7 @@ impl DriveClient {
         let client = reqwest::Client::new();
 
         loop {
-            let mut url = "https://www.googleapis.com/drive/v3/files?trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version)".to_string();
+            let mut url = "https://www.googleapis.com/drive/v3/files?trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))".to_string();
             
             if let Some(ref token_str) = page_token {
                 url.push_str(&format!("&pageToken={}", token_str));
@@ -200,8 +299,8 @@ impl DriveClient {
     }
 
     /// Lista cambios desde un page_token dado
-    /// Retorna: (cambios, nuevo_start_page_token si es la última página)
-    pub async fn list_changes(&self, page_token: &str) -> Result<(Vec<google_drive3::api::Change>, Option<String>)> {
+    /// Retorna: (cambios, nuevo_start_page_token si es la última página, has_more)
+    pub async fn list_changes(&self, page_token: &str) -> Result<(Vec<google_drive3::api::Change>, Option<String>, bool)> {
         let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
             .await
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
@@ -211,7 +310,7 @@ impl DriveClient {
         
         // pageToken es requerido, fields especifica qué queremos recibir
         let url = format!(
-            "https://www.googleapis.com/drive/v3/changes?pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed))",
+            "https://www.googleapis.com/drive/v3/changes?pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed,shared,ownedByMe,capabilities(canMoveItemWithinDrive)))",
             page_token
         );
 
@@ -234,18 +333,19 @@ impl DriveClient {
             .context("Error al parsear respuesta de changes")?;
 
         let changes = change_list.changes.unwrap_or_default();
-        let new_start_token = change_list.new_start_page_token;
+        let has_more = change_list.next_page_token.is_some();
+        let next_token = change_list.next_page_token.clone().or(change_list.new_start_page_token.clone());
 
         tracing::debug!(
             "Changes: {} cambios, next_page={:?}, new_start={:?}",
             changes.len(),
             change_list.next_page_token,
-            new_start_token
+            change_list.new_start_page_token
         );
 
-        // Si hay new_start_page_token, es la última página
-        // Si hay next_page_token, hay más páginas (pero no lo procesamos aquí, el syncer hará loop)
-        Ok((changes, new_start_token))
+        // Retornamos el siguiente token a usar (ya sea next_page_token para seguir iterando
+        // o new_start_page_token si llegamos al final de los cambios actuales)
+        Ok((changes, next_token, has_more))
     }
 
     /// Obtiene el MD5 checksum de un archivo remoto (para detectar conflictos)
@@ -294,6 +394,7 @@ impl DriveClient {
         name: &str,
         mime_type: Option<&str>,
         parent_id: &str,
+        progress_cb: Option<ProgressCallback>,
     ) -> Result<String> {
         tracing::info!("📤 Subiendo archivo: {}", name);
 
@@ -305,7 +406,7 @@ impl DriveClient {
         let mut file_metadata = google_drive3::api::File::default();
         file_metadata.name = Some(name.to_string());
         file_metadata.mime_type = Some(mime_type.unwrap_or("application/octet-stream").to_string());
-        
+
         if parent_id != "root" {
             file_metadata.parents = Some(vec![parent_id.to_string()]);
         }
@@ -318,26 +419,34 @@ impl DriveClient {
         // - Archivos grandes: Resumable upload
         let result = if content_len < 5 * 1024 * 1024 {
             tracing::debug!("Usando upload simple para archivo de {} bytes", content_len);
-            self.hub
-                .files()
-                .create(file_metadata)
-                .upload(
-                    std::io::Cursor::new(content),
-                    mime,
-                )
-                .await
-                .context("Error en upload simple")?
+            match progress_cb {
+                Some(cb) => {
+                    let reader = ProgressReader::new(std::io::Cursor::new(content), cb);
+                    self.hub.files().create(file_metadata)
+                        .upload(reader, mime).await
+                        .context("Error en upload simple")?
+                }
+                None => {
+                    self.hub.files().create(file_metadata)
+                        .upload(std::io::Cursor::new(content), mime).await
+                        .context("Error en upload simple")?
+                }
+            }
         } else {
             tracing::debug!("Usando upload resumable para archivo de {} bytes", content_len);
-            self.hub
-                .files()
-                .create(file_metadata)
-                .upload_resumable(
-                    std::io::Cursor::new(content),
-                    mime,
-                )
-                .await
-                .context("Error en upload resumable")?
+            match progress_cb {
+                Some(cb) => {
+                    let reader = ProgressReader::new(std::io::Cursor::new(content), cb);
+                    self.hub.files().create(file_metadata)
+                        .upload_resumable(reader, mime).await
+                        .context("Error en upload resumable")?
+                }
+                None => {
+                    self.hub.files().create(file_metadata)
+                        .upload_resumable(std::io::Cursor::new(content), mime).await
+                        .context("Error en upload resumable")?
+                }
+            }
         };
 
         let file_id = result.1.id.ok_or_else(|| anyhow::anyhow!("No se recibió file_id en respuesta"))?;
@@ -385,6 +494,7 @@ impl DriveClient {
         &self,
         file_id: &str,
         file_path: &std::path::Path,
+        progress_cb: Option<ProgressCallback>,
     ) -> Result<()> {
         tracing::info!("📝 Actualizando contenido de archivo: {}", file_id);
 
@@ -400,26 +510,34 @@ impl DriveClient {
         // Estrategia adaptativa para updates
         if content_len < 5 * 1024 * 1024 {
             tracing::debug!("Usando update simple para archivo de {} bytes", content_len);
-            self.hub
-                .files()
-                .update(file_metadata, file_id)
-                .upload(
-                    std::io::Cursor::new(content),
-                    mime,
-                )
-                .await
-                .context("Error en update simple")?;
+            match progress_cb {
+                Some(cb) => {
+                    let reader = ProgressReader::new(std::io::Cursor::new(content), cb);
+                    self.hub.files().update(file_metadata, file_id)
+                        .upload(reader, mime).await
+                        .context("Error en update simple")?;
+                }
+                None => {
+                    self.hub.files().update(file_metadata, file_id)
+                        .upload(std::io::Cursor::new(content), mime).await
+                        .context("Error en update simple")?;
+                }
+            }
         } else {
             tracing::debug!("Usando update resumable para archivo de {} bytes", content_len);
-            self.hub
-                .files()
-                .update(file_metadata, file_id)
-                .upload_resumable(
-                    std::io::Cursor::new(content),
-                    mime,
-                )
-                .await
-                .context("Error en update resumable")?;
+            match progress_cb {
+                Some(cb) => {
+                    let reader = ProgressReader::new(std::io::Cursor::new(content), cb);
+                    self.hub.files().update(file_metadata, file_id)
+                        .upload_resumable(reader, mime).await
+                        .context("Error en update resumable")?;
+                }
+                None => {
+                    self.hub.files().update(file_metadata, file_id)
+                        .upload_resumable(std::io::Cursor::new(content), mime).await
+                        .context("Error en update resumable")?;
+                }
+            }
         }
 
         tracing::info!("✅ Archivo actualizado: {}", file_id);
@@ -478,9 +596,9 @@ impl DriveClient {
             .context("No se obtuvo ningún token válido")?;
 
         let client = reqwest::Client::new();
-        // Solicitamos name, parents y md5Checksum
+        // Solicitamos name, parents, md5Checksum y capabilities para verificar permisos
         let url = format!(
-            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType",
+            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType,shared,ownedByMe,capabilities&supportsAllDrives=true",
             file_id
         );
 
@@ -498,8 +616,10 @@ impl DriveClient {
             anyhow::bail!("Error API Drive get_file_metadata: {} - {}", status, body);
         }
 
-        let file: google_drive3::api::File = response.json()
-            .await
+        let body = response.text().await.context("Error leyendo body")?;
+        tracing::debug!("🔍 RAW METADATA ({}): {}", file_id, body);
+
+        let file: google_drive3::api::File = serde_json::from_str(&body)
             .context("Error al parsear respuesta de get_file_metadata")?;
 
         Ok(file)
@@ -526,6 +646,9 @@ impl DriveClient {
         
         // Query params
         let mut params = Vec::new();
+        // IMPORTANTE: supportsAllDrives=true asegura que veamos/editemos la jerarquía completa
+        params.push("supportsAllDrives=true".to_string());
+
         if let Some(parent) = add_parent {
             params.push(format!("addParents={}", parent));
         }

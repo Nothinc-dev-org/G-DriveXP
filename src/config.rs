@@ -7,8 +7,11 @@ use std::path::PathBuf;
 /// Configuración persistente de la aplicación
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Punto de montaje del sistema de archivos FUSE
-    pub mount_point: PathBuf,
+    /// Punto de montaje del sistema de archivos FUSE (Oculto)
+    pub fuse_mount_path: PathBuf,
+
+    /// Directorio espejo visible para el usuario (~/GoogleDrive)
+    pub mirror_path: PathBuf,
     
     /// Directorio de caché para contenido de archivos
     pub cache_dir: PathBuf,
@@ -29,7 +32,9 @@ impl Config {
         let home = env::var("HOME")?;
         
         Ok(Self {
-            mount_point: PathBuf::from(format!("{}/GoogleDrive", home)),
+            // FUSE_Mount en lugar de .cloud_mount para que Flatpak pueda atravesarlo
+            fuse_mount_path: PathBuf::from(format!("{}/GoogleDrive/FUSE_Mount", home)),
+            mirror_path: PathBuf::from(format!("{}/GoogleDrive", home)),
             cache_dir: PathBuf::from(format!("{}/.cache/fedoradrive", home)),
             db_path: PathBuf::from(format!("{}/.config/fedoradrive/metadata.db", home)),
             sync_interval_secs: 60,
@@ -43,7 +48,24 @@ impl Config {
         
         if config_path.exists() {
             let contents = fs::read_to_string(&config_path)?;
-            let config: Config = serde_json::from_str(&contents)?;
+            let mut config: Config = serde_json::from_str(&contents)?;
+            
+            // MIGRATION: Check if using restricted paths (.local) or unstable (/tmp) or hidden (.cloud_mount) and migrate to visible mount
+            let home = env::var("HOME")?;
+            let current_path = config.fuse_mount_path.to_string_lossy();
+            
+            let needs_migration = current_path.contains(".local/share/g-drive-xp") || 
+                                  current_path.contains("/tmp/g-drive-xp-mount") ||
+                                  current_path.contains(".cloud_mount");
+
+            if needs_migration {
+                tracing::warn!("⚠️ MIGRACIÓN: Moviendo punto de montaje a ~/GoogleDrive/FUSE_Mount para compatibilidad total con Flatpak (Sandbox).");
+                let new_mount = PathBuf::from(format!("{}/GoogleDrive/FUSE_Mount", home));
+                config.fuse_mount_path = new_mount;
+                config.ensure_directories()?;
+                config.save()?;
+            }
+            
             tracing::info!("Configuración cargada desde {:?}", config_path);
             Ok(config)
         } else {
@@ -82,24 +104,39 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         
-        // Crear el punto de montaje si no existe
-        // Si ya existe (incluso en estado stale por crash anterior), ignorar el error EEXIST
-        match fs::create_dir_all(&self.mount_point) {
+        // Crear el directorio espejo (visible) si no existe
+        fs::create_dir_all(&self.mirror_path)?;
+
+        // Crear el punto de montaje FUSE (oculto visualmente con .hidden)
+        // Si ya existe ignorar el error EEXIST
+        match fs::create_dir_all(&self.fuse_mount_path) {
             Ok(()) => {},
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                tracing::debug!("Punto de montaje ya existe, continuando...");
+                tracing::debug!("Punto de montaje FUSE ya existe, continuando...");
             },
             Err(e) => {
-                // Verificar si es accesible (stale mount devuelve error al acceder)
-                if fs::read_dir(&self.mount_point).is_err() {
+                // Verificar si es accesible (stale mount)
+                if fs::read_dir(&self.fuse_mount_path).is_err() {
                     tracing::warn!(
                         "Punto de montaje {:?} existe pero no es accesible. \
                          Por favor ejecute: fusermount3 -u {:?}",
-                        self.mount_point, self.mount_point
+                        self.fuse_mount_path, self.fuse_mount_path
                     );
                 }
                 return Err(e.into());
             }
+        }
+        
+        // Ocultar FUSE_Mount en Nautilus usando un archivo .hidden
+        let hidden_file_path = self.mirror_path.join(".hidden");
+        let mount_name = self.fuse_mount_path.file_name().unwrap_or_default().to_string_lossy();
+        if let Ok(contents) = fs::read_to_string(&hidden_file_path) {
+            if !contents.contains(mount_name.as_ref()) {
+                let new_contents = format!("{}\n{}", contents, mount_name);
+                let _ = fs::write(&hidden_file_path, new_contents);
+            }
+        } else {
+            let _ = fs::write(&hidden_file_path, format!("{}\n", mount_name));
         }
         
         tracing::info!("Directorios de configuración y montaje creados");

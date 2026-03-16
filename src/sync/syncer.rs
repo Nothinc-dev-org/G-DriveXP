@@ -7,12 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio::sync::RwLock;
+use futures::stream::{self, StreamExt};
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
 
 /// Clave en sync_meta para el page token de changes
 const SYNC_META_PAGE_TOKEN: &str = "changes_page_token";
+
 
 /// Intervalo máximo de backoff en segundos
 const MAX_BACKOFF_SECS: u64 = 300;
@@ -21,7 +23,7 @@ const MAX_BACKOFF_SECS: u64 = 300;
 /// Período de gracia para tombstones en días
 const TOMBSTONE_GRACE_DAYS: i64 = 7;
 
-use crate::gui::history::{ActionHistory, ActionType};
+use crate::gui::history::{ActionHistory, ActionType, TransferOp};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Sincronizador en background que detecta cambios de Google Drive
@@ -32,6 +34,7 @@ pub struct BackgroundSyncer {
     history: ActionHistory,
     sync_paused: Arc<AtomicBool>,
     root_id_cache: Arc<RwLock<Option<String>>>,
+    mirror_tx: tokio::sync::mpsc::Sender<crate::mirror::manager::MirrorCommand>,
 }
 
 impl BackgroundSyncer {
@@ -42,6 +45,7 @@ impl BackgroundSyncer {
         interval_secs: u64,
         history: ActionHistory,
         sync_paused: Arc<AtomicBool>,
+        mirror_tx: tokio::sync::mpsc::Sender<crate::mirror::manager::MirrorCommand>,
     ) -> Self {
         Self {
             db,
@@ -50,6 +54,7 @@ impl BackgroundSyncer {
             history,
             sync_paused,
             root_id_cache: Arc::new(RwLock::new(None)),
+            mirror_tx,
         }
     }
 
@@ -104,7 +109,7 @@ impl BackgroundSyncer {
         let root_id = self.get_cached_root_id().await?;
 
         // 1. Obtener page_token guardado o solicitar uno nuevo
-        let page_token = match self.db.get_sync_meta(SYNC_META_PAGE_TOKEN).await? {
+        let mut page_token = match self.db.get_sync_meta(SYNC_META_PAGE_TOKEN).await? {
             Some(token) => token,
             None => {
                 // Primera vez: obtener startPageToken
@@ -115,23 +120,56 @@ impl BackgroundSyncer {
             }
         };
 
-        // 2. Consultar cambios
-        let (changes, new_start_token) = self.client.list_changes(&page_token).await?;
-        
-        let changes_count = changes.len();
-        
-        // 3. Procesar cada cambio
-        for change in changes {
-            if let Err(e) = self.process_change(change, &root_id).await {
-                tracing::warn!("Error procesando cambio individual: {:?}", e);
-                // Continuamos con los demás
+        let mut total_fetched = 0;
+        let mut total_applied = 0;
+
+        loop {
+            // 2. Consultar cambios
+            let (changes, next_token, has_more) = self.client.list_changes(&page_token).await?;
+            
+            let changes_count = changes.len();
+            total_fetched += changes_count;
+
+            // 3. Procesar cada cambio (con tracking de progreso)
+            if changes_count > 0 {
+                self.history.set_sync_progress(total_fetched, total_applied);
+            }
+            
+            let root_id_arc = Arc::new(root_id.clone());
+
+            let process_results = stream::iter(changes)
+                .map(|change| {
+                    let root_id_ref = root_id_arc.clone();
+                    async move {
+                        self.process_change(change, &root_id_ref).await
+                    }
+                })
+                .buffer_unordered(4)
+                .collect::<Vec<_>>()
+                .await;
+
+            for res in process_results {
+                if let Err(e) = res {
+                    tracing::warn!("Error procesando cambio individual: {:?}", e);
+                }
+                self.history.increment_applied();
+                total_applied += 1;
+            }
+
+            // 4. Guardar nuevo token (puede ser de siguiente página o start page)
+            if let Some(new_token) = next_token {
+                self.db.set_sync_meta(SYNC_META_PAGE_TOKEN, &new_token).await?;
+                tracing::debug!("Nuevo pageToken guardado: {}", new_token);
+                page_token = new_token;
+            }
+
+            if !has_more {
+                break;
             }
         }
 
-        // 4. Guardar nuevo token si es la última página
-        if let Some(new_token) = new_start_token {
-            self.db.set_sync_meta(SYNC_META_PAGE_TOKEN, &new_token).await?;
-            tracing::debug!("Nuevo pageToken guardado: {}", new_token);
+        if total_fetched > 0 {
+            self.history.mark_all_synced();
         }
 
         // 5. Purgar tombstones expirados (cada ciclo, es barato)
@@ -140,7 +178,7 @@ impl BackgroundSyncer {
             tracing::info!("Purgados {} tombstones expirados", purged);
         }
 
-        Ok(changes_count)
+        Ok(total_fetched)
     }
 
     /// Obtiene el root_id cacheado o lo descarga
@@ -158,6 +196,19 @@ impl BackgroundSyncer {
         Ok(id)
     }
 
+    async fn get_relative_path_for_deletion(&self, file_id: &str) -> Option<String> {
+        if let Ok(Some(inode)) = sqlx::query_scalar::<_, i64>("SELECT inode FROM inodes WHERE gdrive_id = ?")
+            .bind(file_id)
+            .fetch_optional(self.db.pool())
+            .await 
+        {
+            if let Ok(Some(rel_path)) = self.db.resolve_inode_to_relative_path(inode as u64).await {
+                return Some(rel_path);
+            }
+        }
+        None
+    }
+
     /// Procesa un cambio individual de la API
     async fn process_change(&self, change: google_drive3::api::Change, root_id: &str) -> Result<()> {
         let file_id = change.file_id.as_deref()
@@ -166,9 +217,13 @@ impl BackgroundSyncer {
         // Caso 1: Archivo eliminado permanentemente (ya no existe en Drive)
         if change.removed == Some(true) {
             tracing::debug!("Cambio detectado: REMOVED (hard delete) file_id={}", file_id);
+            let path_to_delete = self.get_relative_path_for_deletion(file_id).await;
             // El archivo fue eliminado permanentemente de Drive (incluyendo papelera vacía)
             // → Hard delete: eliminar completamente de la DB local
             self.db.hard_delete_by_gdrive_id(file_id).await?;
+            if let Some(p) = path_to_delete {
+                let _ = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await;
+            }
             return Ok(());
         }
 
@@ -177,7 +232,11 @@ impl BackgroundSyncer {
             // Verificar si está en la papelera
             if file.trashed == Some(true) {
                 tracing::debug!("Cambio detectado: TRASHED file_id={}", file_id);
+                let path_to_delete = self.get_relative_path_for_deletion(file_id).await;
                 self.db.soft_delete_by_gdrive_id(file_id).await?;
+                if let Some(p) = path_to_delete {
+                    let _ = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await;
+                }
                 return Ok(());
             }
 
@@ -197,6 +256,12 @@ impl BackgroundSyncer {
                 .unwrap_or(0);
             let mode = if is_dir { 0o755 } else { 0o644 };
 
+            let can_move = file.capabilities.as_ref()
+                .and_then(|c| c.can_move_item_within_drive)
+                .unwrap_or(true);
+
+            let shared = file.shared.unwrap_or(false);
+
             // Obtener o crear inode
             let inode = self.db.get_or_create_inode(file_id).await?;
 
@@ -208,23 +273,53 @@ impl BackgroundSyncer {
                 mode,
                 is_dir,
                 file.mime_type.as_deref(),
+                can_move,
+                shared,
+                file.owned_by_me.unwrap_or(true),
             ).await?;
 
             // Actualizar dentry (árbol de directorios)
-            if let Some(parents) = &file.parents {
-                for parent_id in parents {
-                    // Google Drive usa "root" o el ID canónico (root_id) para el "My Drive" del usuario
-                    // Ambos deben mapearse al inode 1 (root del filesystem local)
-                    let parent_inode = if parent_id == "root" || parent_id == root_id {
-                        1u64
-                    } else {
-                        self.db.get_or_create_inode(parent_id).await?
-                    };
-                    self.db.upsert_dentry(parent_inode, inode, name).await?;
+            // IMPORTANTE: Si el archivo tiene cambios locales pendientes (dirty),
+            // NO sobreescribir la dentry. El cambio remoto es probablemente un eco
+            // de una operación previa nuestra, y el estado local (posiblemente un
+            // segundo movimiento) tiene prioridad.
+            let is_dirty = self.db.is_dirty(inode).await.unwrap_or(false);
+            let owned = file.owned_by_me.unwrap_or(true);
+            if !is_dirty {
+                if let Some(parents) = &file.parents {
+                    for parent_id in parents {
+                        // Google Drive usa "root" o el ID canónico (root_id) para el "My Drive" del usuario
+                        // Ambos deben mapearse al inode 1 (root del filesystem local)
+                        let parent_inode = if parent_id == "root" || parent_id == root_id {
+                            1u64
+                        } else {
+                            let pi = self.db.get_or_create_inode(parent_id).await?;
+                            // Si el archivo no es nuestro y su padre no está conectado
+                            // al árbol (no tiene dentry), vincularlo directamente al root.
+                            // Los archivos "Shared with me" tienen padres en el Drive
+                            // del propietario original, inalcanzables desde nuestro root.
+                            if !owned && !self.db.has_dentry(pi).await.unwrap_or(true) {
+                                1u64
+                            } else {
+                                pi
+                            }
+                        };
+                        self.db.upsert_dentry(parent_inode, inode, name).await?;
+                    }
+                } else {
+                    // Sin padres → colgar del root
+                    self.db.upsert_dentry(1, inode, name).await?;
                 }
             } else {
-                // Sin padres → colgar del root
-                self.db.upsert_dentry(1, inode, name).await?;
+                tracing::debug!(
+                    "⏭️ Saltando actualización de dentry para inode={} (dirty): el cambio remoto es un eco",
+                    inode
+                );
+            }
+
+            // Asegurar dir_counters para directorios nuevos
+            if is_dir {
+                self.db.ensure_dir_counter(inode).await?;
             }
 
             // Actualizar remote_md5 si está disponible (para detección de conflictos)
@@ -232,7 +327,7 @@ impl BackgroundSyncer {
                 self.db.set_remote_md5(inode, &md5).await?;
             }
 
-            tracing::debug!(
+            tracing::trace!(
                 "Cambio detectado: UPSERT file_id={}, name={}, is_dir={}",
                 file_id, name, is_dir
             );
@@ -267,21 +362,31 @@ impl BackgroundSyncer {
             "local_online" => {
                 // Descargar contenido actualizado al path local
                 if !file.mime_type.as_deref().map(|m| m.contains("folder")).unwrap_or(false) {
+                    let name_display = std::path::PathBuf::from(&local_file.relative_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| local_file.relative_path.clone());
+                    self.history.log(ActionType::Download, format!("Descargando: {}", name_display));
                     tracing::info!("📥 Descargando actualización para: {}", local_file.relative_path);
                     
-                    // Descargar archivo usando chunks
+                    // Descargar archivo usando chunks (con tracking de progreso)
                     let file_size = file.size.unwrap_or(0) as u64;
                     let mut content = Vec::with_capacity(file_size as usize);
-                    
+
+                    let transfer_id = self.history.start_transfer(&name_display, TransferOp::Download, file_size);
+
                     const CHUNK_SIZE: u32 = 10 * 1024 * 1024; // 10 MB
                     let mut offset = 0u64;
-                    
+
                     while offset < file_size {
                         let size = std::cmp::min(CHUNK_SIZE, (file_size - offset) as u32);
                         let chunk = self.client.download_chunk(file_id, offset, size).await?;
                         content.extend_from_slice(&chunk);
                         offset += chunk.len() as u64;
+                        self.history.update_transfer_progress(transfer_id, offset);
                     }
+
+                    self.history.complete_transfer(transfer_id);
                     
                     // Asegurar que el directorio padre existe
                     if let Some(parent) = local_path.parent() {
@@ -301,6 +406,7 @@ impl BackgroundSyncer {
                         mtime,
                     ).await?;
                     
+                    self.history.log(ActionType::Download, format!("Descargado: {}", name_display));
                     tracing::info!("✅ Archivo actualizado localmente: {}", local_file.relative_path);
                 }
             }

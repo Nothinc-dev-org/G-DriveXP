@@ -11,16 +11,19 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use crate::db::MetadataRepository;
-use crate::sync::local_sync_manager::LocalSyncCommandSender;
+use crate::fuse::filesystem::SHARED_INODE;
+use crate::mirror::MirrorCommand;
 use super::{IpcRequest, IpcResponse, SyncStatus, FileAvailability};
+use tokio::sync::mpsc;
 
+/// Servidor IPC para comunicación con extensiones externas
 /// Servidor IPC para comunicación con extensiones externas
 pub struct IpcServer {
     socket_path: PathBuf,
     db: Arc<MetadataRepository>,
-    mount_point: PathBuf,
+    mirror_path: PathBuf,
     cache_dir: PathBuf,
-    local_sync_tx: Option<LocalSyncCommandSender>,
+    mirror_tx: Option<mpsc::Sender<MirrorCommand>>,
 }
 
 impl IpcServer {
@@ -28,21 +31,21 @@ impl IpcServer {
     pub fn new(
         socket_path: PathBuf,
         db: Arc<MetadataRepository>,
-        mount_point: PathBuf,
+        mirror_path: PathBuf,
         cache_dir: PathBuf,
     ) -> Self {
         Self {
             socket_path,
             db,
-            mount_point,
+            mirror_path,
             cache_dir,
-            local_sync_tx: None,
+            mirror_tx: None,
         }
     }
 
-    /// Establece el canal de comandos para LocalSyncManager
-    pub fn with_local_sync(mut self, tx: LocalSyncCommandSender) -> Self {
-        self.local_sync_tx = Some(tx);
+    /// Establece el canal de comandos para MirrorManager
+    pub fn with_mirror_manager(mut self, tx: mpsc::Sender<MirrorCommand>) -> Self {
+        self.mirror_tx = Some(tx);
         self
     }
 
@@ -72,12 +75,12 @@ impl IpcServer {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     let db = self.db.clone();
-                    let mount_point = self.mount_point.clone();
+                    let mirror_path = self.mirror_path.clone();
                     let cache_dir = self.cache_dir.clone();
-                    let local_sync_tx = self.local_sync_tx.clone();
+                    let local_sync_tx = self.mirror_tx.clone();
                     
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, db, mount_point, cache_dir, local_sync_tx).await {
+                        if let Err(e) = handle_client(stream, db, mirror_path, cache_dir, local_sync_tx).await {
                             tracing::debug!("Error manejando cliente IPC: {:?}", e);
                         }
                     });
@@ -94,110 +97,163 @@ impl IpcServer {
 async fn handle_client(
     mut stream: UnixStream,
     db: Arc<MetadataRepository>,
-    mount_point: PathBuf,
+    mirror_path: PathBuf,
     cache_dir: PathBuf,
-    local_sync_tx: Option<LocalSyncCommandSender>,
+    mirror_tx: Option<mpsc::Sender<MirrorCommand>>,
 ) -> Result<()> {
     // Buffer para leer el request (max 4KB)
     let mut buf = vec![0u8; 4096];
     
-    // Leer longitud del mensaje (4 bytes, big-endian)
-    stream.read_exact(&mut buf[..4]).await?;
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    
-    if len > 4096 {
-        anyhow::bail!("Mensaje IPC demasiado grande: {} bytes", len);
+    // Loop principal para conexión persistente
+    loop {
+        // Leer longitud del mensaje (4 bytes, big-endian)
+        // Usamos read_exact pero manejamos EOF gracefulmente
+        match stream.read_exact(&mut buf[..4]).await {
+            Ok(_) => {}, // Continuamos
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // El cliente cerró la conexión
+                return Ok(());
+            },
+            Err(e) => return Err(e.into()),
+        }
+
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        
+        if len > 4096 {
+            anyhow::bail!("Mensaje IPC demasiado grande: {} bytes", len);
+        }
+        
+        // Leer el mensaje
+        if let Err(e) = stream.read_exact(&mut buf[..len]).await {
+            // Si falla la lectura del contenido pero leímos el header, es un error real
+            anyhow::bail!("Error leyendo cuerpo del mensaje IPC: {}", e);
+        }
+        
+        // Deserializar request
+        let request: IpcRequest = bincode::deserialize(&buf[..len])
+            .context("Error deserializando request IPC")?;
+        
+        // Log de entrada (solo nivel trace para no saturar con el loop)
+        tracing::trace!("📥 IPC Request: {:?}", request);
+        
+        // Procesar request
+        let response = match request {
+            IpcRequest::Ping => IpcResponse::Pong,
+            IpcRequest::GetFileStatus { path } => {
+                let data = get_extended_file_status(&db, &mirror_path, &cache_dir, &path).await;
+                IpcResponse::ExtendedStatus(data)
+            }
+            IpcRequest::GetFileAvailability { path } => {
+                let avail = get_file_availability(&db, &mirror_path, &path).await;
+                IpcResponse::Availability(avail)
+            }
+            IpcRequest::SetOnlineOnly { path } => {
+                // Validación para evitar borrar archivos no sincronizados
+                let rel = if path.starts_with(mirror_path.to_string_lossy().as_ref()) {
+                    path.strip_prefix(mirror_path.to_string_lossy().as_ref()).unwrap_or(&path).trim_start_matches('/')
+                } else {
+                    &path
+                };
+                
+                let can_free_space = if let Ok(Some((_, gdrive_id))) = resolve_path_to_inode_and_gdrive_id(&db, rel).await {
+                    !gdrive_id.starts_with("temp_")
+                } else {
+                    true // Si no encontramos inode, dejamos que el error se maneje más adelante
+                };
+
+                if !can_free_space {
+                    IpcResponse::Error { message: "El archivo aún no se ha sincronizado con Google Drive. No se puede liberar espacio.".to_string() }
+                } else {
+                    match set_availability(&mirror_tx, &path, "online_only").await {
+                        Ok(()) => IpcResponse::Success,
+                        Err(e) => IpcResponse::Error { message: e.to_string() },
+                    }
+                }
+            }
+            IpcRequest::SetLocalOnline { path } => {
+                match set_availability(&mirror_tx, &path, "local_online").await {
+                    Ok(()) => IpcResponse::Success,
+                    Err(e) => IpcResponse::Error { message: e.to_string() },
+                }
+            }
+        };
+        
+        // Log de salida (trace)
+        tracing::trace!("📤 IPC Response: {:?}", response);
+        
+        // Serializar respuesta
+        let response_bytes = bincode::serialize(&response)
+            .context("Error serializando respuesta IPC")?;
+        
+        // Escribir longitud + respuesta
+        let len_bytes = (response_bytes.len() as u32).to_be_bytes();
+        stream.write_all(&len_bytes).await?;
+        stream.write_all(&response_bytes).await?;
     }
-    
-    // Leer el mensaje
-    stream.read_exact(&mut buf[..len]).await?;
-    
-    // Deserializar request
-    let request: IpcRequest = bincode::deserialize(&buf[..len])
-        .context("Error deserializando request IPC")?;
-    
-    // Procesar request
-    let response = match request {
-        IpcRequest::Ping => IpcResponse::Pong,
-        IpcRequest::GetFileStatus { path } => {
-            let status = get_file_status(&db, &mount_point, &cache_dir, &path).await;
-            IpcResponse::FileStatus(status)
-        }
-        IpcRequest::GetFileAvailability { path } => {
-            let avail = get_file_availability(&db, &path).await;
-            IpcResponse::Availability(avail)
-        }
-        IpcRequest::SetOnlineOnly { path } => {
-            match set_availability(&db, &local_sync_tx, &path, "online_only").await {
-                Ok(()) => IpcResponse::Success,
-                Err(e) => IpcResponse::Error { message: e.to_string() },
-            }
-        }
-        IpcRequest::SetLocalOnline { path } => {
-            match set_availability(&db, &local_sync_tx, &path, "local_online").await {
-                Ok(()) => IpcResponse::Success,
-                Err(e) => IpcResponse::Error { message: e.to_string() },
-            }
-        }
-    };
-    
-    // Serializar respuesta
-    let response_bytes = bincode::serialize(&response)
-        .context("Error serializando respuesta IPC")?;
-    
-    // Escribir longitud + respuesta
-    let len_bytes = (response_bytes.len() as u32).to_be_bytes();
-    stream.write_all(&len_bytes).await?;
-    stream.write_all(&response_bytes).await?;
-    
-    Ok(())
 }
 
-/// Obtiene el estado de sincronización de un archivo dado su path
-async fn get_file_status(
+/// Obtiene el estado extendido de un archivo (sincronización, disponibilidad, compartido)
+async fn get_extended_file_status(
     db: &MetadataRepository,
-    mount_point: &std::path::Path,
+    mirror_path: &std::path::Path,
     cache_dir: &std::path::Path,
     file_path: &str,
-) -> SyncStatus {
-    // Convertir URI file:// a path si es necesario y decodificar URL encoding
-    let raw_path = if file_path.starts_with("file://") {
-        file_path.strip_prefix("file://").unwrap_or(file_path)
-    } else {
-        file_path
-    };
+) -> super::FileStatusData {
+    // Decodificar URI
+    let path_str = decode_file_uri(file_path);
+    let _path = std::path::Path::new(&path_str);
     
-    // Decodificar caracteres URL-encoded (espacios=%20, paréntesis=%28%29, etc.)
-    let path = match percent_decode_str(raw_path).decode_utf8() {
-        Ok(decoded) => decoded.into_owned(),
-        Err(_) => return SyncStatus::Unknown,
+    // Default safe response
+    let mut data = super::FileStatusData {
+        status: SyncStatus::Unknown,
+        availability: FileAvailability::NotTracked,
+        is_shared: false,
     };
-    
-    // Verificar si el archivo está dentro del mount point
-    let mount_str = mount_point.to_string_lossy();
-    if !path.starts_with(mount_str.as_ref()) {
-        return SyncStatus::Unknown;
+
+    // 1. Determinar Disponibilidad
+    data.availability = get_file_availability(db, mirror_path, file_path).await;
+
+    // 2. Determinar SyncStatus
+    if data.availability != FileAvailability::NotTracked {
+        // Resolver inode para obtener status y shared
+        let mirror_str = mirror_path.to_string_lossy();
+        if path_str.starts_with(mirror_str.as_ref()) {
+            if let Some(relative_path) = path_str.strip_prefix(mirror_str.as_ref()) {
+                let rel = relative_path.trim_start_matches('/');
+                match resolve_path_to_inode_and_gdrive_id(db, rel).await {
+                    Ok(Some((inode, gdrive_id))) => {
+                        // Obtener status
+                        match get_sync_state(db, cache_dir, inode, &gdrive_id, &path_str).await {
+                            Ok(status) => {
+                                data.status = status;
+                            }
+                            Err(e) => {
+                                tracing::warn!("[IPC] path={} get_sync_state ERROR: {}", rel, e);
+                                data.status = SyncStatus::Unknown;
+                            }
+                        }
+
+                        // Obtener flag de compartido
+                        if let Ok(attrs) = db.get_attrs(inode).await {
+                            data.is_shared = attrs.shared;
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::info!("[IPC] path={} resolve returned None", rel);
+                    }
+                    Err(e) => {
+                        tracing::warn!("[IPC] path={} resolve ERROR: {}", rel, e);
+                    }
+                }
+            } else {
+                tracing::info!("[IPC] path={} strip_prefix failed (mirror={})", path_str, mirror_str);
+            }
+        } else {
+            tracing::info!("[IPC] path={} NOT in mirror={}", path_str, mirror_str);
+        }
     }
-    
-    // Extraer path relativo dentro del mount point
-    let relative_path = match path.strip_prefix(mount_str.as_ref()) {
-        Some(p) => p.trim_start_matches('/'),
-        None => return SyncStatus::Unknown,
-    };
-    
-    // Buscar el archivo en la base de datos por nombre
-    // Recorremos el path para encontrar el inode
-    let (inode, gdrive_id) = match resolve_path_to_inode_and_gdrive_id(db, relative_path).await {
-        Ok(Some(result)) => result,
-        Ok(None) => return SyncStatus::Unknown,
-        Err(_) => return SyncStatus::Unknown,
-    };
-    
-    // Consultar estado de sincronización, pasando info de cache
-    match get_sync_state(db, cache_dir, inode, &gdrive_id).await {
-        Ok(state) => state,
-        Err(_) => SyncStatus::Unknown,
-    }
+
+    data
 }
 
 /// Resuelve un path relativo a su inode y gdrive_id
@@ -206,16 +262,43 @@ async fn resolve_path_to_inode_and_gdrive_id(
     relative_path: &str,
 ) -> Result<Option<(u64, String)>> {
     let parts: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
-    
+
+    // Caso especial: carpeta virtual SHARED
+    if !parts.is_empty() && parts[0] == "SHARED" {
+        if parts.len() == 1 {
+            // La carpeta SHARED en sí
+            return Ok(Some((SHARED_INODE, "SHARED_VIRTUAL".to_string())));
+        }
+        // Hijos de SHARED están bajo root (inode 1) con owned_by_me=0
+        // Saltar "SHARED" y resolver normalmente desde root
+        let mut current_inode = 1u64;
+        for part in &parts[1..] {
+            match db.lookup(current_inode, part).await? {
+                Some(child_inode) => current_inode = child_inode,
+                None => return Ok(None),
+            }
+        }
+        let gdrive_id: Option<String> = sqlx::query_scalar(
+            "SELECT gdrive_id FROM inodes WHERE inode = ?"
+        )
+        .bind(current_inode as i64)
+        .fetch_optional(db.pool())
+        .await?;
+        return match gdrive_id {
+            Some(id) => Ok(Some((current_inode, id))),
+            None => Ok(None),
+        };
+    }
+
     let mut current_inode = 1u64; // Root inode
-    
+
     for part in parts {
         match db.lookup(current_inode, part).await? {
             Some(child_inode) => current_inode = child_inode,
             None => return Ok(None),
         }
     }
-    
+
     // Obtener gdrive_id del inode final
     let gdrive_id: Option<String> = sqlx::query_scalar(
         "SELECT gdrive_id FROM inodes WHERE inode = ?"
@@ -223,7 +306,7 @@ async fn resolve_path_to_inode_and_gdrive_id(
     .bind(current_inode as i64)
     .fetch_optional(db.pool())
     .await?;
-    
+
     match gdrive_id {
         Some(id) => Ok(Some((current_inode, id))),
         None => Ok(None),
@@ -236,7 +319,46 @@ async fn get_sync_state(
     _cache_dir: &std::path::Path,
     inode: u64,
     _gdrive_id: &str,
+    abs_path: &str,
 ) -> Result<SyncStatus> {
+    // Caso especial: carpeta virtual SHARED
+    if inode == SHARED_INODE {
+        let (has_local_only, has_synced, _total_files) =
+            db.get_shared_directory_aggregate_status().await?;
+
+        return Ok(if has_local_only {
+            SyncStatus::LocalOnly
+        } else if has_synced {
+            SyncStatus::Synced
+        } else {
+            SyncStatus::CloudOnly
+        });
+    }
+
+    // 1. Verificación Física (Source of Truth para UI)
+    // Si es un Symlink -> CloudOnly
+    // Si es File -> Synced
+    // Si no existe -> CloudOnly (o Deleted)
+
+    let path = std::path::Path::new(abs_path);
+    let physical_state = match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                Some(SyncStatus::CloudOnly)
+            } else if meta.is_file() {
+                Some(SyncStatus::Synced)
+            } else {
+                // Directorio u otro
+                // Para directorios, consultamos DB (más abajo)
+                None 
+            }
+        },
+        Err(_) => {
+            // No existe físicamente, probable CloudOnly puro (virtual)
+            Some(SyncStatus::CloudOnly)
+        }
+    };
+
     // Obtener atributos para verificar si es directorio
     let is_dir: Option<bool> = sqlx::query_scalar(
         "SELECT is_dir FROM attrs WHERE inode = ?"
@@ -245,9 +367,18 @@ async fn get_sync_state(
     .fetch_optional(db.pool())
     .await?;
     
-    // Los directorios siempre se consideran "sincronizados" (solo contienen metadata)
+    // Directorios: calcular estado agregado recursivo de todos sus descendientes
     if is_dir == Some(true) {
-        return Ok(SyncStatus::Synced);
+        let (has_local_only, has_synced, _total_files) =
+            db.get_directory_aggregate_status(inode).await?;
+
+        return Ok(if has_local_only {
+            SyncStatus::LocalOnly // Naranja: al menos 1 hijo con cambios pendientes
+        } else if has_synced {
+            SyncStatus::Synced // Verde: al menos 1 hijo sincronizado
+        } else {
+            SyncStatus::CloudOnly // Azul: todos los hijos solo en la nube o vacía
+        });
     }
     
     // Obtener el tamaño esperado del archivo desde la base de datos
@@ -290,36 +421,52 @@ async fn get_sync_state(
             } else if dirty {
                 // Cambios locales pendientes de subir
                 Ok(SyncStatus::LocalOnly)
-            } else if has_complete_cache {
-                // Sincronizado y completamente disponible localmente
-                Ok(SyncStatus::Synced)
             } else {
-                // En Drive pero no descargado completamente
-                Ok(SyncStatus::CloudOnly)
+                // Si no está sucio, retornamos el estado físico detectado
+                // Si physical_state es None (e.g. directorio raro), fallback a lógica cache
+                Ok(physical_state.unwrap_or(if has_complete_cache { SyncStatus::Synced } else { SyncStatus::CloudOnly }))
             }
         }
         None => {
-            // Sin registro en sync_state
-            if has_complete_cache {
-                Ok(SyncStatus::Synced)
-            } else {
-                // Archivo solo en la nube o parcialmente cacheado
-                Ok(SyncStatus::CloudOnly)
-            }
+            // Sin registro en sync_state, retornamos estado físico
+             Ok(physical_state.unwrap_or(if has_complete_cache { SyncStatus::Synced } else { SyncStatus::CloudOnly }))
         }
     }
 }
 
-/// Obtiene la disponibilidad de un archivo en Local Sync
+/// Obtiene la disponibilidad de un archivo en Local Sync o Mirror
 async fn get_file_availability(
     db: &MetadataRepository,
+    mirror_path: &std::path::Path,
     file_path: &str,
 ) -> FileAvailability {
     // Decodificar URI file://
-    let path = decode_file_uri(file_path);
+    let path_str = decode_file_uri(file_path);
+    let path = std::path::Path::new(&path_str);
     
-    // Buscar en local_sync_files por path absoluto
-    match db.find_local_sync_file_by_absolute_path(&path).await {
+    // 1. Verificar si es parte del Mirror Principal
+    if path.starts_with(mirror_path) {
+        // Es un archivo del mirror, consultamos su estado en sync_state
+        if let Ok(relative) = path.strip_prefix(mirror_path) {
+             let relative_str = relative.to_string_lossy();
+             // Resolver inode
+             if let Ok(Some((inode, _))) = resolve_path_to_inode_and_gdrive_id(db, &relative_str).await {
+                 // Consultar disponibilidad en DB
+                 if let Ok(avail_str) = db.get_availability(inode).await {
+                     return match avail_str.as_str() {
+                         "local_online" => FileAvailability::LocalOnline,
+                         "online_only" => FileAvailability::OnlineOnly,
+                         _ => FileAvailability::OnlineOnly, // Default safe
+                     };
+                 }
+             }
+        }
+        // Si falla la resolución, asumimos OnlineOnly si está en mirror path (safe default)
+        return FileAvailability::OnlineOnly;
+    }
+
+    // 2. Buscar en local_sync_files (Carpetas externas)
+    match db.find_local_sync_file_by_absolute_path(&path_str).await {
         Ok(Some(file)) => {
             match file.availability.as_str() {
                 "local_online" => FileAvailability::LocalOnline,
@@ -333,37 +480,31 @@ async fn get_file_availability(
 
 /// Cambia la disponibilidad de un archivo
 async fn set_availability(
-    db: &MetadataRepository,
-    local_sync_tx: &Option<LocalSyncCommandSender>,
+    mirror_tx: &Option<mpsc::Sender<MirrorCommand>>,
     file_path: &str,
     availability: &str,
 ) -> Result<()> {
-    use crate::sync::local_sync_manager::LocalSyncCommand;
-    
     let path = decode_file_uri(file_path);
     
-    // Resolver path a sync_dir_id y relative_path
-    let (sync_dir_id, relative_path) = db.resolve_local_sync_path(&path).await?;
-    
     // Obtener el canal de comandos
-    let tx = local_sync_tx.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("LocalSyncManager no disponible"))?;
+    let tx = mirror_tx.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("MirrorManager no disponible"))?;
     
-    // Enviar comando al LocalSyncManager
+    // Enviar comando al MirrorManager
     let cmd = match availability {
-        "online_only" => LocalSyncCommand::SetOnlineOnly {
-            sync_dir_id,
-            relative_path,
+        "online_only" => MirrorCommand::SetOnlineOnly {
+            path: path.clone()
         },
-        "local_online" => LocalSyncCommand::SetLocalOnline {
-            sync_dir_id,
-            relative_path,
+        "local_online" => MirrorCommand::SetLocalOnline {
+            path: path.clone()
         },
         _ => return Err(anyhow::anyhow!("Availability desconocida: {}", availability)),
     };
     
+    tracing::info!("🔄 IPC enviando comando {:?} a MirrorManager", cmd);
     tx.send(cmd).await
         .map_err(|e| anyhow::anyhow!("Error enviando comando: {}", e))?;
+    tracing::info!("✅ Comando enviado exitosamente al MirrorManager");
     
     Ok(())
 }

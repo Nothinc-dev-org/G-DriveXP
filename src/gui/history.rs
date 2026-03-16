@@ -1,13 +1,18 @@
 //! Historial de acciones recientes para mostrar en el icono de bandeja
 //!
 //! Almacena las últimas N acciones de sincronización, creación, eliminación, etc.
+//! También rastrea transfers activos (uploads/downloads) con progreso.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::collections::{VecDeque, HashMap};
+use std::sync::{Arc, RwLock, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// Número máximo de entradas en el historial
 const MAX_HISTORY_ENTRIES: usize = 50;
+
+/// Contador global para IDs únicos de transfers
+static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Tipo de acción registrada
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +24,7 @@ pub enum ActionType {
     Delete,
     Conflict,
     Error,
+    Stream,
 }
 
 impl ActionType {
@@ -28,11 +34,65 @@ impl ActionType {
             ActionType::Sync => "🔄",
             ActionType::Upload => "📤",
             ActionType::Download => "📥",
-            ActionType::Create => "✨",
+            ActionType::Create => "📄",
             ActionType::Delete => "🗑️",
             ActionType::Conflict => "⚠️",
             ActionType::Error => "❌",
+            ActionType::Stream => "🎬",
         }
+    }
+}
+
+/// Tipo de operación de transferencia
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferOp {
+    Upload,
+    Download,
+    Stream,
+}
+
+impl TransferOp {
+    pub fn emoji(&self) -> &'static str {
+        match self {
+            TransferOp::Upload => "📤",
+            TransferOp::Download => "📥",
+            TransferOp::Stream => "🎬",
+        }
+    }
+}
+
+/// Transfer activo con progreso
+#[derive(Debug, Clone)]
+pub struct ActiveTransfer {
+    pub id: u64,
+    pub file_name: String,
+    pub operation: TransferOp,
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+    pub speed_bps: u64,
+    pub last_update: Option<(SystemTime, u64)>,
+}
+
+impl ActiveTransfer {
+    pub fn progress_fraction(&self) -> f64 {
+        if self.total_bytes == 0 {
+            return 0.0;
+        }
+        (self.bytes_transferred as f64) / (self.total_bytes as f64)
+    }
+}
+
+/// Estado de progreso de sincronización (cambios detectados vs aplicados)
+#[derive(Debug, Clone, Default)]
+pub struct SyncProgress {
+    pub changes_detected: usize,
+    pub changes_applied: usize,
+    pub pending_uploads: usize,
+}
+
+impl SyncProgress {
+    pub fn is_synced(&self) -> bool {
+        self.changes_detected == 0 || self.changes_detected == self.changes_applied
     }
 }
 
@@ -77,6 +137,9 @@ impl ActionEntry {
 #[derive(Clone)]
 pub struct ActionHistory {
     entries: Arc<RwLock<VecDeque<ActionEntry>>>,
+    active_transfers: Arc<RwLock<HashMap<u64, ActiveTransfer>>>,
+    sync_progress: Arc<RwLock<SyncProgress>>,
+    notify: Arc<RwLock<Option<mpsc::Sender<()>>>>,
 }
 
 impl Default for ActionHistory {
@@ -89,6 +152,24 @@ impl ActionHistory {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_HISTORY_ENTRIES))),
+            active_transfers: Arc::new(RwLock::new(HashMap::new())),
+            sync_progress: Arc::new(RwLock::new(SyncProgress::default())),
+            notify: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Registra un notificador que se dispara cada vez que se añade una entrada
+    pub fn set_notifier(&self, tx: mpsc::Sender<()>) {
+        if let Ok(mut notify) = self.notify.write() {
+            *notify = Some(tx);
+        }
+    }
+
+    fn notify_change(&self) {
+        if let Ok(notify) = self.notify.read() {
+            if let Some(tx) = notify.as_ref() {
+                let _ = tx.send(());
+            }
         }
     }
 
@@ -100,6 +181,7 @@ impl ActionHistory {
             }
             entries.push_front(entry);
         }
+        self.notify_change();
     }
 
     /// Añade una entrada de forma conveniente
@@ -122,6 +204,158 @@ impl ActionHistory {
             entries.iter().cloned().collect()
         } else {
             Vec::new()
+        }
+    }
+
+    // --- Transfer activo API ---
+
+    /// Inicia un nuevo transfer activo. Retorna el ID asignado.
+    pub fn start_transfer(&self, file_name: impl Into<String>, operation: TransferOp, total_bytes: u64) -> u64 {
+        let id = NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+        let transfer = ActiveTransfer {
+            id,
+            file_name: file_name.into(),
+            operation,
+            bytes_transferred: 0,
+            total_bytes,
+            speed_bps: 0,
+            last_update: Some((SystemTime::now(), 0)),
+        };
+        if let Ok(mut transfers) = self.active_transfers.write() {
+            transfers.insert(id, transfer);
+        }
+        self.notify_change();
+        id
+    }
+
+    /// Actualiza el progreso de un transfer activo
+    pub fn update_transfer_progress(&self, id: u64, bytes_transferred: u64) {
+        let changed = if let Ok(mut transfers) = self.active_transfers.write() {
+            if let Some(transfer) = transfers.get_mut(&id) {
+                // Calcular velocidad si ha pasado suficiente tiempo (ej. 500ms)
+                let now = SystemTime::now();
+                let mut speed_updated = false;
+                
+                if let Some((last_time, last_bytes)) = transfer.last_update {
+                    if let Ok(elapsed) = now.duration_since(last_time) {
+                        if elapsed.as_millis() >= 500 {
+                            let bytes_delta = bytes_transferred.saturating_sub(last_bytes);
+                            let current_speed = (bytes_delta as f64 / elapsed.as_secs_f64()) as u64;
+                            
+                            // Suavizado simple (EMA)
+                            if transfer.speed_bps == 0 {
+                                transfer.speed_bps = current_speed;
+                            } else {
+                                transfer.speed_bps = (transfer.speed_bps as f64 * 0.7 + current_speed as f64 * 0.3) as u64;
+                            }
+                            
+                            transfer.last_update = Some((now, bytes_transferred));
+                            speed_updated = true;
+                        }
+                    }
+                } else {
+                    transfer.last_update = Some((now, bytes_transferred));
+                }
+
+                if transfer.bytes_transferred != bytes_transferred || speed_updated {
+                    transfer.bytes_transferred = bytes_transferred;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if changed {
+            self.notify_change();
+        }
+    }
+
+    /// Completa y remueve un transfer activo
+    pub fn complete_transfer(&self, id: u64) {
+        if let Ok(mut transfers) = self.active_transfers.write() {
+            transfers.remove(&id);
+        }
+        self.notify_change();
+    }
+
+    /// Obtiene una copia de todos los transfers activos
+    pub fn active_transfers(&self) -> Vec<ActiveTransfer> {
+        if let Ok(transfers) = self.active_transfers.read() {
+            transfers.values().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    // --- Sync progress API ---
+
+    /// Establece el progreso de sincronización (cambios detectados y aplicados)
+    pub fn set_sync_progress(&self, detected: usize, applied: usize) {
+        let changed = if let Ok(mut progress) = self.sync_progress.write() {
+            let changed = progress.changes_detected != detected || progress.changes_applied != applied;
+            progress.changes_detected = detected;
+            progress.changes_applied = applied;
+            changed
+        } else {
+            false
+        };
+
+        if changed {
+            self.notify_change();
+        }
+    }
+
+    /// Incrementa en 1 el contador de cambios aplicados
+    pub fn increment_applied(&self) {
+        if let Ok(mut progress) = self.sync_progress.write() {
+            progress.changes_applied += 1;
+        }
+        self.notify_change();
+    }
+
+    /// Marca todo como sincronizado (resetea contadores)
+    pub fn mark_all_synced(&self) {
+        let changed = if let Ok(mut progress) = self.sync_progress.write() {
+            let changed = progress.changes_detected != 0 || progress.changes_applied != 0;
+            progress.changes_detected = 0;
+            progress.changes_applied = 0;
+            changed
+        } else {
+            false
+        };
+
+        if changed {
+            self.notify_change();
+        }
+    }
+
+    /// Obtiene el estado actual de progreso de sincronización
+    pub fn get_sync_progress(&self) -> SyncProgress {
+        if let Ok(progress) = self.sync_progress.read() {
+            progress.clone()
+        } else {
+            SyncProgress::default()
+        }
+    }
+
+    /// Actualiza el conteo de subidas pendientes localmente
+    pub fn set_pending_uploads(&self, count: usize) {
+        let changed = if let Ok(mut progress) = self.sync_progress.write() {
+            let changed = progress.pending_uploads != count;
+            progress.pending_uploads = count;
+            changed
+        } else {
+            false
+        };
+        
+        // Si el conteo cambió, notificar al tray (hacerlo fuera del lock)
+        if changed {
+            self.notify_change();
         }
     }
 }

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS attrs (
     mode INTEGER NOT NULL,
     is_dir BOOLEAN NOT NULL,
     mime_type TEXT,
+    can_move BOOLEAN DEFAULT 1,
     FOREIGN KEY (inode) REFERENCES inodes(inode)
 );
 
@@ -75,3 +76,11 @@ CREATE TABLE IF NOT EXISTS local_sync_dirs (
 );
 CREATE INDEX IF NOT EXISTS idx_local_sync_enabled ON local_sync_dirs(enabled) WHERE enabled=1;
 
+-- Contadores pre-calculados de estado por directorio (Protocolo "Burbujeo de Estados")
+-- Permite respuestas O(1) a consultas IPC de estado de directorios
+CREATE TABLE IF NOT EXISTS dir_counters (
+    inode INTEGER PRIMARY KEY,
+    dirty_desc_count INTEGER NOT NULL DEFAULT 0,
+    synced_desc_count INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (inode) REFERENCES inodes(inode) ON DELETE CASCADE
+);

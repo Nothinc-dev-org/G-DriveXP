@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+use futures::stream::{self, StreamExt};
 
 use crate::db::MetadataRepository;
 use crate::gdrive::client::DriveClient;
@@ -16,7 +17,7 @@ use crate::gdrive::client::DriveClient;
 /// Intervalo máximo de backoff en segundos
 const MAX_BACKOFF_SECS: u64 = 300;
 
-use crate::gui::history::{ActionHistory, ActionType};
+use crate::gui::history::{ActionHistory, ActionType, TransferOp};
 
 /// Uploader en background que sube archivos dirty a Google Drive
 pub struct Uploader {
@@ -24,7 +25,9 @@ pub struct Uploader {
     client: Arc<DriveClient>,
     interval: Duration,
     cache_dir: std::path::PathBuf,
+    mirror_path: std::path::PathBuf,
     history: ActionHistory,
+    root_id: String,
 }
 
 impl Uploader {
@@ -34,14 +37,18 @@ impl Uploader {
         client: Arc<DriveClient>,
         interval_secs: u64,
         cache_dir: impl AsRef<Path>,
+        mirror_path: impl AsRef<Path>,
         history: ActionHistory,
+        root_id: String,
     ) -> Self {
         Self {
             db,
             client,
             interval: Duration::from_secs(interval_secs),
             cache_dir: cache_dir.as_ref().to_path_buf(),
+            mirror_path: mirror_path.as_ref().to_path_buf(),
             history,
+            root_id,
         }
     }
 
@@ -87,14 +94,26 @@ impl Uploader {
         let mut uploaded_count = 0;
         
         // 2. Procesar archivos FUSE
-        for (inode, gdrive_id, is_delete) in dirty_files {
-            match self.upload_file(inode, &gdrive_id, is_delete).await {
+        let upload_results = stream::iter(dirty_files)
+            .map(|(inode, gdrive_id, is_delete)| async move {
+                let res = self.upload_file(inode, &gdrive_id, is_delete).await;
+                (inode, res)
+            })
+            .buffer_unordered(4) // Concurrencia máxima de 4
+            .collect::<Vec<_>>()
+            .await;
+
+        for (inode, result) in upload_results {
+            match result {
                 Ok(()) => {
                     uploaded_count += 1;
                 }
                 Err(e) => {
-                    warn!("Error subiendo inode {}: {:?}", inode, e);
-                    // Continuamos con los demás
+                    if e.to_string().contains("DEFERRED_PARENT_TEMP") {
+                        debug!("⏳ Inode {} aplazado: directorio padre aún no sincronizado", inode);
+                    } else {
+                        warn!("Error subiendo inode {}: {:?}", inode, e);
+                    }
                 }
             }
         }
@@ -161,6 +180,10 @@ impl Uploader {
         let attrs = self.db.get_attrs(inode).await?;
         let name = self.get_file_name(inode).await?;
         let parent_gdrive_id = self.get_parent_gdrive_id(inode).await?;
+    
+    if parent_gdrive_id.starts_with("temp_") {
+        anyhow::bail!("DEFERRED_PARENT_TEMP");
+    }
         
         // Validar si es una carpeta
         if attrs.is_dir {
@@ -177,10 +200,16 @@ impl Uploader {
                 .execute(self.db.pool())
                 .await?;
             
-            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                .bind(inode as i64)
-                .execute(self.db.pool())
-                .await?;
+            // Optimistic Locking: Verificar si el estado cambió mientras creábamos la carpeta
+            let current_name = self.get_file_name(inode).await?;
+            let current_parent_id = self.get_parent_gdrive_id(inode).await?;
+
+            if current_name != name || current_parent_id != parent_gdrive_id {
+                warn!("⚠️ Modificación concurrente detectada durante creación de carpeta (inode={}). Manteniendo dirty=1.", inode);
+                // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
+            } else {
+                self.db.clear_dirty_and_bubble(inode).await?;
+            }
             
             info!("✅ Carpeta creada en GDrive: {} (inode={})", real_gdrive_id, inode);
             self.history.log(ActionType::Create, format!("Carpeta creada: {}", name));
@@ -189,19 +218,48 @@ impl Uploader {
 
         // Ruta del archivo en caché
         let cache_path = self.cache_dir.join(temp_gdrive_id);
-        
+
         if !cache_path.exists() {
-            warn!("Archivo de caché no existe: {:?}, creando vacío", cache_path);
-            tokio::fs::write(&cache_path, b"").await?;
+            // El archivo fue copiado directamente al directorio mirror (no a través de FUSE),
+            // por lo que su contenido nunca llegó a la caché. Buscar en el mirror como fallback.
+            let mirror_source = self.db.resolve_inode_to_relative_path(inode).await
+                .ok()
+                .flatten()
+                .map(|rel| self.mirror_path.join(rel));
+
+            match mirror_source {
+                Some(ref src) if src.exists() => {
+                    info!("📂 Copiando desde mirror a caché antes de subir: {:?}", src);
+                    tokio::fs::copy(src, &cache_path).await
+                        .context("Error copiando archivo desde mirror a caché")?;
+                }
+                _ => {
+                    warn!("Archivo de caché no existe y no se encontró en mirror: {:?}", cache_path);
+                    tokio::fs::write(&cache_path, b"").await?;
+                }
+            }
         }
         
-        // Subir archivo usando la API
-        let real_gdrive_id = self.client.upload_file(
+        // Subir archivo usando la API (con tracking de progreso)
+        let file_size = tokio::fs::metadata(&cache_path).await.map(|m| m.len()).unwrap_or(0);
+        let transfer_id = self.history.start_transfer(&name, TransferOp::Upload, file_size);
+        
+        let history_clone = self.history.clone();
+        let progress_cb = Box::new(move |offset: u64| {
+            history_clone.update_transfer_progress(transfer_id, offset);
+        });
+
+        let upload_result = self.client.upload_file(
             &cache_path,
             &name,
             attrs.mime_type.as_deref(),
             &parent_gdrive_id,
-        ).await.context("Error subiendo archivo nuevo")?;
+            Some(progress_cb as Box<dyn Fn(u64) + Send + Sync>),
+        ).await;
+
+        self.history.complete_transfer(transfer_id);
+        
+        let real_gdrive_id = upload_result.context("Error subiendo archivo nuevo")?;
         
         // Actualizar el gdrive_id en la base de datos
         sqlx::query("UPDATE inodes SET gdrive_id = ? WHERE inode = ?")
@@ -211,10 +269,16 @@ impl Uploader {
             .await?;
         
         // Marcar como limpio (no dirty)
-        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await?;
+        // Optimistic Locking: Verificar si el estado cambió mientras subíamos el archivo
+        let current_name = self.get_file_name(inode).await?;
+        let current_parent_id = self.get_parent_gdrive_id(inode).await?;
+
+        if current_name != name || current_parent_id != parent_gdrive_id {
+            warn!("⚠️ Modificación concurrente detectada durante creación de archivo (inode={}). Manteniendo dirty=1.", inode);
+            // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
+        } else {
+            self.db.clear_dirty_and_bubble(inode).await?;
+        }
         
         info!("✅ Archivo creado en GDrive: {} (inode={})", real_gdrive_id, inode);
         self.history.log(ActionType::Create, format!("Archivo creado: {}", name));
@@ -264,7 +328,37 @@ impl Uploader {
         let mut add_parent: Option<String> = None;
         let mut remove_parent: Option<String> = None;
 
+        // --- VERIFICACIÓN DE PERMISOS ---
+        let capabilities = remote_meta.capabilities.as_ref();
+        let can_rename = capabilities.map(|c| c.can_rename.unwrap_or(false)).unwrap_or(true); // Asumir true si no hay info (seguridad por defecto: drive suele enviar capabilities)
+        let can_move = capabilities.map(|c| c.can_move_item_within_drive.unwrap_or(false)).unwrap_or(true);
+        let can_add_my_drive = capabilities.map(|c| c.can_add_my_drive_parent.unwrap_or(false)).unwrap_or(true);
+        let can_edit = capabilities.map(|c| c.can_edit.unwrap_or(false)).unwrap_or(true);
+        // --------------------------------
+
+        // Persistir capacidades actualizadas en la DB (para que MirrorManager/FUSE las conozcan)
+        if let Err(e) = sqlx::query("UPDATE attrs SET can_move = ? WHERE inode = ?")
+            .bind(can_move)
+            .bind(inode as i64)
+            .execute(self.db.pool())
+            .await {
+            error!("Error actualizando can_move en DB: {:?}", e);
+        }
+
         if local_name != current_remote_name {
+            if !can_rename {
+                warn!("⛔ PERMISO DENEGADO: No se puede renombrar '{}'. Revertiendo cambio local.", current_remote_name);
+                // Rollback nombre
+                sqlx::query("UPDATE dentry SET name = ? WHERE child_inode = ?")
+                    .bind(&current_remote_name)
+                    .bind(inode as i64)
+                    .execute(self.db.pool())
+                    .await?;
+                // Limpiar dirty
+                self.db.clear_dirty_and_bubble(inode).await?;
+                return Ok(());
+            }
+
             info!("🔄 Detectado cambio de nombre: '{}' -> '{}'", current_remote_name, local_name);
             new_name = Some(local_name.as_str());
             metadata_updated = true;
@@ -287,6 +381,10 @@ impl Uploader {
         let remote_parents = remote_meta.parents.clone().unwrap_or_default();
         let local_parent_id = self.get_parent_gdrive_id(inode).await?;
         
+        if local_parent_id.starts_with("temp_") {
+            anyhow::bail!("DEFERRED_PARENT_TEMP");
+        }
+        
         // Verificar si el padre local está en la lista de padres remotos
         // Manejar el caso especial de "root" vs ID real del root
         let is_in_remote = if local_parent_id == "root" {
@@ -299,13 +397,74 @@ impl Uploader {
             remote_parents.contains(&local_parent_id)
         };
 
+
+
         if !is_in_remote {
+            // Verificar permisos de Move ANTES de procesar
+            let permission_ok = if remote_parents.is_empty() {
+                // Caso especial: "Shared with me" (sin padres visibles)
+                // Usualmente requiere can_add_my_drive_parent O can_move_item_within_drive
+                can_add_my_drive || can_move
+            } else {
+                can_move
+            };
+            if !permission_ok {
+                warn!("⛔ PERMISO DENEGADO: No se puede mover el archivo (ReadOnly). Revertiendo cambio local.");
+                // --- ROLLBACK FÍSICO Y DB (Mirror) ---
+                // 1. Obtener la ruta "incorrecta" actual (donde el usuario lo movió)
+                let unauthorized_rel = self.db.resolve_inode_to_relative_path(inode).await?.unwrap_or_default();
+                
+                // 2. Rollback DB: Restaurar el padre remoto en la base de datos local
+                let target_parent_inode = if let Some(parent_id) = remote_parents.first() {
+                     sqlx::query_scalar::<_, i64>("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                        .bind(parent_id)
+                        .fetch_optional(self.db.pool())
+                        .await?
+                        .unwrap_or(1)
+                } else {
+                     1 
+                };
+
+                sqlx::query("UPDATE dentry SET parent_inode = ?, name = ? WHERE child_inode = ?")
+                    .bind(target_parent_inode)
+                    .bind(&current_remote_name) // También restauramos el nombre por si hubo rename simultáneo
+                    .bind(inode as i64)
+                    .execute(self.db.pool())
+                    .await?;
+
+                // 3. Obtener la ruta "correcta" restaurada
+                let correct_rel = self.db.resolve_inode_to_relative_path(inode).await?.unwrap_or_default();
+
+                // 4. Limpiar dirty
+                self.db.clear_dirty_and_bubble(inode).await?;
+
+                if !unauthorized_rel.is_empty() && !correct_rel.is_empty() && unauthorized_rel != correct_rel {
+                    warn!("🔄 Ejecutando Rollback Físico: {} -> {}", unauthorized_rel, correct_rel);
+                    let old_p = self.mirror_path.join(unauthorized_rel);
+                    let new_p = self.mirror_path.join(correct_rel);
+                    
+                    if let Err(e) = tokio::fs::rename(&old_p, &new_p).await {
+                        error!("Fallo al revertir físicamente el movimiento: {:?}", e);
+                    }
+                }
+
+                self.history.log(ActionType::Sync, format!("Movimiento bloqueado y revertido: {}", current_remote_name));
+                return Ok(());
+            }
+
             info!("🔄 Detectado cambio de ubicación (Move): padre local={}, padres remotos={:?}", 
                   local_parent_id, remote_parents);
             add_parent = Some(local_parent_id.clone());
             // Remover el primer padre remoto que no sea el nuevo
             if let Some(old) = remote_parents.first() {
                 remove_parent = Some(old.clone());
+            } else {
+                // FALLBACK CRÍTICO REVISADO:
+                // Si parents está vacío, es posible que el archivo esté en Root pero la API oculte el parent 
+                // o use el alias "root" en lugar del ID.
+                // Intentamos remover AMBOS para asegurar que liberamos el padre anterior.
+                warn!("⚠️ Parents remoto vacío. Intentando liberar Root ID ({}) y alias 'root'.", self.root_id);
+                remove_parent = Some(format!("{},root", self.root_id));
             }
             metadata_updated = true;
         }
@@ -329,11 +488,12 @@ impl Uploader {
             if metadata_updated {
                 info!("✅ Renombrado completado sin cambios de contenido (sin caché).");
                 // Marcar como limpio
-                sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                    .bind(inode as i64)
-                    .execute(self.db.pool())
-                    .await?;
-                self.history.log(ActionType::Sync, format!("Renombrado: {}", local_name));
+                self.db.clear_dirty_and_bubble(inode).await?;
+                if add_parent.is_some() {
+                    self.history.log(ActionType::Sync, format!("Movido: {} → {}", current_remote_name, local_name));
+                } else {
+                    self.history.log(ActionType::Sync, format!("Renombrado: {} → {}", current_remote_name, local_name));
+                }
                 return Ok(());
             }
 
@@ -344,10 +504,7 @@ impl Uploader {
             // y permitir que se muestre como CloudOnly/Synced.
             info!("⚠️ Corrigiendo estado inconsistente: dirty=1 pero sin caché local. Reseteando a dirty=0.");
             
-            sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                .bind(inode as i64)
-                .execute(self.db.pool())
-                .await?;
+            self.db.clear_dirty_and_bubble(inode).await?;
                 
             self.history.log(ActionType::Sync, format!("Estado corregido (sin caché): {}", gdrive_id));
 
@@ -366,10 +523,7 @@ impl Uploader {
                          // Actualizar estado para reflejar que está sincronizado
                          self.db.set_remote_md5(inode, remote_md5).await?;
                          
-                         sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                            .bind(inode as i64)
-                            .execute(self.db.pool())
-                            .await?;
+                         self.db.clear_dirty_and_bubble(inode).await?;
                             
                          self.history.log(ActionType::Sync, format!("Verificado sin cambios: {}", gdrive_id));
                          return Ok(());
@@ -381,10 +535,41 @@ impl Uploader {
                 // Continuar con la subida normal
             }
         }
+        
+        // Verificar permisos de Edición de Contenido
+        if !can_edit {
+             warn!("⛔ PERMISO DENEGADO: No se puede editar contenido de {}. Revertiendo estado.", gdrive_id);
+             // Como no tenemos hash del contenido original fácilmente restaurable (salvo que lo descargáramos),
+             // lo mejor es marcar dirty=0 para que en la próxima lectura/sync baje la versión remota.
+             // Opcionalmente borrar el caché local para forzar re-descarga.
+             
+             if cache_path.exists() {
+                 tokio::fs::remove_file(&cache_path).await.ok();
+             }
 
-        // 6. Actualizar contenido usando la API
-        self.client.update_file_content(gdrive_id, &cache_path).await
-            .context("Error actualizando archivo")?;
+             self.db.clear_dirty_and_bubble(inode).await?;
+             
+             return Ok(());
+        }
+
+        // 6. Actualizar contenido usando la API (con tracking de progreso)
+        let file_size = tokio::fs::metadata(&cache_path).await.map(|m| m.len()).unwrap_or(0);
+        let transfer_id = self.history.start_transfer(&local_name, TransferOp::Upload, file_size);
+        
+        let history_clone = self.history.clone();
+        let progress_cb = Box::new(move |offset: u64| {
+            history_clone.update_transfer_progress(transfer_id, offset);
+        });
+
+        let update_result = self.client.update_file_content(
+            gdrive_id, 
+            &cache_path,
+            Some(progress_cb as Box<dyn Fn(u64) + Send + Sync>),
+        ).await;
+
+        self.history.complete_transfer(transfer_id);
+        
+        update_result.context("Error actualizando archivo")?;
         
         // 6. Obtener el nuevo MD5 tras la actualización
         if let Some(new_md5) = self.client.get_file_md5(gdrive_id).await? {
@@ -392,13 +577,23 @@ impl Uploader {
         }
         
         // 7. Marcar como limpio
-        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await?;
+        // 7. Optimistic Locking: Verificar si el estado cambió durante la actualización
+        let current_name = self.get_file_name(inode).await?;
+        let current_parent_id = self.get_parent_gdrive_id(inode).await?;
+
+        if current_name != local_name || current_parent_id != local_parent_id {
+            warn!("⚠️ Modificación concurrente detectada durante actualización (inode={}). Manteniendo dirty=1.", inode);
+            // No limpiamos el flag dirty, para que el próximo ciclo procese los cambios nuevos
+        } else {
+            self.db.clear_dirty_and_bubble(inode).await?;
+        }
         
         info!("✅ Archivo actualizado en GDrive: {} (inode={})", gdrive_id, inode);
-        self.history.log(ActionType::Upload, format!("Archivo actualizado: {}", gdrive_id));
+        if add_parent.is_some() {
+            self.history.log(ActionType::Sync, format!("Movido: {} → {}", current_remote_name, local_name));
+        } else {
+            self.history.log(ActionType::Upload, format!("Subido: {}", local_name));
+        }
         
         Ok(())
     }
@@ -429,10 +624,7 @@ impl Uploader {
                         .await?;
                     
                     // Marcar como limpio (no reintentar)
-                    sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-                        .bind(inode as i64)
-                        .execute(self.db.pool())
-                        .await?;
+                    self.db.clear_dirty_and_bubble(inode).await?;
                     
                     self.history.log(
                         ActionType::Sync, 
@@ -455,10 +647,7 @@ impl Uploader {
         }
         
         // Marcar como limpio (eliminación exitosa)
-        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await?;
+        self.db.clear_dirty_and_bubble(inode).await?;
         
         Ok(())
     }
@@ -521,13 +710,11 @@ impl Uploader {
             &conflict_name,
             attrs.mime_type.as_deref(),
             &parent_gdrive_id,
+            None,
         ).await.context("Error subiendo copia de conflicto")?;
         
         // 5. Marcar el archivo original como limpio (no lo modificamos)
-        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
-            .bind(inode as i64)
-            .execute(self.db.pool())
-            .await?;
+        self.db.clear_dirty_and_bubble(inode).await?;
         
         warn!("✅ Conflicto resuelto: copia local guardada como {}", conflict_gdrive_id);
         warn!("   El archivo original permanece sin cambios en la nube");
@@ -587,39 +774,51 @@ impl Uploader {
         
         debug!("📋 Encontrados {} archivos local sync dirty", dirty_files.len());
         
-        let mut uploaded = 0;
-        
-        for file in dirty_files {
-            // Solo subir si está en modo local_online
-            if file.availability != "local_online" {
-                debug!("Saltando archivo online_only: {}", file.relative_path);
-                continue;
-            }
-            
-            // Obtener path absoluto
-            let base_dir = match self.db.get_local_sync_dir(file.sync_dir_id).await {
-                Ok(dir) => dir,
-                Err(e) => {
-                    warn!("Error obteniendo sync_dir_id={}: {:?}", file.sync_dir_id, e);
-                    continue;
+        let local_results = stream::iter(dirty_files)
+            .map(|file| async move {
+                // Solo subir si está en modo local_online
+                if file.availability != "local_online" {
+                    debug!("Saltando archivo online_only: {}", file.relative_path);
+                    return None;
                 }
-            };
-            
-            let local_path = std::path::PathBuf::from(&base_dir.local_path).join(&file.relative_path);
-            
-            // Verificar que el archivo existe y NO es symlink
-            if !local_path.exists() || local_path.is_symlink() {
-                debug!("Archivo no disponible localmente: {}", file.relative_path);
-                continue;
-            }
-            
-            // Procesar según si tiene gdrive_id o no
-            match self.upload_local_file(&file, &local_path, &base_dir).await {
+                
+                // Obtener path absoluto
+                let base_dir = match self.db.get_local_sync_dir(file.sync_dir_id).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        warn!("Error obteniendo sync_dir_id={}: {:?}", file.sync_dir_id, e);
+                        return None;
+                    }
+                };
+                
+                let local_path = std::path::PathBuf::from(&base_dir.local_path).join(&file.relative_path);
+                
+                // Verificar que el archivo existe y NO es symlink
+                if !local_path.exists() || local_path.is_symlink() {
+                    debug!("Archivo no disponible localmente: {}", file.relative_path);
+                    return None;
+                }
+                
+                // Procesar según si tiene gdrive_id o no
+                Some((file.relative_path.clone(), self.upload_local_file(&file, &local_path, &base_dir).await))
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut uploaded = 0;
+        for res in local_results.into_iter().flatten() {
+            let (rel_path, result) = res;
+            match result {
                 Ok(()) => {
                     uploaded += 1;
                 }
                 Err(e) => {
-                    warn!("Error subiendo {}: {:?}", file.relative_path, e);
+                    if e.to_string().contains("DEFERRED_PARENT_TEMP") {
+                        debug!("⏳ {} aplazado: directorio padre aún no sincronizado", rel_path);
+                    } else {
+                        warn!("Error subiendo {}: {:?}", rel_path, e);
+                    }
                 }
             }
         }
@@ -679,13 +878,22 @@ impl Uploader {
             None => {
                 // Archivo nuevo: subir a Drive
                 info!("📤 Creando archivo local sync en Drive: {}", file.relative_path);
-                
-                let gdrive_id = self.client.upload_file(
+
+                let file_size = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
+                let transfer_id = self.history.start_transfer(file_name, TransferOp::Upload, file_size);
+                let history_ref = self.history.clone();
+                let progress_cb = Box::new(move |bytes: u64| {
+                    history_ref.update_transfer_progress(transfer_id, bytes);
+                });
+                let upload_result = self.client.upload_file(
                     local_path,
                     file_name,
                     mime_type.as_deref(),
                     &parent_gdrive_id,
-                ).await.context("Error subiendo archivo local sync")?;
+                    Some(progress_cb),
+                ).await;
+                self.history.complete_transfer(transfer_id);
+                let gdrive_id = upload_result.context("Error subiendo archivo local sync")?;
                 
                 // Actualizar BD
                 self.db.set_local_file_gdrive_id(file.id, &gdrive_id).await?;
@@ -704,11 +912,18 @@ impl Uploader {
             Some(gdrive_id) => {
                 // Archivo existente: actualizar contenido
                 info!("📤 Actualizando archivo local sync: {}", file.relative_path);
-                
+
                 // TODO: Implementar detección de conflictos similar a update_file
-                
-                self.client.update_file_content(gdrive_id, local_path).await
-                    .context("Error actualizando archivo local sync")?;
+
+                let file_size = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
+                let transfer_id = self.history.start_transfer(file_name, TransferOp::Upload, file_size);
+                let history_ref = self.history.clone();
+                let progress_cb = Box::new(move |bytes: u64| {
+                    history_ref.update_transfer_progress(transfer_id, bytes);
+                });
+                let update_result = self.client.update_file_content(gdrive_id, local_path, Some(progress_cb)).await;
+                self.history.complete_transfer(transfer_id);
+                update_result.context("Error actualizando archivo local sync")?;
                 
                 // Actualizar BD
                 self.db.clear_local_file_dirty(file.id).await?;

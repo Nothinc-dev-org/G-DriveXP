@@ -5,10 +5,9 @@
 use ksni::{menu::*, Tray, TrayService, ToolTip};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use super::history::ActionHistory;
+use super::history::{ActionHistory, TransferOp};
 
-/// Número de entradas recientes a mostrar en el menú
-const RECENT_ENTRIES_COUNT: usize = 10;
+
 
 /// Servicio del icono de bandeja
 pub struct TrayIcon {
@@ -24,9 +23,24 @@ impl TrayIcon {
     /// Inicia el servicio del icono de bandeja en un thread separado
     pub fn spawn(self) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
+            let history = self.history.clone();
             let service = TrayService::new(GDriveXPTray {
                 history: self.history,
                 sync_paused: self.sync_paused,
+            });
+
+            // Obtener handle para forzar actualizaciones del menú
+            let handle = service.handle();
+
+            // Canal de notificación: history.push() → watcher → handle.update()
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            history.set_notifier(tx);
+
+            // Thread watcher: escucha cambios en el historial y fuerza refresh del menú
+            std::thread::spawn(move || {
+                while rx.recv().is_ok() {
+                    handle.update(|_| {});
+                }
             });
 
             // Ejecutar el loop de eventos de ksni (blocking)
@@ -79,25 +93,53 @@ impl Tray for GDriveXPTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items: Vec<MenuItem<Self>> = Vec::new();
 
-        // Historial reciente
-        let recent = self.history.recent(RECENT_ENTRIES_COUNT);
-        if !recent.is_empty() {
-            for entry in recent {
-                items.push(StandardItem {
-                    label: entry.format_for_menu(),
-                    enabled: false, // Solo informativo
-                    ..Default::default()
-                }.into());
-            }
-            items.push(MenuItem::Separator);
-        } else {
+        let progress = self.history.get_sync_progress();
+        let active_transfers = self.history.active_transfers();
+
+        let has_pending_downloads = progress.changes_detected != progress.changes_applied;
+        let has_pending_uploads = progress.pending_uploads > 0;
+
+        let has_active_real_transfers = active_transfers.iter().any(|t| t.operation != TransferOp::Stream);
+
+        // Determinar estado de sincronización
+        if has_active_real_transfers || has_pending_downloads || has_pending_uploads {
             items.push(StandardItem {
-                label: "Sin actividad reciente".to_string(),
+                label: "🔄 Syncronizando".to_string(),
                 enabled: false,
                 ..Default::default()
             }.into());
-            items.push(MenuItem::Separator);
+
+            if has_pending_downloads {
+                items.push(StandardItem {
+                    label: format!("Descargas pendientes: {}/{}", progress.changes_applied, progress.changes_detected),
+                    enabled: false,
+                    ..Default::default()
+                }.into());
+            } 
+            if has_pending_uploads {
+                items.push(StandardItem {
+                    label: format!("Subidas/Cambios pendientes: {}", progress.pending_uploads),
+                    enabled: false,
+                    ..Default::default()
+                }.into());
+            }
+            let non_stream_transfers: Vec<_> = active_transfers.iter().filter(|t| t.operation != TransferOp::Stream).collect();
+            if !non_stream_transfers.is_empty() {
+                items.push(StandardItem {
+                    label: format!("{} transferencias activas", non_stream_transfers.len()),
+                    enabled: false,
+                    ..Default::default()
+                }.into());
+            }
+        } else {
+            items.push(StandardItem {
+                label: "Todo en Orden".to_string(),
+                enabled: false,
+                ..Default::default()
+            }.into());
         }
+
+        items.push(MenuItem::Separator);
 
         // Abrir panel principal
         items.push(StandardItem {
@@ -158,6 +200,11 @@ impl Tray for GDriveXPTray {
             label: "Salir".to_string(),
             activate: Box::new(|_| {
                 tracing::info!("👋 Cerrando aplicación desde bandeja...");
+                // Desmontar FUSE antes de salir para evitar zombie del kernel
+                let fuse_path = dirs::home_dir()
+                    .map(|h| h.join("GoogleDrive/FUSE_Mount"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/GoogleDrive/FUSE_Mount"));
+                let _ = crate::utils::mount::unmount_and_wait(&fuse_path);
                 std::process::exit(0);
             }),
             ..Default::default()
