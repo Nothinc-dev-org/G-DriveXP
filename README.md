@@ -49,12 +49,27 @@ cargo build --release
 5. Descargue el archivo `credentials.json`
 6. Colóquelo en la raíz del proyecto como `credentials.json`
 
-### 4. Configurar FUSE (Opcional, recomendado para Flatpak)
+### 4. Instalar icono y entrada de escritorio
+
+Para que G-DriveXP aparezca correctamente en el dock de GNOME (icono y nombre), ejecute:
+
+```bash
+./scripts/install-icons.sh
+```
+
+Este script:
+- Instala el icono en `~/.local/share/icons/hicolor/` (48, 128, 256px)
+- Copia el archivo `.desktop` a `~/.local/share/applications/`
+- Crea un symlink del binario en `~/.local/bin/` (requerido: GIO descarta el `.desktop` si el ejecutable no se encuentra en `$PATH`)
+
+> **Nota**: Despues de cada `cargo build --release`, re-ejecute `./scripts/install-icons.sh` para actualizar el symlink del binario.
+
+### 5. Configurar FUSE (Opcional, recomendado para Flatpak)
 
 Para que aplicaciones de terceros (reproductores, navegadores) puedan acceder al sistema de archivos:
 
 1. Descomente `user_allow_other` en `/etc/fuse.conf`.
-2. Asegúrese de que su usuario esté en el grupo `fuse`.
+2. Asegurese de que su usuario este en el grupo `fuse`.
 
 Consulte [INSTALL.md](./INSTALL.md) para instrucciones detalladas.
 
@@ -66,10 +81,13 @@ Consulte [INSTALL.md](./INSTALL.md) para instrucciones detalladas.
 ## 🎯 Uso
 
 ```bash
-# Ejecutar el daemon
+# Ejecutar (si install-icons.sh fue ejecutado, el binario esta en PATH)
+g-drive-xp
+
+# O directamente desde el directorio del proyecto
 ./target/release/g-drive-xp
 
-# El sistema de archivos se montará automáticamente en:
+# El sistema de archivos se montara automaticamente en:
 ~/GoogleDrive
 ```
 

@@ -610,6 +610,9 @@ impl Component for AppModel {
         // Forzar tema oscuro
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
 
+        // Icono de la app para taskbar/dock (independiente del .desktop lookup)
+        gtk::Window::set_default_icon_name("org.gnome.FedoraDrive");
+
         let sync_paused = Arc::new(AtomicBool::new(false));
         let history = ActionHistory::new();
 

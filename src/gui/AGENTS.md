@@ -15,7 +15,7 @@ Interfaz gráfica de usuario construida con Relm4 (patrón MVU) sobre GTK4 y Lib
 
 ## Dependencias
 
-- **Externas**: `relm4`, `gtk4`, `libadwaita`, `ksni`.
+- **Externas**: `relm4` (con feature `libadwaita`), `gtk4`, `libadwaita`, `ksni`.
 - **Internas**: `db::MetadataRepository`, `auth::clear_all_auth_data`, `mirror::MirrorCommand`.
 
 ## Notas para Agentes
@@ -25,3 +25,5 @@ Interfaz gráfica de usuario construida con Relm4 (patrón MVU) sobre GTK4 y Lib
 - **Hard Reset**: la GUI puede limpiar toda la autenticación y base de datos. Usa `HARD_RESET_IN_PROGRESS` (AtomicBool global) para coordinar el cierre.
 - **Shutdown delegado**: `AppMsg::Quit` NO ejecuta `process::exit()` ni `unmount_and_wait()`. Solo llama `utils::shutdown::request_shutdown()` para señalizar al backend, que ejecuta la secuencia completa (ocultar archivos → desmontar → exit). Esto evita race conditions entre el hilo GTK y el runtime Tokio. Ver ADR-006.
 - **ViewMode**: Main (dashboard) y Activity (detalle de transferencias).
+- **Feature `libadwaita` en Relm4**: OBLIGATORIO. Sin él, `adw::init()` no se ejecuta y la app no se integra correctamente con el dock de GNOME (no aparece icono ni nombre). Ver ADR-008.
+- **Integración desktop**: El `.desktop` file (`data/org.gnome.FedoraDrive.desktop`) y el symlink del binario en `~/.local/bin/` son instalados por `scripts/install-icons.sh`. GIO descarta silenciosamente el `.desktop` si `Exec` no resuelve a un binario en PATH.

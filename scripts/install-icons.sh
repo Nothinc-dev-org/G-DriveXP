@@ -34,6 +34,20 @@ fi
 echo "  → Instalando archivo .desktop..."
 cp "$PROJECT_DIR/data/${APP_ID}.desktop" ~/.local/share/applications/
 
+# Crear symlink del binario en ~/.local/bin/ (GIO valida Exec y descarta el .desktop si no encuentra el binario)
+echo "  → Creando symlink del binario en ~/.local/bin/..."
+mkdir -p ~/.local/bin
+BINARY="$PROJECT_DIR/target/release/g-drive-xp"
+if [ ! -f "$BINARY" ]; then
+    BINARY="$PROJECT_DIR/target/debug/g-drive-xp"
+fi
+if [ -f "$BINARY" ]; then
+    ln -sf "$BINARY" ~/.local/bin/g-drive-xp
+    echo "    Enlace: ~/.local/bin/g-drive-xp → $BINARY"
+else
+    echo "  ⚠️  Binario no encontrado. Compile con 'cargo build --release' primero."
+fi
+
 # Actualizar caché de iconos
 echo "  → Actualizando caché de iconos..."
 if command -v gtk-update-icon-cache &> /dev/null; then

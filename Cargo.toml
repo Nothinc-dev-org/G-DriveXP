@@ -30,7 +30,7 @@ keyring = "3.6"
 # GUI GTK4
 gtk4 = { version = "0.9", features = ["v4_12"] }
 libadwaita = { version = "0.7", features = ["v1_5"] }
-relm4 = "0.9"
+relm4 = { version = "0.9", features = ["libadwaita"] }
 
 # Utilidades
 anyhow = "1.0"

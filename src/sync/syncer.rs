@@ -66,6 +66,12 @@ impl BackgroundSyncer {
             let mut current_backoff = self.interval;
             
             loop {
+                // Verificar si se solicitó shutdown
+                if crate::utils::shutdown::is_shutdown_requested() {
+                    tracing::info!("🛑 Syncer: Shutdown detectado, deteniendo sincronización.");
+                    break;
+                }
+
                 // Verificar si está pausado
                 if self.sync_paused.load(Ordering::Relaxed) {
                     sleep(Duration::from_secs(2)).await;

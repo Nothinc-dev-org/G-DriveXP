@@ -63,12 +63,14 @@ impl Tray for GDriveXPTray {
     }
 
     fn icon_name(&self) -> String {
-        // Usar icono del sistema o uno personalizado
-        if self.sync_paused.load(Ordering::Relaxed) {
-            "folder-cloud-offline".to_string()
-        } else {
-            "folder-cloud".to_string()
-        }
+        "org.gnome.FedoraDrive".to_string()
+    }
+
+    fn icon_theme_path(&self) -> String {
+        // Ruta adicional para que el host SNI encuentre el icono instalado por install-icons.sh
+        dirs::home_dir()
+            .map(|h| h.join(".local/share/icons").to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     fn title(&self) -> String {
@@ -115,7 +117,7 @@ impl Tray for GDriveXPTray {
                     enabled: false,
                     ..Default::default()
                 }.into());
-            } 
+            }
             if has_pending_uploads {
                 items.push(StandardItem {
                     label: format!("Subidas/Cambios pendientes: {}", progress.pending_uploads),

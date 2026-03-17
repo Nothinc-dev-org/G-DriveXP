@@ -213,18 +213,23 @@ pub fn run_backend(
         tokio::spawn(async move {
             tracing::info!("🔍 Iniciando monitor de progreso DB...");
             loop {
+                if utils::shutdown::is_shutdown_requested() {
+                    tracing::info!("🛑 Progress Monitor: Shutdown detectado, deteniendo.");
+                    break;
+                }
+
                 let dirty_fuse = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_state WHERE dirty = 1")
                     .fetch_one(db_monitor.pool())
                     .await
                     .unwrap_or(0);
-                    
+
                 let dirty_local = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM local_sync_files WHERE dirty = 1")
                     .fetch_one(db_monitor.pool())
                     .await
                     .unwrap_or(0);
-                    
+
                 history_monitor.set_pending_uploads((dirty_fuse + dirty_local) as usize);
-                
+
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
         });
@@ -336,6 +341,12 @@ pub fn run_backend(
 
         tracing::info!("🛑 Desmontando sistema de archivos y cerrando...");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Desmontando...".to_string()));
+
+        // Detener el MirrorWatcher ANTES de escribir .hidden para evitar que
+        // el watcher detecte los archivos y los registre como cambios del usuario.
+        let _ = mirror_sender.send(mirror::MirrorCommand::Shutdown).await;
+        // Dar tiempo para que el watcher se detenga y se drene el último batch debounced
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
         // Ocultar archivos OnlineOnly ANTES de desmontar FUSE
         // para que Nautilus no muestre symlinks rotos con opciones destructivas

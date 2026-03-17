@@ -36,8 +36,7 @@ pub fn register_shutdown_handlers() {
 /// # Returns
 /// 
 /// `true` si se recibió una señal de terminación.
-#[inline] 
-#[allow(dead_code)]
+#[inline]
 pub fn is_shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
 }

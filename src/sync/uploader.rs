@@ -58,8 +58,13 @@ impl Uploader {
             info!("📤 Uploader iniciado (intervalo: {:?})", self.interval);
             
             let mut current_backoff = self.interval;
-            
+
             loop {
+                if crate::utils::shutdown::is_shutdown_requested() {
+                    info!("🛑 Uploader: Shutdown detectado, deteniendo uploads.");
+                    break;
+                }
+
                 match self.upload_cycle().await {
                     Ok(uploaded_count) => {
                         if uploaded_count > 0 {
@@ -153,13 +158,22 @@ impl Uploader {
 
     /// Sube un archivo individual a Google Drive
     async fn upload_file(&self, inode: u64, gdrive_id: &str, is_delete: bool) -> Result<()> {
+        // Guard: nunca subir archivos de control interno (.hidden, manifiesto)
+        if let Ok(name) = self.get_file_name(inode).await {
+            if name == ".hidden" || name == ".gdrivexp_hidden_manifest" {
+                info!("⏭️ Uploader: ignorando archivo de control interno '{}' (inode={}), limpiando dirty", name, inode);
+                self.db.clear_dirty_and_bubble(inode).await?;
+                return Ok(());
+            }
+        }
+
         // Caso 1: Archivo marcado para eliminación
         if is_delete {
             return self.delete_file(inode, gdrive_id).await;
         }
 
         // Caso 2: Archivo nuevo o modificado
-        
+
         // Verificar si es un archivo temporal (recién creado)
         let is_temp = gdrive_id.starts_with("temp_");
         

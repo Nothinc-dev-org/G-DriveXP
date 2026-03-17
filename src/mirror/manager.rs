@@ -21,6 +21,8 @@ pub enum MirrorCommand {
     Refresh,
     /// Notificación de archivos eliminados en Google Drive
     RemoteDeleted { paths: Vec<String> },
+    /// Detener watcher y salir del run_loop (previo a shutdown)
+    Shutdown,
 }
 
 use crate::mirror::watcher::MirrorWatcher;
@@ -328,6 +330,13 @@ impl MirrorManager {
                                     }
                                 }
                             }
+                        }
+                        MirrorCommand::Shutdown => {
+                            tracing::info!("🛑 MirrorManager: Shutdown recibido, deteniendo watcher...");
+                            // Dropear el watcher detiene la vigilancia del filesystem
+                            self.watcher.take();
+                            tracing::info!("🛑 MirrorManager: Watcher detenido. Saliendo de run_loop.");
+                            return;
                         }
                     }
                 }
@@ -757,6 +766,15 @@ impl MirrorManager {
                         continue;
                     }
                 }
+
+                // Ignorar archivos de control de G-DriveXP (.hidden, manifiesto)
+                // Estos son artefactos internos del shutdown y nunca deben sincronizarse
+                if let Some(file_name) = path.file_name() {
+                    let name = file_name.to_string_lossy();
+                    if name == ".hidden" || name == HIDDEN_MANIFEST {
+                        continue;
+                    }
+                }
                 
                 // Calcular ruta relativa
                 let relative = match path.strip_prefix(&self.ctx.mirror_path) {
@@ -1004,8 +1022,9 @@ impl MirrorManager {
                     let child_path = entry.path();
                     let child_name = entry.file_name().to_string_lossy().to_string();
                     
-                    // Ignorar basura
-                     if child_name.starts_with(".gdrive") || child_name.starts_with(".cloud") {
+                    // Ignorar archivos internos
+                     if child_name.starts_with(".gdrive") || child_name.starts_with(".cloud")
+                        || child_name == ".hidden" || child_name == HIDDEN_MANIFEST {
                         continue;
                     }
 
@@ -1037,8 +1056,17 @@ impl MirrorManager {
 
     /// Lógica core de registro de cambios. Retorna true si el archivo es NUEVO.
     async fn process_local_change(&self, path: &PathBuf, relative_path: &str, is_dir: bool) -> bool {
+        // Guard: nunca registrar archivos de control interno en la DB
+        if let Some(file_name) = path.file_name() {
+            let name = file_name.to_string_lossy();
+            if name == ".hidden" || name == HIDDEN_MANIFEST {
+                tracing::debug!("⏭️ Ignorando archivo de control interno: {}", relative_path);
+                return false;
+            }
+        }
+
         tracing::debug!("📝 Cambio local detectado: {} (dir={})", relative_path, is_dir);
-        
+
         let db = &self.ctx.db;
         
         // 1. Resolver padre
