@@ -868,6 +868,15 @@ impl MetadataRepository {
         Ok(row)
     }
 
+    /// Elimina una clave de sync_meta
+    pub async fn delete_sync_meta(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sync_meta WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Verifica si existen chunks cacheados para un inodo
     pub async fn has_any_chunks(&self, inode: u64) -> Result<bool> {
         let count: i64 = sqlx::query_scalar(

@@ -235,7 +235,15 @@ impl Uploader {
                 }
                 _ => {
                     warn!("Archivo de caché no existe y no se encontró en mirror: {:?}", cache_path);
-                    tokio::fs::write(&cache_path, b"").await?;
+                    // Contenido perdido: actualizar size a 0 para mantener consistencia DB↔Drive
+                    // y limpiar dirty para no reintentar indefinidamente
+                    sqlx::query("UPDATE attrs SET size = 0 WHERE inode = ?")
+                        .bind(inode as i64)
+                        .execute(self.db.pool())
+                        .await?;
+                    self.db.clear_dirty_and_bubble(inode).await?;
+                    info!("⚠️ Contenido perdido para inode={}: dirty limpiado, size→0", inode);
+                    return Ok(());
                 }
             }
         }

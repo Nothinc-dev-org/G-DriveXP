@@ -596,9 +596,9 @@ impl DriveClient {
             .context("No se obtuvo ningún token válido")?;
 
         let client = reqwest::Client::new();
-        // Solicitamos name, parents, md5Checksum y capabilities para verificar permisos
+        // Solicitamos name, parents, md5Checksum, size y capabilities para verificar permisos
         let url = format!(
-            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType,shared,ownedByMe,capabilities&supportsAllDrives=true",
+            "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType,size,shared,ownedByMe,capabilities&supportsAllDrives=true",
             file_id
         );
 

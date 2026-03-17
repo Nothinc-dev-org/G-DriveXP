@@ -282,11 +282,6 @@ impl Component for AppModel {
                 append = &gtk::Stack {
                     set_vexpand: true,
                     set_transition_type: gtk::StackTransitionType::SlideLeftRight,
-                    #[watch]
-                    set_visible_child_name: match model.current_view {
-                        ViewMode::Main => "main",
-                        ViewMode::Activity => "activity",
-                    },
 
                     // ========== VISTA PRINCIPAL ==========
                     add_named[Some("main")] = &gtk::ScrolledWindow {
@@ -595,6 +590,12 @@ impl Component for AppModel {
                         },
                     } -> {
                         set_name: "activity",
+                    },
+
+                    #[watch]
+                    set_visible_child_name: match model.current_view {
+                        ViewMode::Main => "main",
+                        ViewMode::Activity => "activity",
                     },
                 },
             }

@@ -1673,7 +1673,27 @@ impl GDriveFS {
         for result in results {
             match result {
                 Ok(Ok(_)) => {},
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    let err_msg = format!("{}", e);
+                    if err_msg.contains("416") {
+                        // 416 Range Not Satisfiable: el tamaño real en Drive difiere del registrado en DB.
+                        // Consultar metadatos remotos y corregir attrs.size.
+                        tracing::warn!("🔄 416 detectado para inode {}: refrescando tamaño desde Drive", inode);
+                        if let Ok(remote_file) = self.drive_client.get_file_metadata(gdrive_id).await {
+                            let real_size = remote_file.size.unwrap_or(0);
+                            let _ = sqlx::query("UPDATE attrs SET size = ? WHERE inode = ?")
+                                .bind(real_size)
+                                .bind(inode as i64)
+                                .execute(self.db.pool())
+                                .await;
+                            tracing::info!("✅ attrs.size corregido a {} para inode {}", real_size, inode);
+                            if real_size == 0 {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    return Err(e);
+                },
                 Err(e) => return Err(anyhow::anyhow!("Task panicked: {}", e)),
             }
         }

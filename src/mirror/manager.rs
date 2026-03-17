@@ -43,6 +43,7 @@ pub struct MirrorManager {
     watcher_rx: mpsc::Receiver<Vec<DebouncedEvent>>,
     watcher_tx: mpsc::Sender<Vec<DebouncedEvent>>, // Needed to spawn watcher
     watcher: Option<MirrorWatcher>,
+    bfs_ready_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl MirrorManager {
@@ -51,6 +52,7 @@ impl MirrorManager {
         mirror_path: PathBuf,
         fuse_mount_path: PathBuf,
         history: ActionHistory,
+        bfs_ready_rx: tokio::sync::watch::Receiver<bool>,
     ) -> (Self, mpsc::Sender<MirrorCommand>) {
         let (tx, rx) = mpsc::channel(32);
         let (w_tx, w_rx) = mpsc::channel(100);
@@ -61,15 +63,16 @@ impl MirrorManager {
             fuse_mount_path,
             history,
         });
-        
+
         let manager = Self {
             ctx,
             command_rx: rx,
             watcher_rx: w_rx,
             watcher_tx: w_tx,
             watcher: None,
+            bfs_ready_rx,
         };
-        
+
         (manager, tx)
     }
 
@@ -84,6 +87,18 @@ impl MirrorManager {
             info!("🪞 MirrorManager iniciado (Deferred & Async Bootstrap)");
             info!("   Mirror: {:?}", self.ctx.mirror_path);
             info!("   FUSE:   {:?}", self.ctx.fuse_mount_path);
+
+            // Esperar a que BFS complete antes de iniciar el bootstrap del espejo.
+            // En startup normal (bootstrap_complete ya existe), el canal ya tiene true
+            // y esta espera retorna de inmediato sin latencia adicional.
+            info!("⏳ Esperando a que BFS complete antes de iniciar bootstrap del espejo...");
+            while !*self.bfs_ready_rx.borrow() {
+                if self.bfs_ready_rx.changed().await.is_err() {
+                    warn!("Canal BFS cerrado inesperadamente, procediendo con bootstrap.");
+                    break;
+                }
+            }
+            info!("✅ BFS listo. Procediendo con bootstrap del espejo.");
 
             // 1. Initial Scan / Bootstrap (SEQUENTIAL)
             // Ejecutamos bootstrap ANTES de iniciar el watcher para que las correcciones

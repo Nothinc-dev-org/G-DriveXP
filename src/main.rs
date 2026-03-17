@@ -102,19 +102,28 @@ pub fn run_backend(
         // Inicializar base de datos SQLite
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cargando base de datos...".to_string()));
         let db = Arc::new(db::MetadataRepository::new(&config.db_path).await?);
-        
+
+        // --- Resiliencia post-crash: detectar cierre no limpio ---
+        let prev_session = db.get_sync_meta("session_active").await?;
+        if prev_session.is_some() {
+            tracing::warn!("⚠️ Detectado cierre no limpio (crash/power loss). Forzando re-bootstrap...");
+            db.delete_sync_meta("bootstrap_complete").await?;
+            db.delete_sync_meta("changes_page_token").await?;
+        }
+        db.set_sync_meta("session_active", "true").await?;
+
         // Enviar DB a la GUI para que pueda gestionar directorios locales
         ui_sender.input(gui::app_model::AppMsg::SetDatabase(db.clone()));
-        
+
         // Inicializar cliente de Google Drive
         let authenticator = oauth_manager.get_authenticator(None).await?;
         let drive_client = Arc::new(gdrive::client::DriveClient::new(authenticator));
-        
+
         // Obtener Root ID para optimizaciones del Uploader
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Obteniendo ID de carpeta raíz...".to_string()));
         let root_id = drive_client.get_root_file_id().await
             .context("Error crítico obteniendo Root ID de Google Drive")?;
-        
+
         // Inicializar sistema de archivos
         let fs = GDriveFS::new(
             db.clone(),
@@ -122,13 +131,17 @@ pub fn run_backend(
             &config.cache_dir,
             Arc::new(history.clone()),
         );
-        
+
+        // Canal de coordinación: BFS bootstrap → MirrorManager
+        let (bfs_ready_tx, bfs_ready_rx) = tokio::sync::watch::channel(false);
+
         // Fase 2.15: Instanciar MirrorManager tempranamente para compartir su sender
         let (mirror_manager, mirror_sender) = mirror::MirrorManager::new(
             db.clone(),
             config.mirror_path.clone(),
             config.fuse_mount_path.clone(),
             history.clone(),
+            bfs_ready_rx,
         );
 
         // Fase 2.1: Bootstrapping (Sincronización de metadatos)
@@ -141,7 +154,12 @@ pub fn run_backend(
                 // Base de datos nueva: no necesitamos reparar ownership legacy, los datos ya vienen bien.
                 let _ = db.set_sync_meta("repair_ownership_done_v2", "true").await;
             }
-            // Siempre: lanzar BFS background para completar
+            // Señalar a MirrorManager que puede iniciar con los datos actuales
+            // (level 1 en primera vez, o datos previos al crash).
+            // El Refresh posterior al completar BFS actualizará el espejo con el árbol completo.
+            let _ = bfs_ready_tx.send(true);
+
+            // Lanzar BFS background para completar el árbol
             let db_bg = db.clone();
             let client_bg = drive_client.clone();
             let root_id_bg = root_id.clone();
@@ -154,11 +172,14 @@ pub fn run_backend(
                 } else {
                     let _ = db_bg.set_sync_meta("bootstrap_complete", "true").await;
                     tracing::info!("Bootstrap BFS completado y marcado como finalizado.");
-                    
+
                     // Notificar al MirrorManager que el árbol ha sido completado y hay archivos compartidos nuevos
                     let _ = mirror_tx_bg.send(mirror::MirrorCommand::Refresh).await;
                 }
             });
+        } else {
+            // BFS ya completado, señalar inmediatamente para que MirrorManager no espere
+            let _ = bfs_ready_tx.send(true);
         }
         
         // Fase 2.2: Background Syncer (sincronización continua)
@@ -303,6 +324,9 @@ pub fn run_backend(
             }
         }
         
+        // Marcar cierre limpio antes de cualquier ruta de salida
+        let _ = db.delete_sync_meta("session_active").await;
+
         // Si un Hard Reset está en curso, dejar que su hilo maneje el cierre.
         // Este hilo simplemente se duerme para no competir con process::exit.
         if HARD_RESET_IN_PROGRESS.load(Ordering::SeqCst) {
