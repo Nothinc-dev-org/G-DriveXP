@@ -31,6 +31,8 @@ pub struct AppModel {
     pub sync_dirs_listbox: Option<gtk::ListBox>,
     // Navegación
     pub current_view: ViewMode,
+    // Shutdown
+    pub shutdown_requested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -630,6 +632,7 @@ impl Component for AppModel {
             history_listbox: None,
             sync_dirs_listbox: None,
             current_view: ViewMode::Main,
+            shutdown_requested: false,
         };
 
         // Iniciar icono de bandeja
@@ -780,15 +783,8 @@ impl Component for AppModel {
             }
             AppMsg::Quit => {
                 tracing::info!("Cerrando aplicación...");
-
-                // Desmontar FUSE y esperar confirmación del kernel
-                if let Some(ref path) = self.fuse_mount_path {
-                    if let Err(e) = crate::utils::mount::unmount_and_wait(path) {
-                        tracing::error!("Error al desmontar en cierre: {:?}", e);
-                    }
-                }
-
-                std::process::exit(0);
+                // Solo señalizar — el backend en main.rs ejecuta: hide → unmount → exit
+                crate::utils::shutdown::request_shutdown();
             }
             AppMsg::HardReset => {
                 tracing::warn!("Ejecutando Hard Reset delegado a hilo secundario...");

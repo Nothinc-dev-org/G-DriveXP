@@ -23,4 +23,5 @@ Interfaz gráfica de usuario construida con Relm4 (patrón MVU) sobre GTK4 y Lib
 - **Thread safety**: GTK4 NO es thread-safe. Todas las actualizaciones de widgets deben pasar por `ComponentSender<AppModel>` (mensajes `AppMsg`).
 - **run_backend()**: se ejecuta en `std::thread::spawn` desde `AppModel::init`. El runtime Tokio vive en ese hilo.
 - **Hard Reset**: la GUI puede limpiar toda la autenticación y base de datos. Usa `HARD_RESET_IN_PROGRESS` (AtomicBool global) para coordinar el cierre.
+- **Shutdown delegado**: `AppMsg::Quit` NO ejecuta `process::exit()` ni `unmount_and_wait()`. Solo llama `utils::shutdown::request_shutdown()` para señalizar al backend, que ejecuta la secuencia completa (ocultar archivos → desmontar → exit). Esto evita race conditions entre el hilo GTK y el runtime Tokio. Ver ADR-006.
 - **ViewMode**: Main (dashboard) y Activity (detalle de transferencias).

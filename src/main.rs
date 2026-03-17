@@ -287,7 +287,7 @@ pub fn run_backend(
         // ui_sender.input(gui::app_model::AppMsg::SetLocalSyncSender(local_sync_sender));
 
         
-        // Esperar a que termine la sesión O sea interrumpida por Ctrl+C
+        // Esperar a que termine la sesión, Ctrl+C, o shutdown desde GUI
         tokio::select! {
             res = &mut handle => {
                 if let Err(e) = res {
@@ -297,6 +297,9 @@ pub fn run_backend(
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("🛑 Recibida señal de interrupción (Ctrl+C)");
                 ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cerrando por señal...".to_string()));
+            }
+            _ = utils::shutdown::wait_for_shutdown() => {
+                tracing::info!("🛑 Shutdown solicitado desde GUI");
             }
         }
         
@@ -309,6 +312,12 @@ pub fn run_backend(
 
         tracing::info!("🛑 Desmontando sistema de archivos y cerrando...");
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Desmontando...".to_string()));
+
+        // Ocultar archivos OnlineOnly ANTES de desmontar FUSE
+        // para que Nautilus no muestre symlinks rotos con opciones destructivas
+        if let Err(e) = mirror::hide_online_only_files(&db, &config.mirror_path).await {
+            tracing::error!("Error ocultando archivos OnlineOnly: {:?}", e);
+        }
 
         // El drop de 'handle' debería intentar desmontar, pero lo forzamos por seguridad
         let _ = utils::mount::unmount_and_wait(&config.fuse_mount_path);

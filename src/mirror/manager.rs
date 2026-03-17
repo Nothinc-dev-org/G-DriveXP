@@ -1,11 +1,13 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, error, warn};
 
 use crate::db::MetadataRepository;
 use crate::gui::history::{ActionHistory, ActionType, TransferOp};
+
+const HIDDEN_MANIFEST: &str = ".gdrivexp_hidden_manifest";
 
 /// Comandos para el MirrorManager (desde IPC o GUI)
 #[derive(Debug)]
@@ -123,6 +125,9 @@ impl MirrorManager {
     // Función estática asociada que corre independiente del estado mut del manager
     async fn run_bootstrap(ctx: Arc<MirrorContext>) -> Result<()> {
         info!("🔄 Iniciando bootstrap del espejo...");
+
+        // Restaurar archivos OnlineOnly ocultados por un shutdown previo
+        restore_hidden_online_only_files(&ctx.mirror_path).await;
 
         // Pequeña pausa adicional de seguridad
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1176,4 +1181,130 @@ impl MirrorManager {
             // Ya no existe en DB? Entonces no importa.
         }
     }
+}
+
+/// Oculta archivos OnlineOnly en Nautilus escribiendo sus nombres en archivos `.hidden` por directorio.
+/// Debe llamarse ANTES de desmontar FUSE para que la secuencia sea:
+/// escribir .hidden → desmontar FUSE → symlinks rotos pero ocultos en Nautilus.
+pub async fn hide_online_only_files(db: &MetadataRepository, mirror_path: &Path) -> Result<()> {
+    use std::collections::HashMap;
+
+    let files = db.get_all_active_files().await?;
+
+    // Agrupar nombres de archivos online_only por directorio padre
+    let mut by_dir: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (_inode, relative_path, availability) in files {
+        if availability != "online_only" {
+            continue;
+        }
+        let p = Path::new(&relative_path);
+        let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+        let name = match p.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        by_dir.entry(dir).or_default().push(name);
+    }
+
+    if by_dir.is_empty() {
+        info!("🙈 No hay archivos OnlineOnly que ocultar");
+        return Ok(());
+    }
+
+    let mut manifest_lines = Vec::new();
+
+    for (dir, names) in &by_dir {
+        let hidden_path = if dir.is_empty() {
+            mirror_path.join(".hidden")
+        } else {
+            mirror_path.join(dir).join(".hidden")
+        };
+
+        let existing = tokio::fs::read_to_string(&hidden_path).await.unwrap_or_default();
+        let existing_set: std::collections::HashSet<&str> = existing.lines().collect();
+
+        let mut content = existing.clone();
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+
+        for name in names {
+            if !existing_set.contains(name.as_str()) {
+                content.push_str(name);
+                content.push('\n');
+            }
+            manifest_lines.push(format!("{}\t{}", dir, name));
+        }
+
+        if let Err(e) = tokio::fs::write(&hidden_path, &content).await {
+            warn!("Error escribiendo .hidden en {:?}: {:?}", hidden_path, e);
+        }
+    }
+
+    // Escribir manifiesto para que el próximo arranque pueda revertir
+    let manifest_path = mirror_path.join(HIDDEN_MANIFEST);
+    let manifest_content = manifest_lines.join("\n");
+    if let Err(e) = tokio::fs::write(&manifest_path, &manifest_content).await {
+        warn!("Error escribiendo manifiesto: {:?}", e);
+    }
+
+    info!("🙈 {} archivos OnlineOnly ocultados en {} directorios", manifest_lines.len(), by_dir.len());
+    Ok(())
+}
+
+/// Restaura archivos OnlineOnly previamente ocultados, limpiando las entradas de `.hidden`
+/// que fueron agregadas por `hide_online_only_files`.
+/// Debe llamarse al inicio, DESPUÉS de montar FUSE (durante bootstrap del MirrorManager).
+pub async fn restore_hidden_online_only_files(mirror_path: &Path) {
+    use std::collections::{HashMap, HashSet};
+
+    let manifest_path = mirror_path.join(HIDDEN_MANIFEST);
+
+    let manifest = match tokio::fs::read_to_string(&manifest_path).await {
+        Ok(content) => content,
+        Err(_) => return, // No hay manifiesto → nada que limpiar
+    };
+
+    let mut by_dir: HashMap<String, HashSet<String>> = HashMap::new();
+    for line in manifest.lines() {
+        if let Some((dir, name)) = line.split_once('\t') {
+            by_dir.entry(dir.to_string()).or_default().insert(name.to_string());
+        }
+    }
+
+    for (dir, names_to_remove) in &by_dir {
+        let hidden_path = if dir.is_empty() {
+            mirror_path.join(".hidden")
+        } else {
+            mirror_path.join(dir).join(".hidden")
+        };
+
+        let existing = match tokio::fs::read_to_string(&hidden_path).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let cleaned: Vec<&str> = existing
+            .lines()
+            .filter(|line| !line.is_empty() && !names_to_remove.contains(*line))
+            .collect();
+
+        if cleaned.is_empty() {
+            if dir.is_empty() {
+                // El root .hidden puede tener FUSE_Mount; si quedó vacío, dejarlo vacío
+                // config.ensure_directories() lo recreará con FUSE_Mount en el siguiente arranque
+                let _ = tokio::fs::write(&hidden_path, "").await;
+            } else {
+                let _ = tokio::fs::remove_file(&hidden_path).await;
+            }
+        } else {
+            let new_content = format!("{}\n", cleaned.join("\n"));
+            let _ = tokio::fs::write(&hidden_path, &new_content).await;
+        }
+    }
+
+    let _ = tokio::fs::remove_file(&manifest_path).await;
+    info!("👁️ Archivos OnlineOnly restaurados ({} entradas .hidden limpiadas)",
+        by_dir.values().map(|s| s.len()).sum::<usize>());
 }

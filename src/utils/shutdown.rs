@@ -36,16 +36,30 @@ pub fn register_shutdown_handlers() {
 /// # Returns
 /// 
 /// `true` si se recibió una señal de terminación.
-#[inline]
+#[inline] 
+#[allow(dead_code)]
 pub fn is_shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
 }
 
 /// Marca manualmente el inicio del shutdown
-/// 
+///
 /// Útil para iniciar el proceso de cierre desde código interno
 /// (por ejemplo, desde un botón "Salir" en la GUI).
 pub fn request_shutdown() {
     tracing::info!("🛑 Shutdown solicitado programáticamente");
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Espera asíncronamente hasta que se solicite shutdown.
+///
+/// Permite integrar la señal de shutdown en un `tokio::select!`
+/// para coordinar el cierre desde el runtime async.
+pub async fn wait_for_shutdown() {
+    loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
