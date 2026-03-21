@@ -20,7 +20,7 @@ google-drive3 = "5.0"
 yup-oauth2 = "9.0"
 
 # Cliente HTTP
-reqwest = { version = "0.12", features = ["stream", "json"] }
+reqwest = { version = "0.12", features = ["stream", "json", "gzip"] }
 hyper = { version = "0.14", features = ["full"] }
 hyper-rustls = "0.25.0"
 

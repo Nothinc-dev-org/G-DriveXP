@@ -47,6 +47,7 @@ impl<R: Read + Seek> Seek for ProgressReader<R> {
 /// Cliente Wrapper para Google Drive API
 pub struct DriveClient {
     hub: DriveHub<HttpsConnector<HttpConnector>>,
+    http: reqwest::Client,
 }
 
 impl DriveClient {
@@ -63,7 +64,7 @@ impl DriveClient {
 
         let hub = DriveHub::new(client, auth);
 
-        Self { hub }
+        Self { hub, http: reqwest::Client::new() }
     }
 
     /// Obtiene el ID canónico de la carpeta 'root' (My Drive)
@@ -73,7 +74,7 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido")?;
 
-        let client = reqwest::Client::new();
+        let client = &self.http;
         let url = "https://www.googleapis.com/drive/v3/files/root?fields=id";
 
         let response = client
@@ -117,7 +118,7 @@ impl DriveClient {
         let url = format!("https://www.googleapis.com/drive/v3/files/{}?alt=media&acknowledgeAbuse=true", file_id);
 
         // 3. Realizar petición con reqwest
-        let client = reqwest::Client::new();
+        let client = &self.http;
         
         let response = client
             .get(&url)
@@ -158,12 +159,12 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido")?;
 
-        let client = reqwest::Client::new();
+        let client = &self.http;
         let query = format!("'{}' in parents and trashed = false", root_id);
 
         loop {
             let mut url = format!(
-                "https://www.googleapis.com/drive/v3/files?q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
+                "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
                 urlencoding::encode(&query)
             );
 
@@ -218,10 +219,10 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido")?;
 
-        let client = reqwest::Client::new();
+        let client = &self.http;
 
         loop {
-            let mut url = "https://www.googleapis.com/drive/v3/files?trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))".to_string();
+            let mut url = "https://www.googleapis.com/drive/v3/files?pageSize=1000&trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))".to_string();
             
             if let Some(ref token_str) = page_token {
                 url.push_str(&format!("&pageToken={}", token_str));
@@ -272,7 +273,7 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido")?;
 
-        let client = reqwest::Client::new();
+        let client = &self.http;
         let url = "https://www.googleapis.com/drive/v3/changes/startPageToken";
 
         let response = client
@@ -311,11 +312,11 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido")?;
 
-        let client = reqwest::Client::new();
+        let client = &self.http;
         
         // pageToken es requerido, fields especifica qué queremos recibir
         let url = format!(
-            "https://www.googleapis.com/drive/v3/changes?pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed,shared,ownedByMe,capabilities(canMoveItemWithinDrive)))",
+            "https://www.googleapis.com/drive/v3/changes?pageSize=1000&pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed,shared,ownedByMe,capabilities(canMoveItemWithinDrive)))",
             page_token
         );
 
@@ -360,7 +361,7 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido")?;
 
-        let client = reqwest::Client::new();
+        let client = &self.http;
         let url = format!(
             "https://www.googleapis.com/drive/v3/files/{}?fields=md5Checksum",
             file_id
@@ -559,7 +560,7 @@ impl DriveClient {
             .ok_or_else(|| super::DriveError::Auth("No token available".into()))?;
 
         let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
-        let client = reqwest::Client::new();
+        let client = &self.http;
 
         let response = client
             .patch(&url)
@@ -600,7 +601,7 @@ impl DriveClient {
             .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
             .context("No se obtuvo ningún token válido")?;
 
-        let client = reqwest::Client::new();
+        let client = &self.http;
         // Solicitamos name, parents, md5Checksum, size y capabilities para verificar permisos
         let url = format!(
             "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,parents,md5Checksum,mimeType,size,shared,ownedByMe,capabilities&supportsAllDrives=true",
@@ -677,7 +678,7 @@ impl DriveClient {
             json_map.insert("modifiedTime".to_string(), serde_json::Value::String(mtime.to_rfc3339_opts(SecondsFormat::Secs, true)));
         }
 
-        let client = reqwest::Client::new();
+        let client = &self.http;
         let response = client
             .patch(&url)
             .header("Authorization", format!("Bearer {}", token))
