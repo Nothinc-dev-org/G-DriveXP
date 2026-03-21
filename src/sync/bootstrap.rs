@@ -137,184 +137,147 @@ pub async fn bootstrap_remaining_bfs(
     let all_files = client.list_all_files().await?;
     tracing::info!("Bootstrap BFS: {} archivos totales obtenidos de Drive", all_files.len());
 
-    // Mapeo de DriveID -> Inode
-    let mut drive_id_to_inode: HashMap<String, u64> = HashMap::new();
+    // 1. Fase 1: Obtener Inodes de forma masiva
+    let all_drive_ids: Vec<String> = all_files.iter()
+        .filter_map(|f| f.id.clone())
+        .collect();
+
+    tracing::info!("Bootstrap BFS: Obteniendo {} inodos de forma masiva...", all_drive_ids.len());
+    let mut drive_id_to_inode = db.get_or_create_inodes_bulk(&all_drive_ids).await?;
     drive_id_to_inode.insert("root".to_string(), 1u64);
     if !root_id.is_empty() {
         drive_id_to_inode.insert(root_id.to_string(), 1u64);
     }
 
-    // Agrupar archivos por padre para procesarlos en BFS
+    // 2. Fase 2: Upsert de Metadatos en bloques
+    tracing::info!("Bootstrap BFS: Insertando metadatos en bloques de 500...");
+    let mut metadata_buffer = Vec::with_capacity(500);
     let mut by_parent: HashMap<String, Vec<&google_drive3::api::File>> = HashMap::new();
     let mut root_level_dir_ids: Vec<String> = Vec::new();
 
-    // Primera pasada: crear inodes y metadata para TODOS los archivos
-    // y agrupar por padre
     for file in &all_files {
         if let Some(id) = &file.id {
-            // INSERT OR IGNORE: si ya existe del nivel 1, no lo sobreescribe
-            let inode = db.get_or_create_inode(id).await?;
-            drive_id_to_inode.insert(id.clone(), inode);
+            if let Some(&inode) = drive_id_to_inode.get(id) {
+                let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
+                let size = file.size.unwrap_or(0);
+                let mtime = file.modified_time
+                    .as_ref()
+                    .map(|t| t.timestamp())
+                    .unwrap_or(0);
+                let mode = if is_dir { 0o755 } else { 0o644 };
+                let can_move = file.capabilities.as_ref()
+                    .and_then(|c| c.can_move_item_within_drive)
+                    .unwrap_or(true);
+                let shared = file.shared.unwrap_or(false);
 
-            let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
-            let size = file.size.unwrap_or(0);
-            let mtime = file.modified_time
-                .as_ref()
-                .map(|t| t.timestamp())
-                .unwrap_or(0);
-            let mode = if is_dir { 0o755 } else { 0o644 };
-            let can_move = file.capabilities.as_ref()
-                .and_then(|c| c.can_move_item_within_drive)
-                .unwrap_or(true);
-            let shared = file.shared.unwrap_or(false);
+                metadata_buffer.push(crate::db::BulkFileMetadata {
+                    inode, size, mtime, mode, is_dir,
+                    mime_type: file.mime_type.clone(),
+                    can_move, shared,
+                    owned_by_me: file.owned_by_me.unwrap_or(true),
+                });
 
-            db.upsert_file_metadata(
-                inode, size, mtime, mode, is_dir,
-                file.mime_type.as_deref(), can_move, shared,
-                file.owned_by_me.unwrap_or(true),
-            ).await?;
+                if is_dir {
+                    // Nota: dir_counters se reparan al final masivamente con rebuild_all_dir_counters
+                }
 
-            if is_dir {
-                db.ensure_dir_counter(inode).await?;
-            }
-
-            // Agrupar por padre
-            if let Some(parents) = &file.parents {
-                for parent_id in parents {
-                    by_parent.entry(parent_id.clone()).or_default().push(file);
-
-                    // Identificar directorios de nivel 1 (hijos del root)
-                    if (parent_id == "root" || parent_id == root_id) && is_dir {
-                        root_level_dir_ids.push(id.clone());
+                // Agrupar por padre para BFS posterior
+                if let Some(parents) = &file.parents {
+                    for parent_id in parents {
+                        by_parent.entry(parent_id.clone()).or_default().push(file);
+                        if (parent_id == "root" || parent_id == root_id) && is_dir {
+                            root_level_dir_ids.push(id.clone());
+                        }
                     }
+                }
+
+                if metadata_buffer.len() >= 500 {
+                    db.upsert_bulk_file_metadata(&metadata_buffer).await?;
+                    metadata_buffer.clear();
                 }
             }
         }
     }
+    if !metadata_buffer.is_empty() {
+        db.upsert_bulk_file_metadata(&metadata_buffer).await?;
+    }
 
-    // BFS: construir dentries nivel por nivel
-    // Nivel 1 ya se insertó en bootstrap_level1, pero usamos INSERT OR IGNORE
-    // para manejar el caso idempotente
+    // 3. Fase 3: BFS para Dentries en bloques
+    tracing::info!("Bootstrap BFS: Construyendo árbol de directorios...");
     let mut current_level_ids = vec!["root".to_string()];
     if !root_id.is_empty() {
         current_level_ids.push(root_id.to_string());
     }
-    let mut level = 1u32;
+    let mut dentry_buffer = Vec::with_capacity(500);
     let mut processed_parents: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while !current_level_ids.is_empty() {
         let mut next_level_ids = Vec::new();
 
         for parent_gdrive_id in &current_level_ids {
-            if processed_parents.contains(parent_gdrive_id) {
-                continue;
-            }
+            if processed_parents.contains(parent_gdrive_id) { continue; }
             processed_parents.insert(parent_gdrive_id.clone());
 
             if let Some(children) = by_parent.get(parent_gdrive_id) {
-                let parent_inode = drive_id_to_inode.get(parent_gdrive_id)
-                    .cloned()
-                    .unwrap_or(1);
+                let parent_inode = drive_id_to_inode.get(parent_gdrive_id).cloned().unwrap_or(1);
 
                 for file in children {
                     if let (Some(id), Some(name)) = (&file.id, &file.name) {
                         if let Some(&child_inode) = drive_id_to_inode.get(id.as_str()) {
-                            // INSERT OR IGNORE: idempotente si ya existe del nivel 1
-                            db.upsert_dentry(parent_inode, child_inode, name).await?;
+                            dentry_buffer.push(crate::db::BulkDentry {
+                                parent_inode, child_inode, name: name.clone(),
+                            });
 
-                            // Si es directorio, añadir a la cola BFS
-                            let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
-                            if is_dir {
+                            if file.mime_type.as_deref() == Some("application/vnd.google-apps.folder") {
                                 next_level_ids.push(id.clone());
                             }
-                        }
-                    }
-                }
-            }
-        }
 
-        if level > 1 {
-            tracing::debug!("Bootstrap BFS: nivel {} procesado ({} directorios)", level, next_level_ids.len());
-        }
-
-        current_level_ids = next_level_ids;
-        level += 1;
-
-        // Yield periódico para no acaparar el executor
-        if level % 5 == 0 {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    // Post-BFS: Vincular archivos compartidos huérfanos al root.
-    // Los archivos "Shared with me" tienen parents en el Drive del propietario original,
-    // no en el árbol del usuario. El BFS desde root nunca los alcanza, así que sus inodes
-    // y attrs se crearon pero nunca recibieron una entrada en dentry.
-    tracing::info!("Bootstrap BFS: vinculando archivos compartidos huérfanos...");
-    let mut orphan_count = 0u32;
-    let mut orphan_dirs: Vec<String> = Vec::new();
-
-    for file in &all_files {
-        if let (Some(id), Some(name)) = (&file.id, &file.name) {
-            let owned = file.owned_by_me.unwrap_or(true);
-            if !owned {
-                if let Some(&inode) = drive_id_to_inode.get(id.as_str()) {
-                    if !db.has_dentry(inode).await.unwrap_or(true) {
-                        db.upsert_dentry(1, inode, name).await?;
-                        orphan_count += 1;
-
-                        let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
-                        if is_dir {
-                            orphan_dirs.push(id.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // BFS desde directorios compartidos recién vinculados para conectar sus hijos
-    if !orphan_dirs.is_empty() {
-        tracing::info!("Bootstrap BFS: procesando {} directorios compartidos recién vinculados...", orphan_dirs.len());
-        let mut queue = orphan_dirs;
-        let mut visited = processed_parents.clone();
-
-        while !queue.is_empty() {
-            let mut next_queue = Vec::new();
-            for parent_id in &queue {
-                if visited.contains(parent_id) { continue; }
-                visited.insert(parent_id.clone());
-
-                if let Some(children) = by_parent.get(parent_id) {
-                    let parent_inode = drive_id_to_inode.get(parent_id.as_str()).cloned().unwrap_or(1);
-                    for file in children {
-                        if let (Some(id), Some(name)) = (&file.id, &file.name) {
-                            if let Some(&child_inode) = drive_id_to_inode.get(id.as_str()) {
-                                db.upsert_dentry(parent_inode, child_inode, name).await?;
-                                orphan_count += 1;
-
-                                let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
-                                if is_dir {
-                                    next_queue.push(id.clone());
-                                }
+                            if dentry_buffer.len() >= 500 {
+                                db.upsert_bulk_dentries(&dentry_buffer).await?;
+                                dentry_buffer.clear();
                             }
                         }
                     }
                 }
             }
-            queue = next_queue;
+        }
+        current_level_ids = next_level_ids;
+        tokio::task::yield_now().await;
+    }
+    if !dentry_buffer.is_empty() {
+        db.upsert_bulk_dentries(&dentry_buffer).await?;
+        dentry_buffer.clear();
+    }
+
+    // 4. Fase 4: Archivos compartidos huérfanos
+    tracing::info!("Bootstrap BFS: vinculando archivos compartidos huérfanos...");
+    for file in &all_files {
+        if let (Some(id), Some(name)) = (&file.id, &file.name) {
+            if !file.owned_by_me.unwrap_or(true) {
+                if let Some(&inode) = drive_id_to_inode.get(id) {
+                    if !db.has_dentry(inode).await.unwrap_or(true) {
+                        dentry_buffer.push(crate::db::BulkDentry {
+                            parent_inode: 1, child_inode: inode, name: name.clone(),
+                        });
+                        if dentry_buffer.len() >= 500 {
+                            db.upsert_bulk_dentries(&dentry_buffer).await?;
+                            dentry_buffer.clear();
+                        }
+                    }
+                }
+            }
         }
     }
 
-    if orphan_count > 0 {
-        tracing::info!("Bootstrap BFS: {} archivos/carpetas compartidos vinculados al root", orphan_count);
+    if !dentry_buffer.is_empty() {
+        db.upsert_bulk_dentries(&dentry_buffer).await?;
     }
 
-    // Recalcular TODOS los contadores de directorio ahora que el árbol está completo
+    // 5. Fase Final: Recalcular contadores y finalizar
     tracing::info!("Bootstrap BFS: recalculando contadores de directorio...");
     db.rebuild_all_dir_counters().await?;
 
-    tracing::info!("Bootstrap BFS completado: {} niveles procesados", level - 1);
+    tracing::info!("Bootstrap BFS completado exitosamente.");
     Ok(())
 }
 
@@ -331,17 +294,29 @@ pub async fn repair_ownership_metadata(
     let total = files.len();
 
     let mut repaired_count = 0;
+    let mut buffer = Vec::with_capacity(500);
+
     for file in files {
         if let Some(id) = file.id {
             // Solo actualizamos si el inodo existe localmente
             if let Some(inode) = db.get_inode_by_gdrive_id(&id).await? {
                 let owned = file.owned_by_me.unwrap_or(true);
-                db.update_ownership(inode, owned).await?;
-                repaired_count += 1;
+                buffer.push((inode, owned));
+                
+                if buffer.len() >= 500 {
+                    db.update_bulk_ownership(&buffer).await?;
+                    repaired_count += buffer.len();
+                    buffer.clear();
+                }
             }
         }
     }
 
-    tracing::info!("Reparación completada: {}/{} archivos actualizados", repaired_count, total);
+    if !buffer.is_empty() {
+        repaired_count += buffer.len();
+        db.update_bulk_ownership(&buffer).await?;
+    }
+
+    tracing::info!("Reparación completada: {}/{} archivos procesados", repaired_count, total);
     Ok(())
 }

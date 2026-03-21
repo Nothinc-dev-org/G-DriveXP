@@ -1,3 +1,3 @@
 pub mod repository;
 
-pub use repository::{MetadataRepository, LocalSyncDir, LocalSyncFile};
+pub use repository::{MetadataRepository, LocalSyncDir, LocalSyncFile, BulkFileMetadata, BulkDentry};

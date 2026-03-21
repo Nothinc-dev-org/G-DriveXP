@@ -143,153 +143,164 @@ impl MirrorManager {
     async fn run_bootstrap(ctx: Arc<MirrorContext>) -> Result<()> {
         info!("🔄 Iniciando bootstrap del espejo...");
 
-        // Restaurar archivos OnlineOnly ocultados por un shutdown previo
         restore_hidden_online_only_files(&ctx.mirror_path).await;
-
-        // Pequeña pausa adicional de seguridad
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // PASO 0: Crear todos los directorios activos, incluyendo los vacíos.
-        // get_all_active_files() filtra is_dir=0, así que directorios sin archivos
-        // nunca se crearían como padres implícitos. Lo hacemos aquí explícitamente.
+        // PASO 0: Crear directorios activos en batch (blocking)
         let dirs = ctx.db.get_all_active_dirs().await?;
         info!("📁 Se encontraron {} directorios activos en DB", dirs.len());
-        for (_inode, relative_path) in dirs {
-            let mirror_dir = ctx.mirror_path.join(&relative_path);
-            if tokio::fs::symlink_metadata(&mirror_dir).await.is_err() {
-                if let Err(e) = tokio::fs::create_dir_all(&mirror_dir).await {
-                    warn!("No se pudo crear directorio {:?}: {:?}", mirror_dir, e);
+        let mirror_path_clone = ctx.mirror_path.clone();
+        let dirs_for_blocking: Vec<String> = dirs.iter().map(|(_, p)| p.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            for relative_path in &dirs_for_blocking {
+                let mirror_dir = mirror_path_clone.join(relative_path);
+                if !mirror_dir.exists() {
+                    let _ = std::fs::create_dir_all(&mirror_dir);
                 }
             }
-        }
+        }).await?;
 
+        // PASO 1: Clasificar archivos en fast path vs slow path
         let files = ctx.db.get_all_active_files().await?;
         let total = files.len();
         info!("📂 Se encontraron {} archivos activos en DB", total);
 
-        let mut processed = 0u64;
+        let mut symlinks_to_create: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut repaired = 0u64;
 
-        for (_inode, relative_path, availability) in files {
-            processed += 1;
-            if processed % 5000 == 0 || processed == total as u64 {
-                info!("🔄 Bootstrap progreso: {}/{} archivos verificados ({} reparados)", processed, total, repaired);
-            }
-
-            let mirror_file = ctx.mirror_path.join(&relative_path);
-
-            // Asegurar que el directorio padre existe (async, no sigue symlinks)
-            if let Some(parent) = mirror_file.parent() {
-                if tokio::fs::symlink_metadata(parent).await.is_err() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-            }
-
-            // Una sola llamada async para obtener metadata del mirror file (lstat, NO sigue symlinks)
+        for (_inode, relative_path, availability) in &files {
+            let mirror_file = ctx.mirror_path.join(relative_path);
             let meta = tokio::fs::symlink_metadata(&mirror_file).await;
             let file_exists = meta.is_ok();
             let is_symlink = meta.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
-            // is_file() sobre symlink_metadata retorna true solo para archivos reales, no symlinks
             let is_real_file = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
 
             match availability.as_str() {
                 "online_only" => {
-                    let should_recreate = if is_symlink {
+                    if !file_exists {
+                        // Fast path: solo necesitamos crear el symlink
+                        let fuse_path = ctx.fuse_mount_path.join(relative_path);
+                        symlinks_to_create.push((fuse_path, mirror_file));
+                    } else if is_symlink {
                         match tokio::fs::read_link(&mirror_file).await {
-                            Ok(target) => {
-                                // Si no empieza con el path de montaje actual, está roto/obsoleto
-                                !target.starts_with(&ctx.fuse_mount_path)
-                            },
-                            Err(_) => true,
+                            Ok(target) if !target.starts_with(&ctx.fuse_mount_path) => {
+                                // Symlink roto: reparar via slow path
+                                Self::static_handle_set_online_only_opt(&ctx, &mirror_file.to_string_lossy(), false).await;
+                                repaired += 1;
+                            }
+                            _ => {}
                         }
-                    } else {
-                        !file_exists
-                    };
-
-                    if should_recreate {
-                        // bubble=false: no burbujear dir_counters individualmente; se reconstruyen al final.
-                        Self::static_handle_set_online_only_opt(&ctx, &mirror_file.to_string_lossy(), false).await;
-                        repaired += 1;
                     } else if is_real_file {
-                        // Caso delicado: DB dice OnlineOnly, FS tiene archivo real (no symlink).
                         warn!("CONFLICTO: DB dice OnlineOnly pero existe archivo local: {:?}", relative_path);
                     }
                 }
                 "local_online" => {
-                    // Queremos archivo real. Si es symlink o no existe, reparamos.
                     if !file_exists || is_symlink {
-                        // bubble=false: no burbujear dir_counters individualmente; se reconstruyen al final.
-                        Self::static_handle_set_local_online_opt(&ctx, &mirror_file.to_string_lossy(), false).await;
-                        repaired += 1;
+                        let mut moved_locally = false;
+                        if relative_path.starts_with("SHARED/") {
+                            let legacy_path = relative_path.strip_prefix("SHARED/").unwrap_or("");
+                            let legacy_mirror_file = ctx.mirror_path.join(legacy_path);
+                            if let Ok(meta_old) = tokio::fs::metadata(&legacy_mirror_file).await {
+                                if meta_old.is_file() {
+                                    info!("🚚 Detectado cambio de ruta por propiedad: {:?} -> {:?}", legacy_path, relative_path);
+                                    if let Err(e) = tokio::fs::rename(&legacy_mirror_file, &mirror_file).await {
+                                        warn!("   Falló el renombrado local: {:?}", e);
+                                    } else {
+                                        moved_locally = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !moved_locally {
+                            Self::static_handle_set_local_online_opt(&ctx, &mirror_file.to_string_lossy(), false).await;
+                            repaired += 1;
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        info!("🔄 Bootstrap: {} archivos verificados, {} reparados", processed, repaired);
-        // PASO 3: LIMPIEZA DE SYMLINKS OBSOLETOS EN ROOT
-        // En versiones anteriores, los archivos compartidos (owned_by_me=0) se colocaban
-        // en la raíz del espejo. Ahora se colocan bajo SHARED/. Este paso detecta y elimina
-        // los symlinks "huérfanos" que ya no corresponden a ninguna ruta en la DB de root.
-        info!("🧹 Inspeccionando symlinks obsoletos en el root del espejo...");
 
-        // Construir un Set de todas las rutas relativas válidas en la raíz (sin prefijo SHARED/)
-        let valid_root_names: std::collections::HashSet<String> = {
-            let all_files = ctx.db.get_all_active_files().await.unwrap_or_default();
-            let all_dirs = ctx.db.get_all_active_dirs().await.unwrap_or_default();
-            let mut set: std::collections::HashSet<String> = all_files.into_iter()
-                .filter_map(|(_, path, _)| {
-                    // Solo nombres en root (sin separador '/')
-                    if !path.contains('/') { Some(path) } else { None }
-                })
-                .collect();
-            // Añadir también directorios de root válidos
-            for (_, path) in all_dirs {
-                if !path.contains('/') {
-                    set.insert(path);
+        // PASO 2: Crear symlinks del fast path en batch (un solo spawn_blocking)
+        if !symlinks_to_create.is_empty() {
+            let count = symlinks_to_create.len();
+            info!("🔗 Creando {} symlinks...", count);
+            let created = tokio::task::spawn_blocking(move || {
+                let mut ok = 0u64;
+                for (target, link) in &symlinks_to_create {
+                    if let Some(parent) = link.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::os::unix::fs::symlink(target, link) {
+                        Ok(()) => ok += 1,
+                        Err(e) => tracing::warn!("Error creando symlink {:?}: {:?}", link, e),
+                    }
                 }
+                ok
+            }).await.unwrap_or(0);
+            repaired += created;
+            info!("🔗 {} symlinks creados", created);
+        }
+
+        info!("🔄 Bootstrap: {} archivos verificados, {} creados/reparados", total, repaired);
+
+        // PASO 3: Limpieza de huérfanos (reutiliza listas ya obtenidas)
+        info!("🧹 Iniciando limpieza recursiva de archivos huérfanos en el espejo...");
+        let valid_paths: std::collections::HashSet<PathBuf> = {
+            let mut paths = std::collections::HashSet::new();
+            for (_, path, _) in &files {
+                paths.insert(PathBuf::from(path));
             }
-            // SHARED/ es siempre válido (directorio virtual)
-            set.insert("SHARED".to_string());
-            set
+            for (_, path) in &dirs {
+                paths.insert(PathBuf::from(path));
+            }
+            paths.insert(PathBuf::from("SHARED"));
+            paths
         };
 
-        if let Ok(mut root_entries) = tokio::fs::read_dir(&ctx.mirror_path).await {
-            let mut stale_count = 0;
-            while let Ok(Some(entry)) = root_entries.next_entry().await {
-                let path = entry.path();
+        let mut entries_to_check = vec![ctx.mirror_path.clone()];
+        let mut deleted_count = 0;
 
-                // Solo nos interesan los symlinks del root
-                let meta = match tokio::fs::symlink_metadata(&path).await {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if !meta.is_symlink() { continue; }
+        while let Some(current_dir) = entries_to_check.pop() {
+            if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let full_path = entry.path();
+                    let rel_path = match full_path.strip_prefix(&ctx.mirror_path) {
+                        Ok(p) => p.to_path_buf(),
+                        Err(_) => continue,
+                    };
 
-                let name = path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                    let name = rel_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                    if name.starts_with('.') { continue; }
 
-                // Ignorar entradas del sistema y temporales
-                if name.starts_with('.') { continue; }
-
-                if !valid_root_names.contains(&name) {
-                    warn!("🧹 Eliminando symlink obsoleto del root: {}", name);
-                    if let Err(e) = tokio::fs::remove_file(&path).await {
-                        warn!("   No se pudo eliminar {:?}: {:?}", path, e);
+                    if !valid_paths.contains(&rel_path) {
+                        warn!("🧹 Eliminando entrada huérfana en espejo: {:?}", rel_path);
+                        let meta = entry.metadata().await;
+                        if let Ok(m) = meta {
+                            if m.is_dir() {
+                                let _ = tokio::fs::remove_dir_all(&full_path).await;
+                            } else {
+                                let _ = tokio::fs::remove_file(&full_path).await;
+                            }
+                        } else {
+                            let _ = tokio::fs::remove_file(&full_path).await;
+                        }
+                        deleted_count += 1;
                     } else {
-                        stale_count += 1;
+                        if let Ok(m) = entry.file_type().await {
+                            if m.is_dir() {
+                                entries_to_check.push(full_path);
+                            }
+                        }
                     }
                 }
             }
-            if stale_count > 0 {
-                info!("🧹 {} symlinks obsoletos eliminados del root.", stale_count);
-            }
+        }
+        if deleted_count > 0 {
+            info!("🧹 Limpieza completada: {} entradas eliminadas.", deleted_count);
         }
 
-        // PASO FINAL: Reconstruir dir_counters en una sola pasada CTE.
-        // Durante el bootstrap, las llamadas a set_availability usaron bubble=false
-        // para evitar N burbujeos individuales. Consolidamos todo aquí.
+        // PASO FINAL: Reconstruir dir_counters
         if let Err(e) = ctx.db.rebuild_all_dir_counters().await {
             error!("Error reconstruyendo dir_counters post-bootstrap: {:?}", e);
         }
@@ -311,10 +322,28 @@ impl MirrorManager {
                             Self::static_handle_set_local_online(&self.ctx, &path).await;
                         }
                         MirrorCommand::Refresh => {
-                             let ctx_refresh = self.ctx.clone();
-                             tokio::spawn(async move {
-                                 let _ = Self::run_bootstrap(ctx_refresh).await;
-                             });
+                            // Pausar watcher para evitar que el bootstrap genere falsos dirty
+                            self.watcher.take();
+                            while self.watcher_rx.try_recv().is_ok() {}
+
+                            if let Err(e) = Self::run_bootstrap(self.ctx.clone()).await {
+                                error!("Error durante bootstrap (Refresh): {:?}", e);
+                            }
+
+                            // Recrear watcher
+                            let w_tx = self.watcher_tx.clone();
+                            let mirror_path = self.ctx.mirror_path.clone();
+                            let watcher_result = tokio::task::spawn_blocking(move || {
+                                MirrorWatcher::new(&mirror_path, w_tx)
+                            }).await;
+                            match watcher_result {
+                                Ok(Ok(w)) => {
+                                    info!("👀 Watcher reactivado tras Refresh");
+                                    self.watcher = Some(w);
+                                },
+                                Ok(Err(e)) => error!("Error reiniciando watcher: {:?}", e),
+                                Err(e) => error!("Error en spawn_blocking (watcher restart): {:?}", e),
+                            }
                         }
                         MirrorCommand::RemoteDeleted { paths } => {
                             for relative in paths {
@@ -724,12 +753,18 @@ impl MirrorManager {
             match event.kind {
                 // Caso A: Renombrado completo (Source + Dest) detectado por Notify
                 EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if paths.len() == 2 => {
+                    let src_str = paths[0].to_string_lossy();
+                    let dst_str = paths[1].to_string_lossy();
+                    if src_str.contains(".gdrive_tmp_ops") || dst_str.contains(".gdrive_tmp_ops") {
+                        continue;
+                    }
                     self.handle_local_rename(&paths[0], &paths[1]).await;
                     continue;
                 }
                 // Caso B: "Rename From" (Mover FUERA del espejo o a la papelera)
                 EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
                     for path in paths {
+                        if path.to_string_lossy().contains(".gdrive_tmp_ops") { continue; }
                         if let Ok(relative) = path.strip_prefix(&self.ctx.mirror_path) {
                             self.handle_local_delete(&relative.to_string_lossy()).await;
                         }
@@ -739,8 +774,10 @@ impl MirrorManager {
                 // Caso C: "Rename To" (Mover DESDE FUERA al espejo)
                 EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
                     for path in paths {
+                        if path.to_string_lossy().contains(".gdrive_tmp_ops") { continue; }
                         if let Ok(relative) = path.strip_prefix(&self.ctx.mirror_path) {
                             if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
+                                if meta.is_symlink() { continue; }
                                 self.handle_local_change(&path, &relative.to_string_lossy(), meta.is_dir()).await;
                             }
                         }
@@ -838,9 +875,11 @@ impl MirrorManager {
             Ok(Some(i)) => i,
             Ok(None) => {
                 warn!("Origen de renombrado no encontrado en DB: {}", old_relative);
-                // Fallback: tratar como Create en destino
-                if let Ok(meta) = tokio::fs::metadata(new_path).await {
-                     self.handle_local_change(new_path, &new_relative, meta.is_dir()).await;
+                // Fallback: tratar como Create en destino (solo si no es symlink)
+                if let Ok(meta) = tokio::fs::symlink_metadata(new_path).await {
+                    if !meta.is_symlink() {
+                        self.handle_local_change(new_path, &new_relative, meta.is_dir()).await;
+                    }
                 }
                 return;
             }

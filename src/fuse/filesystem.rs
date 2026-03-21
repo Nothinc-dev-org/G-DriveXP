@@ -685,15 +685,40 @@ impl Filesystem for GDriveFS {
                 tracing::info!("🚀 Heurística de volumen disparada (>1MB reales leídos). Smart Streamer iniciado para inode={}", inode);
             }
 
-            // Descargar solo lo necesario
-            if let Err(e) = self.ensure_range_cached(inode, &gdrive_id, offset, size, file_size as u64).await {
-                let err_msg = format!("{}", e);
-                if err_msg.contains("403") && err_msg.contains("cannot") {
-                    self.failed_downloads.insert(inode);
-                    tracing::warn!("🚫 Inode {} marcado como descarga prohibida (403 en read)", inode);
+            // Descargar solo lo necesario (con reintento tras corrección 416)
+            let mut effective_file_size = file_size as u64;
+            let mut attempt = 0u8;
+            loop {
+                match self.ensure_range_cached(inode, &gdrive_id, offset, size, effective_file_size).await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        let err_msg = format!("{}", e);
+                        if err_msg.contains("416") && attempt == 0 {
+                            // ensure_range_cached ya corrigió attrs.size en DB. Re-leer y reintentar.
+                            if let Ok(new_size) = sqlx::query_scalar::<_, i64>(
+                                "SELECT size FROM attrs WHERE inode = ?"
+                            )
+                            .bind(inode as i64)
+                            .fetch_one(self.db.pool())
+                            .await
+                            {
+                                effective_file_size = new_size as u64;
+                                if effective_file_size == 0 || offset >= effective_file_size {
+                                    return Ok(ReplyData { data: vec![].into() });
+                                }
+                                tracing::info!("🔄 Reintentando descarga para inode {} con tamaño corregido: {}", inode, effective_file_size);
+                                attempt += 1;
+                                continue;
+                            }
+                        }
+                        if err_msg.contains("403") && err_msg.contains("cannot") {
+                            self.failed_downloads.insert(inode);
+                            tracing::warn!("🚫 Inode {} marcado como descarga prohibida (403 en read)", inode);
+                        }
+                        error!("Error descargando chunk para inode {}: {}", inode, e);
+                        return Err(Errno::from(libc::EIO));
+                    }
                 }
-                error!("Error descargando chunk para inode {}: {}", inode, e);
-                return Err(Errno::from(libc::EIO));
             }
 
             // Leer desde caché
@@ -1677,7 +1702,7 @@ impl GDriveFS {
                     let err_msg = format!("{}", e);
                     if err_msg.contains("416") {
                         // 416 Range Not Satisfiable: el tamaño real en Drive difiere del registrado en DB.
-                        // Consultar metadatos remotos y corregir attrs.size.
+                        // Corregir attrs.size, invalidar caché obsoleto y dejar que el kernel reintente.
                         tracing::warn!("🔄 416 detectado para inode {}: refrescando tamaño desde Drive", inode);
                         if let Ok(remote_file) = self.drive_client.get_file_metadata(gdrive_id).await {
                             let real_size = remote_file.size.unwrap_or(0);
@@ -1686,7 +1711,12 @@ impl GDriveFS {
                                 .bind(inode as i64)
                                 .execute(self.db.pool())
                                 .await;
-                            tracing::info!("✅ attrs.size corregido a {} para inode {}", real_size, inode);
+
+                            // Invalidar chunks y caché obsoletos para que el reintento descargue limpio
+                            let _ = self.db.clear_chunks(inode).await;
+                            let _ = tokio::fs::remove_file(&cache_path_owned).await;
+
+                            tracing::info!("✅ attrs.size corregido a {} para inode {} (caché invalidado)", real_size, inode);
                             if real_size == 0 {
                                 return Ok(());
                             }

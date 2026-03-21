@@ -109,8 +109,9 @@ impl BackgroundSyncer {
     }
 
     /// Ejecuta un ciclo de sincronización
-    /// Retorna el número de cambios procesados
-    async fn sync_once(&self) -> Result<usize> {
+    /// Retorna el número de cambios procesados.
+    /// Público para permitir un sync inicial antes de montar FUSE.
+    pub async fn sync_once(&self) -> Result<usize> {
         // Asegurarnos de tener el ID del root
         let root_id = self.get_cached_root_id().await?;
 
@@ -270,6 +271,38 @@ impl BackgroundSyncer {
 
             // Obtener o crear inode
             let inode = self.db.get_or_create_inode(file_id).await?;
+
+            // Invalidar caché si el contenido del archivo cambió remotamente.
+            // Compara size y md5 anteriores contra los nuevos antes de actualizar.
+            if !is_dir {
+                let old_size: Option<i64> = sqlx::query_scalar(
+                    "SELECT size FROM attrs WHERE inode = ?"
+                )
+                .bind(inode as i64)
+                .fetch_optional(self.db.pool())
+                .await
+                .unwrap_or(None);
+
+                let old_md5 = self.db.get_remote_md5(inode).await.unwrap_or(None);
+                let new_md5 = file.md5_checksum.as_deref();
+
+                let size_changed = old_size.map(|s| s != size).unwrap_or(false);
+                let md5_changed = match (old_md5.as_deref(), new_md5) {
+                    (Some(old), Some(new)) => old != new,
+                    _ => false,
+                };
+
+                if size_changed || md5_changed {
+                    tracing::info!(
+                        "🔄 Contenido remoto cambió para inode {}: size {}→{}, md5_changed={}. Invalidando caché.",
+                        inode,
+                        old_size.unwrap_or(-1),
+                        size,
+                        md5_changed
+                    );
+                    let _ = self.db.clear_chunks(inode).await;
+                }
+            }
 
             // Actualizar metadatos
             self.db.upsert_file_metadata(

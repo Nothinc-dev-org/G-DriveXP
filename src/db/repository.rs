@@ -1,6 +1,7 @@
 use anyhow::Result;
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, SqlitePool};
 use std::path::Path;
+use std::str::FromStr;
 
 /// Repositorio principal de metadatos basado en SQLite
 #[derive(Debug)]
@@ -19,21 +20,16 @@ impl MetadataRepository {
             std::fs::File::create(db_path)?;
         }
 
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .pragma("busy_timeout", "60000")
+            .pragma("synchronous", "NORMAL")
+            .create_if_missing(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .acquire_timeout(std::time::Duration::from_secs(60)) // Add a timeout to wait for a database lock
-            .connect(&format!("sqlite://{}", db_path.display()))
-            .await?;
-        
-        // Configurar opciones pragma en la conexión para mejorar la concurrencia en SQLite
-        sqlx::query("PRAGMA journal_mode = WAL;")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous = NORMAL;")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA busy_timeout = 60000;")
-            .execute(&pool)
+            .acquire_timeout(std::time::Duration::from_secs(60))
+            .connect_with(options)
             .await?;
 
         // Inicializar esquema (crea tablas si no existen)
@@ -745,6 +741,61 @@ impl MetadataRepository {
         }
     }
 
+    /// Obtiene o crea inodos para una lista de gdrive_ids de forma masiva
+    pub async fn get_or_create_inodes_bulk(&self, gdrive_ids: &[String]) -> Result<std::collections::HashMap<String, u64>> {
+        if gdrive_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut results = std::collections::HashMap::new();
+
+        for batch in gdrive_ids.chunks(500) {
+            let mut tx = self.pool.begin().await?;
+
+            for id in batch {
+                // Intentar obtener existente
+                let existing: Option<i64> = sqlx::query_scalar("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+
+                if let Some(inode) = existing {
+                    results.insert(id.clone(), inode as u64);
+                    continue;
+                }
+
+                // Crear nuevo
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs() as i64;
+
+                let insert_result = sqlx::query("INSERT INTO inodes (gdrive_id, created_at) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await;
+
+                match insert_result {
+                    Ok(res) => {
+                        results.insert(id.clone(), res.last_insert_rowid() as u64);
+                    }
+                    Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                        let inode: i64 = sqlx::query_scalar("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                            .bind(id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                        results.insert(id.clone(), inode as u64);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            tx.commit().await?;
+        }
+
+        Ok(results)
+    }
+
     /// Inserta o actualiza metadatos de un archivo
     pub async fn upsert_file_metadata(
         &self,
@@ -796,6 +847,63 @@ impl MetadataRepository {
             .bind(inode as i64)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Actualiza la propiedad de múltiples archivos en una sola transacción
+    pub async fn update_bulk_ownership(&self, items: &[(u64, bool)]) -> Result<()> {
+        if items.is_empty() { return Ok(()); }
+        let mut tx = self.pool.begin().await?;
+        for (inode, owned) in items {
+            sqlx::query("UPDATE attrs SET owned_by_me = ? WHERE inode = ?")
+                .bind(owned)
+                .bind(*inode as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Inserta o actualiza metadatos de múltiples archivos en una sola transacción
+    pub async fn upsert_bulk_file_metadata(&self, items: &[BulkFileMetadata]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        for item in items {
+            sqlx::query(
+                r#"
+                INSERT INTO attrs (inode, size, mtime, ctime, mode, is_dir, mime_type, can_move, shared, owned_by_me)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(inode) DO UPDATE SET
+                    size = excluded.size,
+                    mtime = excluded.mtime,
+                    mode = excluded.mode,
+                    is_dir = excluded.is_dir,
+                    mime_type = excluded.mime_type,
+                    can_move = excluded.can_move,
+                    shared = excluded.shared,
+                    owned_by_me = excluded.owned_by_me
+                "#
+            )
+            .bind(item.inode as i64)
+            .bind(item.size)
+            .bind(item.mtime)
+            .bind(item.mtime)
+            .bind(item.mode as i32)
+            .bind(item.is_dir)
+            .bind(item.mime_type.as_deref())
+            .bind(item.can_move)
+            .bind(item.shared)
+            .bind(item.owned_by_me)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -853,6 +961,41 @@ impl MetadataRepository {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    /// Inserta o actualiza múltiples entradas de directorio en una sola transacción
+    pub async fn upsert_bulk_dentries(&self, items: &[BulkDentry]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        for item in items {
+            // 1. Eliminar cualquier dentry anterior para este child_inode
+            sqlx::query("DELETE FROM dentry WHERE child_inode = ?")
+                .bind(item.child_inode as i64)
+                .execute(&mut *tx)
+                .await?;
+
+            // 2. Insertar el nuevo dentry
+            sqlx::query(
+                r#"
+                INSERT INTO dentry (parent_inode, child_inode, name)
+                VALUES (?, ?, ?)
+                ON CONFLICT(parent_inode, name) DO UPDATE SET
+                    child_inode = excluded.child_inode
+                "#
+            )
+            .bind(item.parent_inode as i64)
+            .bind(item.child_inode as i64)
+            .bind(&item.name)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1117,67 +1260,92 @@ impl MetadataRepository {
     }
 
     /// Recalcula todos los contadores de directorio desde cero.
-    /// Usado para migración y como mecanismo de auto-reparación.
+    /// Optimizado: Calcula de abajo hacia arriba (bottom-up) para evitar subconsultas recursivas lentas.
     pub async fn rebuild_all_dir_counters(&self) -> Result<()> {
-        // Limpiar tabla
-        sqlx::query("DELETE FROM dir_counters").execute(&self.pool).await?;
+        tracing::info!("Iniciando rebuild de contadores de directorio (optimizado)...");
 
-        // Insertar fila para cada directorio
-        sqlx::query(
-            "INSERT INTO dir_counters (inode, dirty_desc_count, synced_desc_count) SELECT inode, 0, 0 FROM attrs WHERE is_dir = 1"
-        )
-        .execute(&self.pool)
-        .await?;
+        // Fase 1 (TX corta): Limpiar tabla y rellenar con contadores a 0
+        {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM dir_counters").execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO dir_counters (inode, dirty_desc_count, synced_desc_count) SELECT inode, 0, 0 FROM attrs WHERE is_dir = 1"
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
 
-        // Recalcular usando la CTE recursiva original (one-time cost)
-        // Para cada directorio, contar descendientes dirty y synced
-        sqlx::query(
+        // Fase 2 (solo lectura, sin TX de escritura): Obtener datos para cálculo en memoria
+        let dentry_rows: Vec<(i64, i64)> = sqlx::query_as("SELECT parent_inode, child_inode FROM dentry")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let file_states: Vec<(i64, bool, bool)> = sqlx::query_as(
             r#"
-            UPDATE dir_counters SET
-                dirty_desc_count = (
-                    WITH RECURSIVE descendants AS (
-                        SELECT d.child_inode, a.is_dir
-                        FROM dentry d
-                        JOIN attrs a ON d.child_inode = a.inode
-                        WHERE d.parent_inode = dir_counters.inode
-                        UNION ALL
-                        SELECT d.child_inode, a.is_dir
-                        FROM dentry d
-                        JOIN attrs a ON d.child_inode = a.inode
-                        JOIN descendants dt ON d.parent_inode = dt.child_inode
-                        WHERE dt.is_dir = 1
-                    )
-                    SELECT COUNT(*) FROM descendants d
-                    LEFT JOIN sync_state s ON d.child_inode = s.inode
-                    WHERE d.is_dir = 0
-                      AND (s.dirty = 1 OR (s.deleted_at IS NOT NULL AND s.deleted_at > 0))
-                ),
-                synced_desc_count = (
-                    WITH RECURSIVE descendants AS (
-                        SELECT d.child_inode, a.is_dir
-                        FROM dentry d
-                        JOIN attrs a ON d.child_inode = a.inode
-                        WHERE d.parent_inode = dir_counters.inode
-                        UNION ALL
-                        SELECT d.child_inode, a.is_dir
-                        FROM dentry d
-                        JOIN attrs a ON d.child_inode = a.inode
-                        JOIN descendants dt ON d.parent_inode = dt.child_inode
-                        WHERE dt.is_dir = 1
-                    )
-                    SELECT COUNT(*) FROM descendants d
-                    LEFT JOIN sync_state s ON d.child_inode = s.inode
-                    WHERE d.is_dir = 0
-                      AND COALESCE(s.availability, 'online_only') = 'local_online'
-                      AND COALESCE(s.dirty, 0) = 0
-                      AND (s.deleted_at IS NULL OR s.deleted_at = 0)
-                )
+            SELECT
+                a.inode,
+                (s.dirty = 1 OR (s.deleted_at IS NOT NULL AND s.deleted_at > 0)) as is_dirty,
+                (COALESCE(s.availability, 'online_only') = 'local_online' AND COALESCE(s.dirty, 0) = 0 AND (s.deleted_at IS NULL OR s.deleted_at = 0)) as is_synced
+            FROM attrs a
+            LEFT JOIN sync_state s ON a.inode = s.inode
+            WHERE a.is_dir = 0
             "#
         )
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        tracing::info!("Contadores de directorio recalculados");
+        // Fase 3 (cálculo en memoria, sin DB): Construir contadores
+        let mut child_to_parent = std::collections::HashMap::new();
+        for (parent, child) in dentry_rows {
+            child_to_parent.insert(child, parent);
+        }
+
+        let mut dirty_counts = std::collections::HashMap::new();
+        let mut synced_counts = std::collections::HashMap::new();
+
+        for (inode, is_dirty, is_synced) in file_states {
+            if !is_dirty && !is_synced { continue; }
+
+            let mut curr = inode;
+            while let Some(&parent) = child_to_parent.get(&curr) {
+                if is_dirty {
+                    *dirty_counts.entry(parent).or_insert(0) += 1;
+                }
+                if is_synced {
+                    *synced_counts.entry(parent).or_insert(0) += 1;
+                }
+                if parent == 1 { break; }
+                curr = parent;
+            }
+        }
+
+        // Fase 4 (escritura en batches): Volcar resultados a la DB
+        let all_updates: Vec<(i64, i64, i64)> = {
+            let mut updates = std::collections::HashMap::new();
+            for (inode, count) in dirty_counts {
+                updates.entry(inode).or_insert((0i64, 0i64)).0 = count;
+            }
+            for (inode, count) in synced_counts {
+                updates.entry(inode).or_insert((0i64, 0i64)).1 = count;
+            }
+            updates.into_iter().map(|(inode, (d, s))| (inode, d, s)).collect()
+        };
+
+        for batch in all_updates.chunks(500) {
+            let mut tx = self.pool.begin().await?;
+            for &(inode, dirty, synced) in batch {
+                sqlx::query("UPDATE dir_counters SET dirty_desc_count = ?, synced_desc_count = ? WHERE inode = ?")
+                    .bind(dirty)
+                    .bind(synced)
+                    .bind(inode)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
+
+        tracing::info!("Contadores de directorio recalculados (operación optimizada)");
         Ok(())
     }
 
@@ -1649,9 +1817,18 @@ impl MetadataRepository {
             .bind(inode as i64)
             .execute(&self.pool)
             .await?;
-        
+
         tracing::warn!("🧹 Chunks limpiados para inode: {}", inode);
         Ok(())
+    }
+
+    /// Limpia TODOS los chunks de caché (todas las filas de file_cache_chunks).
+    /// Usado en recuperación post-crash para eliminar estado obsoleto.
+    pub async fn clear_all_chunks(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM file_cache_chunks")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// Obtiene el offset máximo registrado en los chunks (para validar consistencia de tamaño)
@@ -2122,4 +2299,26 @@ pub struct LocalSyncFile {
     
     pub dirty: bool,
     pub last_synced: Option<i64>,
+}
+
+/// Struct para inserción masiva de metadatos
+#[derive(Debug, Clone)]
+pub struct BulkFileMetadata {
+    pub inode: u64,
+    pub size: i64,
+    pub mtime: i64,
+    pub mode: u32,
+    pub is_dir: bool,
+    pub mime_type: Option<String>,
+    pub can_move: bool,
+    pub shared: bool,
+    pub owned_by_me: bool,
+}
+
+/// Struct para inserción masiva de dentries
+#[derive(Debug, Clone)]
+pub struct BulkDentry {
+    pub parent_inode: u64,
+    pub child_inode: u64,
+    pub name: String,
 }

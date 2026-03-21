@@ -12,7 +12,7 @@ Utilidades compartidas para gestión de montajes, hashing y limpieza de datos te
 | `mount.rs`   | `cleanup_if_needed()`: detecta y desmonta puntos FUSE huérfanos (stale mounts). `unmount_and_wait()`: desmonta limpiamente con `fusermount3 -u`. |
 | `hash.rs`    | Cálculo de hash MD5 de archivos para verificación de integridad contra `md5Checksum` de Google Drive API. |
 | `cleanup.rs` | Limpieza de caché y datos temporales del directorio `~/.cache/fedoradrive/`. |
-| `shutdown.rs` | Coordinación de cierre graceful. `SHUTDOWN_REQUESTED` (AtomicBool global), `request_shutdown()` para señalizar desde GUI, `wait_for_shutdown()` async para integrar en `tokio::select!`. |
+| `shutdown.rs` | Coordinación de cierre graceful. `SHUTDOWN_REQUESTED` (AtomicBool global), `request_shutdown()` para señalizar desde GUI, `wait_for_shutdown()` async para integrar en `tokio::select!`. Consumido por la macro `or_shutdown!` en `main.rs` para cancelar fases de inicialización pre-FUSE. |
 
 ## Dependencias
 

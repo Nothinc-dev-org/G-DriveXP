@@ -122,7 +122,7 @@ impl DriveClient {
         let response = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .header("Range", range_header)
+            .header("Range", range_header.clone())
             .send()
             .await
             .context("Error de red al descargar chunk")?;
@@ -131,7 +131,12 @@ impl DriveClient {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            tracing::error!("Error API Drive: {} - {}", status, error_text);
+            if status.as_u16() == 416 {
+                // 416 es recuperable: el caller corregirá attrs.size y reintentará
+                tracing::warn!("416 Range Not Satisfiable: file_id={} range={} (se corregirá automáticamente)", file_id, range_header);
+            } else {
+                tracing::error!("Error API Drive: {} - {}", status, error_text);
+            }
             anyhow::bail!("Error API Drive: {} - {}", status, error_text);
         }
 

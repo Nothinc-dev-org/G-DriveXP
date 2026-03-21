@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS dentry (
     FOREIGN KEY (parent_inode) REFERENCES inodes(inode),
     FOREIGN KEY (child_inode) REFERENCES inodes(inode)
 );
+CREATE INDEX IF NOT EXISTS idx_dentry_child ON dentry(child_inode);
 
 -- Metadatos POSIX cacheados
 CREATE TABLE IF NOT EXISTS attrs (

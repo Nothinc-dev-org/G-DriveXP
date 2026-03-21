@@ -23,6 +23,8 @@ Implementa la "Arquitectura Espejo": el directorio `~/GoogleDrive/` visible al u
 - **MirrorCommand**: los comandos vienen del IPC Server (Nautilus), del Syncer (cambios remotos), y de `main.rs` (`Shutdown` al cerrar).
 - **Symlinks vs Copias**: Online Only = symlink a `FUSE_Mount/<path>`. Local & Online = archivo real copiado desde FUSE.
 - El watcher ignora eventos dentro de `FUSE_Mount/` para evitar loops.
+- **Pausa durante Refresh**: `MirrorCommand::Refresh` dropea el watcher, drena eventos pendientes, ejecuta bootstrap sincrónicamente, y recrea el watcher. Esto evita que los rename atómicos de symlinks (desde `.gdrive_tmp_ops/`) generen falsos `dirty=1`. Ver ADR-007.
+- **Filtros de symlink en rename**: Los handlers de `RenameMode::Both`, `From` y `To` filtran paths con `.gdrive_tmp_ops`. `RenameMode::To` y el fallback de `handle_local_rename` verifican `is_symlink()` antes de procesar. Defensa en profundidad contra race condition watcher/bootstrap.
 - **Archivos de control interno**: `.hidden` y `.gdrivexp_hidden_manifest` están filtrados en `handle_fs_events`, `process_local_change` y el escaneo recursivo. Nunca deben registrarse en la DB ni sincronizarse.
 - **Shutdown ordenado**: `MirrorCommand::Shutdown` dropea el watcher y sale del `run_loop()` ANTES de que `hide_online_only_files()` escriba los `.hidden`. Ver ADR-006 (Rev 2).
 - **Integridad al cerrar**: `hide_online_only_files()` oculta symlinks OnlineOnly via archivos `.hidden` (mecanismo Nautilus/GLib) al cerrar el daemon, evitando que Nautilus muestre "Broken Link" con opciones destructivas. `restore_hidden_online_only_files()` revierte las entradas al arrancar usando `.gdrivexp_hidden_manifest`. Ver ADR-006.

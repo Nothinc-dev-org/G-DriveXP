@@ -41,6 +41,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Ejecuta un future cancelable por shutdown.
+/// Uso exclusivo durante inicialización, donde no hay recursos que limpiar.
+macro_rules! or_shutdown {
+    ($future:expr) => {
+        tokio::select! {
+            biased;
+            result = $future => result,
+            _ = crate::utils::shutdown::wait_for_shutdown() => {
+                tracing::info!("🛑 Shutdown durante inicialización, saliendo.");
+                std::process::exit(0);
+            }
+        }
+    };
+}
+
 /// Ejecuta toda la lógica de backend (asíncrona)
 pub fn run_backend(
     ui_sender: ComponentSender<gui::app_model::AppModel>,
@@ -91,8 +106,7 @@ pub fn run_backend(
             .context("Error al inicializar gestor OAuth2")?;
 
         tracing::info!("Verificando estado de autenticación (esto puede abrir su navegador)...");
-        oauth_manager.authenticate(Some(ui_sender.clone()))
-            .await
+        or_shutdown!(oauth_manager.authenticate(Some(ui_sender.clone())))
             .context("Fallo crítico en autenticación")?;
             
         tracing::info!("✅ Autenticación correcta");
@@ -104,13 +118,30 @@ pub fn run_backend(
         let db = Arc::new(db::MetadataRepository::new(&config.db_path).await?);
 
         // --- Resiliencia post-crash: detectar cierre no limpio ---
-        let prev_session = db.get_sync_meta("session_active").await?;
-        if prev_session.is_some() {
-            tracing::warn!("⚠️ Detectado cierre no limpio (crash/power loss). Forzando re-bootstrap...");
-            db.delete_sync_meta("bootstrap_complete").await?;
-            db.delete_sync_meta("changes_page_token").await?;
+        // Usamos un marcador físico en el espejo para mayor robustez.
+        let shutdown_marker = config.mirror_path.join(".gdrivexp_clean_shutdown");
+        let is_clean_shutdown = shutdown_marker.exists();
+        let is_crash_recovery = !is_clean_shutdown && db.get_sync_meta("bootstrap_complete").await?.is_some();
+
+        if is_crash_recovery {
+            tracing::warn!("⚠️ Detectado cierre no limpio (crash/power loss). Iniciando recuperación gradual...");
+            // No borramos bootstrap_complete inmediatamente para permitir que el MirrorManager 
+            // siga viendo el árbol mientras el Syncer/BFS actualiza metadatos.
+            
+            // Limpiar caché de chunks sospechosos (solo si es necesario, no nuke total)
+            // En esta versión, mantenemos el clear_all_chunks pero evitamos borrar el dir físico 
+            // si solo queremos actualizar metadatos.
+            let chunks_cleared = db.clear_all_chunks().await.unwrap_or(0);
+            if chunks_cleared > 0 {
+                tracing::info!("🧹 {} registros de caché invalidados (post-crash cleanup)", chunks_cleared);
+            }
         }
-        db.set_sync_meta("session_active", "true").await?;
+
+        // Borrar marcador para la sesión actual (si existe)
+        if is_clean_shutdown {
+            let _ = std::fs::remove_file(&shutdown_marker);
+        }
+
 
         // Enviar DB a la GUI para que pueda gestionar directorios locales
         ui_sender.input(gui::app_model::AppMsg::SetDatabase(db.clone()));
@@ -121,7 +152,7 @@ pub fn run_backend(
 
         // Obtener Root ID para optimizaciones del Uploader
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Obteniendo ID de carpeta raíz...".to_string()));
-        let root_id = drive_client.get_root_file_id().await
+        let root_id = or_shutdown!(drive_client.get_root_file_id())
             .context("Error crítico obteniendo Root ID de Google Drive")?;
 
         // Inicializar sistema de archivos
@@ -150,7 +181,7 @@ pub fn run_backend(
             if db.is_empty().await? {
                 // Primera vez: nivel 1
                 ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cargando estructura inicial...".to_string()));
-                sync::bootstrap::bootstrap_level1(&db, &drive_client, &root_id).await?;
+                or_shutdown!(sync::bootstrap::bootstrap_level1(&db, &drive_client, &root_id))?;
                 // Base de datos nueva: no necesitamos reparar ownership legacy, los datos ya vienen bien.
                 let _ = db.set_sync_meta("repair_ownership_done_v2", "true").await;
             }
@@ -159,24 +190,39 @@ pub fn run_backend(
             // El Refresh posterior al completar BFS actualizará el espejo con el árbol completo.
             let _ = bfs_ready_tx.send(true);
 
-            // Lanzar BFS background para completar el árbol
-            let db_bg = db.clone();
-            let client_bg = drive_client.clone();
-            let root_id_bg = root_id.clone();
-            let mirror_tx_bg = mirror_sender.clone();
-            ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Escaneando Drive en segundo plano...".to_string()));
-            tokio::spawn(async move {
-                tracing::info!("Iniciando bootstrap BFS en background...");
-                if let Err(e) = sync::bootstrap::bootstrap_remaining_bfs(&db_bg, &client_bg, &root_id_bg).await {
-                    tracing::error!("Error en bootstrap BFS background: {:?}", e);
+            if is_crash_recovery {
+                // Post-crash: BFS SÍNCRONO para que upsert_file_metadata actualice
+                // TODOS los tamaños antes de montar FUSE. Esto elimina errores 416
+                // sin necesidad de llamadas extra a la API.
+                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Recuperando metadatos tras cierre no limpio...".to_string()));
+                tracing::info!("Iniciando bootstrap BFS SÍNCRONO (post-crash)...");
+                if let Err(e) = or_shutdown!(sync::bootstrap::bootstrap_remaining_bfs(&db, &drive_client, &root_id)) {
+                    tracing::error!("Error en bootstrap BFS post-crash: {:?}", e);
                 } else {
-                    let _ = db_bg.set_sync_meta("bootstrap_complete", "true").await;
-                    tracing::info!("Bootstrap BFS completado y marcado como finalizado.");
-
-                    // Notificar al MirrorManager que el árbol ha sido completado y hay archivos compartidos nuevos
-                    let _ = mirror_tx_bg.send(mirror::MirrorCommand::Refresh).await;
+                    let _ = db.set_sync_meta("bootstrap_complete", "true").await;
+                    tracing::info!("Bootstrap BFS síncrono completado (post-crash).");
+                    let _ = mirror_sender.send(mirror::MirrorCommand::Refresh).await;
                 }
-            });
+            } else {
+                // Normal: BFS en background (no bloquea el arranque)
+                let db_bg = db.clone();
+                let client_bg = drive_client.clone();
+                let root_id_bg = root_id.clone();
+                let mirror_tx_bg = mirror_sender.clone();
+                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Escaneando Drive en segundo plano...".to_string()));
+                tokio::spawn(async move {
+                    tracing::info!("Iniciando bootstrap BFS en background...");
+                    if let Err(e) = sync::bootstrap::bootstrap_remaining_bfs(&db_bg, &client_bg, &root_id_bg).await {
+                        tracing::error!("Error en bootstrap BFS background: {:?}", e);
+                    } else {
+                        let _ = db_bg.set_sync_meta("bootstrap_complete", "true").await;
+                        tracing::info!("Bootstrap BFS completado y marcado como finalizado.");
+
+                        // Notificar al MirrorManager que el árbol ha sido completado
+                        let _ = mirror_tx_bg.send(mirror::MirrorCommand::Refresh).await;
+                    }
+                });
+            }
         } else {
             // BFS ya completado, señalar inmediatamente para que MirrorManager no espere
             let _ = bfs_ready_tx.send(true);
@@ -192,6 +238,16 @@ pub fn run_backend(
             sync_paused.clone(),
             mirror_sender.clone(),
         );
+
+        // Sync inicial ANTES de montar FUSE: actualizar metadatos (sizes) para evitar
+        // 416 Range Not Satisfiable masivos cuando GNOME escanea el montaje.
+        ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Sincronizando cambios recientes...".to_string()));
+        match or_shutdown!(syncer.sync_once()) {
+            Ok(n) if n > 0 => tracing::info!("✅ Sync inicial pre-FUSE: {} cambios aplicados", n),
+            Ok(_) => tracing::info!("✅ Sync inicial pre-FUSE: sin cambios pendientes"),
+            Err(e) => tracing::warn!("⚠️ Sync inicial pre-FUSE falló (no bloqueante): {:?}", e),
+        }
+
         let _syncer_handle = syncer.spawn();
         
         // Fase 2.3: Uploader (subida de archivos dirty)
@@ -356,6 +412,12 @@ pub fn run_backend(
 
         // El drop de 'handle' debería intentar desmontar, pero lo forzamos por seguridad
         let _ = utils::mount::unmount_and_wait(&config.fuse_mount_path);
+
+        // Crear marcador de cierre limpio FÍSICO tras desmontaje exitoso
+        tracing::info!("💾 Escribiendo marcador de cierre limpio...");
+        if let Err(e) = std::fs::File::create(&shutdown_marker) {
+            tracing::error!("No se pudo crear marcador de cierre limpio: {:?}", e);
+        }
 
         // Forzar salida del proceso (GTK no responde a señales del backend)
         tracing::info!("👋 Cerrando aplicación...");
