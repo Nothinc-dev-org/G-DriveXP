@@ -344,7 +344,7 @@ impl Component for AppModel {
 
                                         add_suffix = &gtk::Image {
                                             #[watch]
-                                            set_icon_name: Some(if model.is_connected { "emblem-ok-symbolic" } else { "dialog-error-symbolic" }),
+                                            set_icon_name: Some(if model.is_connected { "object-select-symbolic" } else { "dialog-error-symbolic" }),
                                             #[watch]
                                             set_css_classes: if model.is_connected { &["success"] } else { &["error"] },
                                         },
@@ -372,9 +372,9 @@ impl Component for AppModel {
                                             #[watch]
                                             set_icon_name: Some(
                                                 if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
-                                                    "emblem-synchronizing-symbolic"
+                                                    "view-refresh-symbolic"
                                                 } else {
-                                                    "emblem-ok-symbolic"
+                                                    "object-select-symbolic"
                                                 }
                                             ),
                                             #[watch]
@@ -521,9 +521,9 @@ impl Component for AppModel {
                                     #[watch]
                                     set_icon_name: Some(
                                         if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
-                                            "emblem-synchronizing-symbolic"
+                                            "view-refresh-symbolic"
                                         } else {
-                                            "emblem-ok-symbolic"
+                                            "object-select-symbolic"
                                         }
                                     ),
                                     #[watch]
