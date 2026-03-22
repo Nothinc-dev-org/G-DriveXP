@@ -149,15 +149,20 @@ pub fn run_backend(
 
         if is_crash_recovery {
             tracing::warn!("⚠️ Detectado cierre no limpio (crash/power loss). Iniciando recuperación gradual...");
-            // No borramos bootstrap_complete inmediatamente para permitir que el MirrorManager 
+            // No borramos bootstrap_complete inmediatamente para permitir que el MirrorManager
             // siga viendo el árbol mientras el Syncer/BFS actualiza metadatos.
-            
-            // Limpiar caché de chunks sospechosos (solo si es necesario, no nuke total)
-            // En esta versión, mantenemos el clear_all_chunks pero evitamos borrar el dir físico 
-            // si solo queremos actualizar metadatos.
+
             let chunks_cleared = db.clear_all_chunks().await.unwrap_or(0);
             if chunks_cleared > 0 {
                 tracing::info!("🧹 {} registros de caché invalidados (post-crash cleanup)", chunks_cleared);
+            }
+
+            // Purgar caché física para mantener consistencia con la DB.
+            // Sin esto, los archivos físicos huérfanos disparan "zombie cache" en cada sesión futura.
+            if config.cache_dir.exists() {
+                let _ = std::fs::remove_dir_all(&config.cache_dir);
+                let _ = std::fs::create_dir_all(&config.cache_dir);
+                tracing::info!("🧹 Caché física purgada (post-crash cleanup)");
             }
         }
 
