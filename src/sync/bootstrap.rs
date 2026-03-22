@@ -54,6 +54,17 @@ async fn ensure_root_exists(db: &Arc<MetadataRepository>) -> Result<()> {
     Ok(())
 }
 
+/// Si el archivo es un shortcut de Google Drive, retorna (target_id, target_mime_type).
+pub fn resolve_shortcut_info(file: &google_drive3::api::File) -> Option<(String, String)> {
+    if file.mime_type.as_deref() != Some("application/vnd.google-apps.shortcut") {
+        return None;
+    }
+    let details = file.shortcut_details.as_ref()?;
+    let target_id = details.target_id.as_ref()?.clone();
+    let target_mime = details.target_mime_type.as_ref()?.clone();
+    Some((target_id, target_mime))
+}
+
 /// Helper: procesa un archivo de Drive e inserta inode + attrs.
 /// Retorna (inode, is_dir).
 async fn insert_file_metadata(
@@ -66,7 +77,13 @@ async fn insert_file_metadata(
     };
 
     let inode = db.get_or_create_inode(id).await?;
-    let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
+
+    let shortcut_info = resolve_shortcut_info(file);
+    let effective_mime = shortcut_info.as_ref()
+        .map(|(_, mime)| mime.as_str())
+        .or(file.mime_type.as_deref());
+
+    let is_dir = effective_mime == Some("application/vnd.google-apps.folder");
     let size = file.size.unwrap_or(0);
     let mtime = file.modified_time
         .as_ref()
@@ -80,11 +97,14 @@ async fn insert_file_metadata(
 
     db.upsert_file_metadata(
         inode, size, mtime, mode, is_dir,
-        file.mime_type.as_deref(), can_move, shared,
+        effective_mime, can_move, shared,
         file.owned_by_me.unwrap_or(true),
     ).await?;
 
-    // Inicializar dir_counters para directorios
+    if let Some((target_id, _)) = &shortcut_info {
+        db.set_shortcut_target_id(inode, target_id).await?;
+    }
+
     if is_dir {
         db.ensure_dir_counter(inode).await?;
     }
@@ -145,6 +165,8 @@ pub async fn bootstrap_remaining_bfs(
 
     // Archivos compartidos no propios para resolución de huérfanos al final
     let mut shared_non_owned: Vec<(u64, String)> = Vec::new();
+    // Shortcuts pendientes de resolución de size al final
+    let mut shortcut_targets: Vec<(u64, String)> = Vec::new();
 
     let mut page_token: Option<String> = None;
     let mut total_scanned: usize = 0;
@@ -195,7 +217,12 @@ pub async fn bootstrap_remaining_bfs(
                 None => continue,
             };
 
-            let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
+            let shortcut_info = resolve_shortcut_info(file);
+            let effective_mime = shortcut_info.as_ref()
+                .map(|(_, mime)| mime.clone())
+                .or_else(|| file.mime_type.clone());
+
+            let is_dir = effective_mime.as_deref() == Some("application/vnd.google-apps.folder");
             let size = file.size.unwrap_or(0);
             let mtime = file.modified_time
                 .as_ref()
@@ -208,9 +235,13 @@ pub async fn bootstrap_remaining_bfs(
             let shared = file.shared.unwrap_or(false);
             let owned = file.owned_by_me.unwrap_or(true);
 
+            if let Some((target_id, _)) = &shortcut_info {
+                shortcut_targets.push((inode, target_id.clone()));
+            }
+
             metadata_buffer.push(crate::db::BulkFileMetadata {
                 inode, size, mtime, mode, is_dir,
-                mime_type: file.mime_type.clone(),
+                mime_type: effective_mime,
                 can_move, shared,
                 owned_by_me: owned,
             });
@@ -280,6 +311,14 @@ pub async fn bootstrap_remaining_bfs(
         if !orphan_buffer.is_empty() {
             db.upsert_bulk_dentries(&orphan_buffer).await?;
         }
+    }
+
+    // Post-procesamiento: resolver shortcuts (guardar target_id y copiar size del target)
+    if !shortcut_targets.is_empty() {
+        tracing::info!("Escaneo: resolviendo {} shortcuts...", shortcut_targets.len());
+        db.set_bulk_shortcut_targets(&shortcut_targets).await?;
+        let resolved = db.resolve_shortcut_sizes().await?;
+        tracing::info!("Escaneo: {} shortcuts resueltos con size del target", resolved);
     }
 
     // Recalcular contadores y enviar refresh final

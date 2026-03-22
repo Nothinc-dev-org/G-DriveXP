@@ -23,3 +23,4 @@ Cliente wrapper para la API v3 de Google Drive. Abstrae las operaciones HTTP (li
 - **Resumable Upload**: para archivos grandes, usa el protocolo de subida resumible de Google.
 - **Exponential Backoff**: debe implementarse en los consumidores, no en este módulo directamente.
 - **Root ID**: se obtiene con `get_root_file_id()` y se cachea en el caller.
+- **Shortcuts**: Todos los endpoints de listado y cambios solicitan `shortcutDetails(targetId,targetMimeType)` en el campo `fields`. Es responsabilidad del consumidor (bootstrap/syncer) interpretar estos campos.

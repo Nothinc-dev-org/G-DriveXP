@@ -164,7 +164,7 @@ impl DriveClient {
 
         loop {
             let mut url = format!(
-                "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
+                "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive),shortcutDetails(targetId,targetMimeType))",
                 urlencoding::encode(&query)
             );
 
@@ -223,7 +223,7 @@ impl DriveClient {
 
         loop {
             let mut url = format!(
-                "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
+                "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive),shortcutDetails(targetId,targetMimeType))",
                 urlencoding::encode("trashed = false")
             );
             
@@ -274,7 +274,7 @@ impl DriveClient {
             .context("No se obtuvo ningún token válido")?;
 
         let mut url = format!(
-            "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
+            "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive),shortcutDetails(targetId,targetMimeType))",
             urlencoding::encode("trashed = false")
         );
 
@@ -357,7 +357,7 @@ impl DriveClient {
         
         // pageToken es requerido, fields especifica qué queremos recibir
         let url = format!(
-            "https://www.googleapis.com/drive/v3/changes?pageSize=1000&pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed,shared,ownedByMe,capabilities(canMoveItemWithinDrive)))",
+            "https://www.googleapis.com/drive/v3/changes?pageSize=1000&pageToken={}&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,md5Checksum,trashed,shared,ownedByMe,capabilities(canMoveItemWithinDrive),shortcutDetails(targetId,targetMimeType)))",
             page_token
         );
 

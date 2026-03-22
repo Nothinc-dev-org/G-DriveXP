@@ -198,7 +198,7 @@ impl Filesystem for GDriveFS {
         }
 
         // Para archivos Workspace, el usuario busca con .html pero en DB está sin extensión
-        let (lookup_name, is_html_lookup) = if name_str.ends_with(".html") {
+        let (lookup_name, _is_html_lookup) = if name_str.ends_with(".html") {
             (name_str.trim_end_matches(".html"), true)
         } else {
             (name_str, false)
@@ -237,16 +237,14 @@ impl Filesystem for GDriveFS {
 
         let mut file_attr = attrs.to_file_attr();
 
-        // Si es lookup de archivo Workspace (.html), ajustar tamaño al HTML generado
-        if is_html_lookup {
-            if let Some(ref mime) = attrs.mime_type {
-                if shortcuts::is_workspace_file(mime) {
-                    let gdrive_id = self.get_gdrive_id(inode).await
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    let html_content = shortcuts::generate_desktop_entry(&gdrive_id, lookup_name, mime);
-                    file_attr.size = html_content.len() as u64;
-                    file_attr.perm = 0o644;
-                }
+        // Si es archivo Workspace, ajustar tamaño al HTML generado (consistente con getattr)
+        if let Some(ref mime) = attrs.mime_type {
+            if shortcuts::is_workspace_file(mime) {
+                let gdrive_id = self.get_gdrive_id(inode).await
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let html_content = shortcuts::generate_desktop_entry(&gdrive_id, lookup_name, mime);
+                file_attr.size = html_content.len() as u64;
+                file_attr.perm = 0o644;
             }
         }
 
@@ -561,16 +559,16 @@ impl Filesystem for GDriveFS {
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        // 1. Obtener el gdrive_id del archivo, mime_type y tamaño PRIMERO para logging
-        let (gdrive_id, mime_type, file_size) = match sqlx::query_as::<_, (String, Option<String>, i64)>(
-            "SELECT i.gdrive_id, a.mime_type, a.size 
-             FROM inodes i 
-             LEFT JOIN attrs a ON i.inode = a.inode 
+        // 1. Obtener el gdrive_id del archivo, mime_type, tamaño y shortcut_target_id
+        let (raw_gdrive_id, mime_type, file_size, shortcut_target_id) = match sqlx::query_as::<_, (String, Option<String>, i64, Option<String>)>(
+            "SELECT i.gdrive_id, a.mime_type, a.size, a.shortcut_target_id
+             FROM inodes i
+             LEFT JOIN attrs a ON i.inode = a.inode
              WHERE i.inode = ?"
         )
             .bind(inode as i64)
             .fetch_one(self.db.pool())
-            .await 
+            .await
         {
             Ok(row) => row,
             Err(e) => {
@@ -578,6 +576,7 @@ impl Filesystem for GDriveFS {
                 return Err(Errno::from(libc::ENOENT));
             }
         };
+        let gdrive_id = shortcut_target_id.unwrap_or(raw_gdrive_id);
 
         let is_audio = mime_type.as_deref().map(|m| m.starts_with("audio/")).unwrap_or(false);
         if is_audio {

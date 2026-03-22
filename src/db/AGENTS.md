@@ -24,3 +24,4 @@ Capa de persistencia SQLite que almacena metadatos de archivos de Google Drive, 
 - **Inodo raíz**: Siempre `inode=1`, `gdrive_id="root"`. Es invariante del sistema.
 - **Pool**: Máximo 5 conexiones con `busy_timeout=60s`. Compartido via `Arc<MetadataRepository>`.
 - Los archivos `schema.sql` se embeben en compilación. Cambios al esquema requieren recompilación.
+- **Shortcuts**: La columna `attrs.shortcut_target_id` almacena el `gdrive_id` del archivo destino. Métodos `set_shortcut_target_id`, `set_bulk_shortcut_targets` y `resolve_shortcut_sizes` gestionan la resolución.

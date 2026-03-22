@@ -268,7 +268,24 @@ impl MetadataRepository {
                 .await?;
         }
 
-        // 10. Crear tabla dir_counters (Protocolo Burbujeo de Estados)
+        // 10. Verificar si la columna shortcut_target_id existe en attrs
+        let has_shortcut_target = sqlx::query("PRAGMA table_info(attrs)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "shortcut_target_id"
+            });
+
+        if !has_shortcut_target {
+            sqlx::query("ALTER TABLE attrs ADD COLUMN shortcut_target_id TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // 11. Crear tabla dir_counters (Protocolo Burbujeo de Estados)
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS dir_counters (
@@ -2313,6 +2330,46 @@ impl MetadataRepository {
         }
         
         Err(anyhow::anyhow!("Path no pertenece a ninguna carpeta Local Sync: {}", absolute_path))
+    }
+
+    pub async fn set_shortcut_target_id(&self, inode: u64, target_id: &str) -> Result<()> {
+        sqlx::query("UPDATE attrs SET shortcut_target_id = ? WHERE inode = ?")
+            .bind(target_id)
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_bulk_shortcut_targets(&self, items: &[(u64, String)]) -> Result<()> {
+        if items.is_empty() { return Ok(()); }
+        let mut tx = self.pool.begin().await?;
+        for (inode, target_id) in items {
+            sqlx::query("UPDATE attrs SET shortcut_target_id = ? WHERE inode = ?")
+                .bind(target_id)
+                .bind(*inode as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn resolve_shortcut_sizes(&self) -> Result<usize> {
+        let result = sqlx::query(
+            r#"UPDATE attrs SET size = (
+                SELECT a2.size FROM inodes i2 JOIN attrs a2 ON i2.inode = a2.inode
+                WHERE i2.gdrive_id = attrs.shortcut_target_id AND a2.size > 0
+            )
+            WHERE shortcut_target_id IS NOT NULL AND size = 0
+            AND EXISTS (
+                SELECT 1 FROM inodes i2 JOIN attrs a2 ON i2.inode = a2.inode
+                WHERE i2.gdrive_id = attrs.shortcut_target_id AND a2.size > 0
+            )"#
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
     }
 }
 /// Struct que representa un directorio local sincronizado

@@ -257,7 +257,14 @@ impl BackgroundSyncer {
 
             // Caso 4: Archivo nuevo o modificado
             let name = file.name.as_deref().unwrap_or("unknown");
-            let is_dir = file.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
+
+            // Resolver shortcuts: usar mime y size del target
+            let shortcut_info = crate::sync::bootstrap::resolve_shortcut_info(&file);
+            let effective_mime = shortcut_info.as_ref()
+                .map(|(_, mime)| mime.as_str())
+                .or(file.mime_type.as_deref());
+
+            let is_dir = effective_mime == Some("application/vnd.google-apps.folder");
             let size = file.size.unwrap_or(0);
             let mtime = file.modified_time
                 .as_ref()
@@ -313,11 +320,17 @@ impl BackgroundSyncer {
                 mtime,
                 mode,
                 is_dir,
-                file.mime_type.as_deref(),
+                effective_mime,
                 can_move,
                 shared,
                 file.owned_by_me.unwrap_or(true),
             ).await?;
+
+            // Resolver shortcut: guardar target_id y copiar size del target
+            if let Some((target_id, _)) = &shortcut_info {
+                self.db.set_shortcut_target_id(inode, target_id).await?;
+                let _ = self.db.resolve_shortcut_sizes().await;
+            }
 
             // Actualizar dentry (árbol de directorios)
             // IMPORTANTE: Si el archivo tiene cambios locales pendientes (dirty),

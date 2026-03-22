@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS attrs (
     is_dir BOOLEAN NOT NULL,
     mime_type TEXT,
     can_move BOOLEAN DEFAULT 1,
+    shortcut_target_id TEXT,
     FOREIGN KEY (inode) REFERENCES inodes(inode)
 );
 

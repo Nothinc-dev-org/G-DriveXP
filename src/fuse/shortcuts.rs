@@ -46,9 +46,20 @@ pub fn generate_desktop_entry(file_id: &str, name: &str, mime_type: &str) -> Str
     )
 }
 
-/// Detecta si un MIME type es de Google Workspace
+/// Detecta si un MIME type es de Google Workspace (contenido no descargable)
 pub fn is_workspace_file(mime_type: &str) -> bool {
-    mime_type.starts_with("application/vnd.google-apps.")
+    matches!(
+        mime_type,
+        "application/vnd.google-apps.document"
+            | "application/vnd.google-apps.spreadsheet"
+            | "application/vnd.google-apps.presentation"
+            | "application/vnd.google-apps.form"
+            | "application/vnd.google-apps.drawing"
+            | "application/vnd.google-apps.site"
+            | "application/vnd.google-apps.jam"
+            | "application/vnd.google-apps.map"
+            | "application/vnd.google-apps.script"
+    )
 }
 
 #[cfg(test)]
@@ -62,6 +73,10 @@ mod tests {
     #[case::presentation("application/vnd.google-apps.presentation", true)]
     #[case::form("application/vnd.google-apps.form", true)]
     #[case::drawing("application/vnd.google-apps.drawing", true)]
+    #[case::site("application/vnd.google-apps.site", true)]
+    #[case::jam("application/vnd.google-apps.jam", true)]
+    #[case::shortcut("application/vnd.google-apps.shortcut", false)]
+    #[case::folder("application/vnd.google-apps.folder", false)]
     #[case::pdf("application/pdf", false)]
     #[case::png("image/png", false)]
     #[case::plain_text("text/plain", false)]
