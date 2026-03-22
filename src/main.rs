@@ -29,9 +29,8 @@ fn main() -> Result<()> {
     
     tracing::info!("🚀 Iniciando FedoraDrive-rs v{}", env!("CARGO_PKG_VERSION"));
     
-    // Registrar manejadores de señales para cierre graceful
-    utils::shutdown::register_shutdown_handlers();
-    tracing::info!("🛡️ Signal handlers registrados");
+    // El registro de manejadores de señales se delega al runtime asíncrono
+    // dentro de la función de backend para operar mediante primitivas exclusivas de Tokio.
 
     // Iniciar la aplicación Relm4
     tracing::info!("🖥️ Iniciando interfaz gráfica...");
@@ -70,6 +69,31 @@ pub fn run_backend(
         .context("Error al construir Tokio Runtime")?;
 
     rt.block_on(async {
+        // --- Escucha reactiva de señales del OS (SIGTERM/SIGINT) ---
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = sigterm.recv() => {},
+                    }
+                    tracing::info!("🛑 Señal OS recibida (SIGTERM/SIGINT) - Despertando a Tokio...");
+                    crate::utils::shutdown::request_shutdown();
+                } else {
+                    // Fallback a ctrl_c si falla SIGTERM
+                    let _ = tokio::signal::ctrl_c().await;
+                    crate::utils::shutdown::request_shutdown();
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                crate::utils::shutdown::request_shutdown();
+            }
+        });
+
         // Cargar o crear configuración
         let config = Config::load().unwrap_or_else(|_| {
             tracing::warn!("No se pudo cargar configuración, usando valores predeterminados");
@@ -175,59 +199,56 @@ pub fn run_backend(
             bfs_ready_rx,
         );
 
-        // Fase 2.1: Bootstrapping (Sincronización de metadatos)
+        // Fase 2.1: Bootstrap inicial + Escaneo progresivo
         let bootstrap_done = db.get_sync_meta("bootstrap_complete").await?;
-        if bootstrap_done.is_none() {
-            if db.is_empty().await? {
-                // Primera vez: nivel 1
-                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cargando estructura inicial...".to_string()));
-                or_shutdown!(sync::bootstrap::bootstrap_level1(&db, &drive_client, &root_id))?;
-                // Base de datos nueva: no necesitamos reparar ownership legacy, los datos ya vienen bien.
-                let _ = db.set_sync_meta("repair_ownership_done_v2", "true").await;
+
+        // Primera vez con DB vacía: nivel 1 rápido para mostrar root de inmediato
+        if bootstrap_done.is_none() && db.is_empty().await? {
+            ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cargando estructura inicial...".to_string()));
+            or_shutdown!(sync::bootstrap::bootstrap_level1(&db, &drive_client, &root_id))?;
+            let _ = db.set_sync_meta("repair_ownership_done_v2", "true").await;
+        }
+
+        // Señalar a MirrorManager que puede arrancar con los datos actuales
+        let _ = bfs_ready_tx.send(true);
+
+        // Escaneo progresivo: SIEMPRE se ejecuta al iniciar/reanudar sesión
+        if is_crash_recovery {
+            // Post-crash: escaneo SÍNCRONO antes de montar FUSE (evita 416 por sizes desactualizados)
+            ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Recuperando metadatos...".to_string()));
+            tracing::info!("Escaneo síncrono post-crash...");
+            if let Err(e) = or_shutdown!(sync::bootstrap::bootstrap_remaining_bfs(
+                &db, &drive_client, &root_id, &history, &mirror_sender
+            )) {
+                tracing::error!("Error en escaneo post-crash: {:?}", e);
             }
-            // Señalar a MirrorManager que puede iniciar con los datos actuales
-            // (level 1 en primera vez, o datos previos al crash).
-            // El Refresh posterior al completar BFS actualizará el espejo con el árbol completo.
-            let _ = bfs_ready_tx.send(true);
-
-            if is_crash_recovery {
-                // Post-crash: BFS SÍNCRONO para que upsert_file_metadata actualice
-                // TODOS los tamaños antes de montar FUSE. Esto elimina errores 416
-                // sin necesidad de llamadas extra a la API.
-                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Recuperando metadatos tras cierre no limpio...".to_string()));
-                tracing::info!("Iniciando bootstrap BFS SÍNCRONO (post-crash)...");
-                if let Err(e) = or_shutdown!(sync::bootstrap::bootstrap_remaining_bfs(&db, &drive_client, &root_id)) {
-                    tracing::error!("Error en bootstrap BFS post-crash: {:?}", e);
-                } else {
-                    let _ = db.set_sync_meta("bootstrap_complete", "true").await;
-                    tracing::info!("Bootstrap BFS síncrono completado (post-crash).");
-                    let _ = mirror_sender.send(mirror::MirrorCommand::Refresh).await;
-                }
-            } else {
-                // Normal: BFS en background (no bloquea el arranque)
-                let db_bg = db.clone();
-                let client_bg = drive_client.clone();
-                let root_id_bg = root_id.clone();
-                let mirror_tx_bg = mirror_sender.clone();
-                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Escaneando Drive en segundo plano...".to_string()));
-                tokio::spawn(async move {
-                    tracing::info!("Iniciando bootstrap BFS en background...");
-                    if let Err(e) = sync::bootstrap::bootstrap_remaining_bfs(&db_bg, &client_bg, &root_id_bg).await {
-                        tracing::error!("Error en bootstrap BFS background: {:?}", e);
-                    } else {
-                        let _ = db_bg.set_sync_meta("bootstrap_complete", "true").await;
-                        tracing::info!("Bootstrap BFS completado y marcado como finalizado.");
-
-                        // Notificar al MirrorManager que el árbol ha sido completado
-                        let _ = mirror_tx_bg.send(mirror::MirrorCommand::Refresh).await;
-                    }
-                });
+            if bootstrap_done.is_none() {
+                let _ = db.set_sync_meta("bootstrap_complete", "true").await;
             }
         } else {
-            // BFS ya completado, señalar inmediatamente para que MirrorManager no espere
-            let _ = bfs_ready_tx.send(true);
+            // Normal: escaneo en background (no bloquea arranque)
+            let db_bg = db.clone();
+            let client_bg = drive_client.clone();
+            let root_id_bg = root_id.clone();
+            let mirror_tx_bg = mirror_sender.clone();
+            let history_bg = history.clone();
+            let needs_bootstrap_mark = bootstrap_done.is_none();
+            let ui_bg = ui_sender.clone();
+            ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Escaneando...".to_string()));
+            tokio::spawn(async move {
+                if let Err(e) = sync::bootstrap::bootstrap_remaining_bfs(
+                    &db_bg, &client_bg, &root_id_bg, &history_bg, &mirror_tx_bg
+                ).await {
+                    tracing::error!("Error en escaneo background: {:?}", e);
+                } else if needs_bootstrap_mark {
+                    let _ = db_bg.set_sync_meta("bootstrap_complete", "true").await;
+                }
+                ui_bg.input(gui::app_model::AppMsg::UpdateStatus(
+                    "Sistema de archivos montado y activo".to_string()
+                ));
+            });
         }
-        
+
         // Fase 2.2: Background Syncer (sincronización continua)
         tracing::info!("Iniciando sincronizador en background...");
         let syncer = sync::syncer::BackgroundSyncer::new(
@@ -250,6 +271,10 @@ pub fn run_backend(
 
         let _syncer_handle = syncer.spawn();
         
+        // Limpiar dirty-deletes stale de sesiones anteriores
+        // (previene que el uploader envíe a papelera archivos que no borró el usuario)
+        let _ = db.clear_stale_dirty_deletes().await;
+
         // Fase 2.3: Uploader (subida de archivos dirty)
         tracing::info!("Iniciando uploader en background...");
         let uploader = sync::uploader::Uploader::new(
@@ -369,19 +394,17 @@ pub fn run_backend(
         // ui_sender.input(gui::app_model::AppMsg::SetLocalSyncSender(local_sync_sender));
 
         
-        // Esperar a que termine la sesión, Ctrl+C, o shutdown desde GUI
+        // Esperar a que termine la sesión recursiva, o se notifique un shutdown coordinado
+        // (el cual unifica cierres provenientes vía GUI o del Systema Operativo vía Señal)
         tokio::select! {
             res = &mut handle => {
                 if let Err(e) = res {
                     tracing::error!("Error en la sesión FUSE: {:?}", e);
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("🛑 Recibida señal de interrupción (Ctrl+C)");
-                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cerrando por señal...".to_string()));
-            }
             _ = utils::shutdown::wait_for_shutdown() => {
-                tracing::info!("🛑 Shutdown solicitado desde GUI");
+                tracing::info!("🛑 Desmontaje coordinado activado...");
+                ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Cerrando subsistemas...".to_string()));
             }
         }
         

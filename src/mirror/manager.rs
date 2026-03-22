@@ -107,7 +107,7 @@ impl MirrorManager {
             // (como reparar symlinks) no generen eventos de "Eliminación" que el watcher
             // malinterprete como acciones del usuario.
             info!("🔄 Ejecutando Bootstrap (Reparación de estado)...");
-            if let Err(e) = Self::run_bootstrap(self.ctx.clone()).await {
+            if let Err(e) = Self::run_bootstrap(self.ctx.clone(), true).await {
                 error!("Error durante bootstrap: {:?}", e);
             }
             info!("✅ Bootstrap completado. Iniciando vigilancia.");
@@ -140,7 +140,7 @@ impl MirrorManager {
 
     /// Reconcilia el estado del sistema de archivos visible con la base de datos
     // Función estática asociada que corre independiente del estado mut del manager
-    async fn run_bootstrap(ctx: Arc<MirrorContext>) -> Result<()> {
+    async fn run_bootstrap(ctx: Arc<MirrorContext>, skip_orphan_cleanup: bool) -> Result<()> {
         info!("🔄 Iniciando bootstrap del espejo...");
 
         restore_hidden_online_only_files(&ctx.mirror_path).await;
@@ -244,60 +244,76 @@ impl MirrorManager {
 
         info!("🔄 Bootstrap: {} archivos verificados, {} creados/reparados", total, repaired);
 
-        // PASO 3: Limpieza de huérfanos (reutiliza listas ya obtenidas)
-        info!("🧹 Iniciando limpieza recursiva de archivos huérfanos en el espejo...");
-        let valid_paths: std::collections::HashSet<PathBuf> = {
-            let mut paths = std::collections::HashSet::new();
-            for (_, path, _) in &files {
-                paths.insert(PathBuf::from(path));
-            }
-            for (_, path) in &dirs {
-                paths.insert(PathBuf::from(path));
-            }
-            paths.insert(PathBuf::from("SHARED"));
-            paths
-        };
+        // PASO 3: Limpieza de huérfanos (solo si no hay escaneo en curso)
+        // Si skip_orphan_cleanup es true, no eliminar archivos del espejo
+        // ya que la DB puede estar incompleta (escaneo en progreso).
+        if skip_orphan_cleanup {
+            info!("⏭️ Omitiendo limpieza de huérfanos (escaneo pendiente)");
+        } else {
+            info!("🧹 Iniciando limpieza recursiva de archivos huérfanos en el espejo...");
+            let valid_paths: std::collections::HashSet<PathBuf> = {
+                let mut paths = std::collections::HashSet::new();
+                for (_, path, _) in &files {
+                    paths.insert(PathBuf::from(path));
+                }
+                for (_, path) in &dirs {
+                    paths.insert(PathBuf::from(path));
+                }
+                paths.insert(PathBuf::from("SHARED"));
+                paths
+            };
 
-        let mut entries_to_check = vec![ctx.mirror_path.clone()];
-        let mut deleted_count = 0;
+            // Directorios que NUNCA deben recorrerse ni eliminarse
+            let mut skip_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            skip_dirs.insert(ctx.fuse_mount_path.clone());
 
-        while let Some(current_dir) = entries_to_check.pop() {
-            if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let full_path = entry.path();
-                    let rel_path = match full_path.strip_prefix(&ctx.mirror_path) {
-                        Ok(p) => p.to_path_buf(),
-                        Err(_) => continue,
-                    };
+            let mut entries_to_check = vec![ctx.mirror_path.clone()];
+            let mut deleted_count = 0;
 
-                    let name = rel_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                    if name.starts_with('.') { continue; }
+            while let Some(current_dir) = entries_to_check.pop() {
+                if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let full_path = entry.path();
 
-                    if !valid_paths.contains(&rel_path) {
-                        warn!("🧹 Eliminando entrada huérfana en espejo: {:?}", rel_path);
-                        let meta = entry.metadata().await;
-                        if let Ok(m) = meta {
-                            if m.is_dir() {
-                                let _ = tokio::fs::remove_dir_all(&full_path).await;
+                        // NUNCA tocar el punto de montaje FUSE ni su contenido
+                        if skip_dirs.contains(&full_path) {
+                            continue;
+                        }
+
+                        let rel_path = match full_path.strip_prefix(&ctx.mirror_path) {
+                            Ok(p) => p.to_path_buf(),
+                            Err(_) => continue,
+                        };
+
+                        let name = rel_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                        if name.starts_with('.') { continue; }
+
+                        if !valid_paths.contains(&rel_path) {
+                            warn!("🧹 Eliminando entrada huérfana en espejo: {:?}", rel_path);
+                            let meta = entry.metadata().await;
+                            if let Ok(m) = meta {
+                                if m.is_dir() {
+                                    let _ = tokio::fs::remove_dir_all(&full_path).await;
+                                } else {
+                                    let _ = tokio::fs::remove_file(&full_path).await;
+                                }
                             } else {
                                 let _ = tokio::fs::remove_file(&full_path).await;
                             }
+                            deleted_count += 1;
                         } else {
-                            let _ = tokio::fs::remove_file(&full_path).await;
-                        }
-                        deleted_count += 1;
-                    } else {
-                        if let Ok(m) = entry.file_type().await {
-                            if m.is_dir() {
-                                entries_to_check.push(full_path);
+                            if let Ok(m) = entry.file_type().await {
+                                if m.is_dir() {
+                                    entries_to_check.push(full_path);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        if deleted_count > 0 {
-            info!("🧹 Limpieza completada: {} entradas eliminadas.", deleted_count);
+            if deleted_count > 0 {
+                info!("🧹 Limpieza completada: {} entradas eliminadas.", deleted_count);
+            }
         }
 
         // PASO FINAL: Reconstruir dir_counters
@@ -326,7 +342,7 @@ impl MirrorManager {
                             self.watcher.take();
                             while self.watcher_rx.try_recv().is_ok() {}
 
-                            if let Err(e) = Self::run_bootstrap(self.ctx.clone()).await {
+                            if let Err(e) = Self::run_bootstrap(self.ctx.clone(), false).await {
                                 error!("Error durante bootstrap (Refresh): {:?}", e);
                             }
 
@@ -346,6 +362,11 @@ impl MirrorManager {
                             }
                         }
                         MirrorCommand::RemoteDeleted { paths } => {
+                            // Pausar watcher para que las eliminaciones del mirror
+                            // no se detecten como eliminaciones del usuario
+                            self.watcher.take();
+                            while self.watcher_rx.try_recv().is_ok() {}
+
                             for relative in paths {
                                 let path_to_check = self.ctx.mirror_path.join(&relative);
                                 if path_to_check.exists() || tokio::fs::symlink_metadata(&path_to_check).await.is_ok() {
@@ -358,6 +379,21 @@ impl MirrorManager {
                                         }
                                     }
                                 }
+                            }
+
+                            // Recrear watcher
+                            let w_tx = self.watcher_tx.clone();
+                            let mirror_path = self.ctx.mirror_path.clone();
+                            let watcher_result = tokio::task::spawn_blocking(move || {
+                                MirrorWatcher::new(&mirror_path, w_tx)
+                            }).await;
+                            match watcher_result {
+                                Ok(Ok(w)) => {
+                                    tracing::debug!("👀 Watcher reactivado tras RemoteDeleted");
+                                    self.watcher = Some(w);
+                                },
+                                Ok(Err(e)) => error!("Error reiniciando watcher tras RemoteDeleted: {:?}", e),
+                                Err(e) => error!("Error en spawn_blocking (watcher restart RemoteDeleted): {:?}", e),
                             }
                         }
                         MirrorCommand::Shutdown => {
@@ -696,8 +732,13 @@ impl MirrorManager {
         ctx.history.complete_transfer(transfer_id);
 
         match copy_result {
-            Ok(Ok(_)) => {
-                tracing::debug!("🪞 Copia finalizada. Preparando intercambio...");
+            Ok(Ok(copied)) => {
+                if copied == 0 {
+                    warn!("🛡️ ABORTADO: copia desde FUSE resultó en 0 bytes para {:?}. No se reemplazará el symlink.", relative);
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return;
+                }
+                tracing::debug!("🪞 Copia finalizada ({} bytes). Preparando intercambio...", copied);
             }
             Ok(Err(e)) => {
                 error!("Error descargando archivo desde FUSE: {:?}", e);

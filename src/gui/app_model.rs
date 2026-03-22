@@ -22,6 +22,7 @@ pub struct AppModel {
     pub sync_detected: usize,
     pub sync_applied: usize,
     pub pending_uploads: usize,
+    pub scanning_total: usize,
     // Directorios de sincronización
     pub local_sync_dirs: Vec<crate::db::repository::LocalSyncDir>,
     // Referencias a widgets dinámicos
@@ -43,10 +44,15 @@ pub enum ViewMode {
 
 impl AppModel {
     fn sync_hint_text(&self) -> String {
+        // Escaneo en curso tiene prioridad visual
+        if self.scanning_total > 0 {
+            return format!("Escaneados {} archivos", self.scanning_total);
+        }
+
         let has_pending_downloads = self.sync_detected != self.sync_applied;
         let has_pending_uploads = self.pending_uploads > 0;
         let has_active_real_transfers = self.active_transfers.iter().any(|t| t.operation != TransferOp::Stream);
-        
+
         if has_active_real_transfers || has_pending_downloads || has_pending_uploads {
             if has_pending_downloads {
                 format!("{}/{} Cambios aplicados", self.sync_applied, self.sync_detected)
@@ -347,7 +353,7 @@ impl Component for AppModel {
                                     add = &adw::ActionRow {
                                         set_title: "Estado",
                                         #[watch]
-                                        set_subtitle: &model.status_message,
+                                        set_subtitle: if model.scanning_total > 0 { "Escaneando..." } else { &model.status_message },
                                     },
                                 },
 
@@ -365,14 +371,14 @@ impl Component for AppModel {
                                         add_prefix = &gtk::Image {
                                             #[watch]
                                             set_icon_name: Some(
-                                                if model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                                if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                                     "emblem-synchronizing-symbolic"
                                                 } else {
                                                     "emblem-ok-symbolic"
                                                 }
                                             ),
                                             #[watch]
-                                            set_css_classes: if model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                            set_css_classes: if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                                 &["accent"]
                                             } else {
                                                 &["success"]
@@ -514,14 +520,14 @@ impl Component for AppModel {
                                 add_prefix = &gtk::Image {
                                     #[watch]
                                     set_icon_name: Some(
-                                        if model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                        if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                             "emblem-synchronizing-symbolic"
                                         } else {
                                             "emblem-ok-symbolic"
                                         }
                                     ),
                                     #[watch]
-                                    set_css_classes: if model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                    set_css_classes: if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
                                         &["accent"]
                                     } else {
                                         &["success"]
@@ -630,6 +636,7 @@ impl Component for AppModel {
             sync_detected: 0,
             sync_applied: 0,
             pending_uploads: 0,
+            scanning_total: 0,
             local_sync_dirs: Vec::new(),
             uploads_listbox: None,
             downloads_listbox: None,
@@ -931,6 +938,7 @@ impl Component for AppModel {
                 self.sync_detected = progress.changes_detected;
                 self.sync_applied = progress.changes_applied;
                 self.pending_uploads = progress.pending_uploads;
+                self.scanning_total = progress.scanning_total;
 
                 // Rebuild imperativo de los listbox dinámicos
                 if let Some(ref uploads_box) = self.uploads_listbox {

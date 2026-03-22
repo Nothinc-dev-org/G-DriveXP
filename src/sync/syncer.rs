@@ -240,7 +240,9 @@ impl BackgroundSyncer {
             if file.trashed == Some(true) {
                 tracing::debug!("Cambio detectado: TRASHED file_id={}", file_id);
                 let path_to_delete = self.get_relative_path_for_deletion(file_id).await;
-                self.db.soft_delete_by_gdrive_id(file_id).await?;
+                // Usar soft_delete_remote: NO marca dirty porque la eliminación
+                // ya ocurrió en GDrive y no necesita re-subirse por el uploader.
+                self.db.soft_delete_remote(file_id).await?;
                 if let Some(p) = path_to_delete {
                     let _ = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await;
                 }
@@ -410,6 +412,14 @@ impl BackgroundSyncer {
                     
                     // Descargar archivo usando chunks (con tracking de progreso)
                     let file_size = file.size.unwrap_or(0) as u64;
+
+                    // Guardia: no sobrescribir archivo local con contenido vacío
+                    if should_protect_local_file(file_size, &local_path).await {
+                        let existing_size = tokio::fs::metadata(&local_path).await.map(|m| m.len()).unwrap_or(0);
+                        tracing::warn!("🛡️ API retornó size=0 para archivo local de {} bytes. No sobrescribiendo: {}", existing_size, local_file.relative_path);
+                        return Ok(());
+                    }
+
                     let mut content = Vec::with_capacity(file_size as usize);
 
                     let transfer_id = self.history.start_transfer(&name_display, TransferOp::Download, file_size);
@@ -459,5 +469,61 @@ impl BackgroundSyncer {
         }
 
         Ok(())
+    }
+}
+
+/// Decide si se debe proteger un archivo local de sobrescritura con contenido vacío de la API
+async fn should_protect_local_file(api_size: u64, local_path: &std::path::Path) -> bool {
+    if api_size != 0 {
+        return false;
+    }
+    if let Ok(meta) = tokio::fs::metadata(local_path).await {
+        meta.len() > 0
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::*;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    /// Versión sync para testing de la lógica de protección
+    fn should_protect_local_file_sync(api_size: u64, local_exists: bool, local_size: u64) -> bool {
+        api_size == 0 && local_exists && local_size > 0
+    }
+
+    #[rstest]
+    #[case::protect_existing(0, true, 5000, true)]
+    #[case::allow_new_file(0, false, 0, false)]
+    #[case::allow_real_download(1024, true, 5000, false)]
+    #[case::allow_overwrite_empty(0, true, 0, false)]
+    #[case::allow_real_update(2048, true, 1024, false)]
+    fn test_should_protect_local_file(
+        #[case] api_size: u64,
+        #[case] local_exists: bool,
+        #[case] local_size: u64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(should_protect_local_file_sync(api_size, local_exists, local_size), expected);
+    }
+
+    #[rstest]
+    fn test_should_protect_real_file_on_disk() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "contenido real").unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::should_protect_local_file(0, tmp.path()));
+        assert!(result, "Debe proteger archivo existente con contenido cuando API dice size=0");
+    }
+
+    #[rstest]
+    fn test_should_not_protect_nonexistent_file() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::should_protect_local_file(0, std::path::Path::new("/tmp/no_existe_xyz_test")));
+        assert!(!result, "No debe proteger archivo que no existe");
     }
 }

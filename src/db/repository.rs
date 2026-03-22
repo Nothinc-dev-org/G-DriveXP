@@ -1259,6 +1259,22 @@ impl MetadataRepository {
         Ok(())
     }
 
+    /// Limpia entradas dirty-delete que quedaron pendientes de sesiones anteriores.
+    /// Esto previene que el uploader envíe a papelera archivos que no fueron
+    /// realmente eliminados por el usuario (e.g., limpieza de huérfanos del mirror).
+    pub async fn clear_stale_dirty_deletes(&self) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE sync_state SET dirty = 0, deleted_at = NULL WHERE dirty = 1 AND deleted_at IS NOT NULL"
+        )
+        .execute(&self.pool)
+        .await?;
+        let count = result.rows_affected() as usize;
+        if count > 0 {
+            tracing::info!("🧹 Limpiadas {} entradas dirty-delete stale de sesión anterior", count);
+        }
+        Ok(count)
+    }
+
     /// Recalcula todos los contadores de directorio desde cero.
     /// Optimizado: Calcula de abajo hacia arriba (bottom-up) para evitar subconsultas recursivas lentas.
     pub async fn rebuild_all_dir_counters(&self) -> Result<()> {
@@ -1563,6 +1579,37 @@ impl MetadataRepository {
 
         tracing::info!("Recursive soft delete applied for gdrive_id={}, root_inode={}", gdrive_id, root_inode);
         Ok(true)
+    }
+
+    /// Soft delete para eliminaciones REMOTAS (no marca dirty).
+    /// Usa soft_delete_by_gdrive_id internamente, pero luego limpia dirty=0
+    /// porque la eliminación ya ocurrió en GDrive y no necesita re-subirse.
+    pub async fn soft_delete_remote(&self, gdrive_id: &str) -> Result<bool> {
+        let inode = self.get_inode_by_gdrive_id(gdrive_id).await?;
+        let result = self.soft_delete_by_gdrive_id(gdrive_id).await?;
+        if result {
+            if let Some(root_inode) = inode {
+                // Limpiar dirty para este inode y todos sus descendientes
+                // (ya fueron movidos a dentry_deleted por soft_delete_by_gdrive_id)
+                sqlx::query(r#"
+                    WITH RECURSIVE subordinates AS (
+                        SELECT child_inode FROM dentry_deleted WHERE child_inode = ?
+                        UNION ALL
+                        SELECT d.child_inode FROM dentry_deleted d
+                        JOIN subordinates s ON d.parent_inode = s.child_inode
+                    )
+                    UPDATE sync_state SET dirty = 0
+                    WHERE inode IN (SELECT child_inode FROM subordinates)
+                      AND deleted_at IS NOT NULL
+                "#)
+                .bind(root_inode as i64)
+                .execute(&self.pool)
+                .await?;
+
+                tracing::debug!("Remote soft delete: dirty cleared for gdrive_id={}", gdrive_id);
+            }
+        }
+        Ok(result)
     }
 
     /// Restaura un archivo eliminado (quita tombstone)

@@ -88,6 +88,8 @@ pub struct SyncProgress {
     pub changes_detected: usize,
     pub changes_applied: usize,
     pub pending_uploads: usize,
+    /// Total de archivos escaneados (0 = no hay escaneo en curso)
+    pub scanning_total: usize,
 }
 
 impl SyncProgress {
@@ -352,10 +354,243 @@ impl ActionHistory {
         } else {
             false
         };
-        
+
         // Si el conteo cambió, notificar al tray (hacerlo fuera del lock)
         if changed {
             self.notify_change();
         }
+    }
+
+    /// Actualiza el total de archivos escaneados (0 = escaneo finalizado)
+    pub fn set_scanning_total(&self, count: usize) {
+        let changed = if let Ok(mut progress) = self.sync_progress.write() {
+            let changed = progress.scanning_total != count;
+            progress.scanning_total = count;
+            changed
+        } else {
+            false
+        };
+
+        if changed {
+            self.notify_change();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::*;
+
+    #[fixture]
+    fn history() -> ActionHistory {
+        ActionHistory::new()
+    }
+
+    // --- ActionType ---
+
+    #[rstest]
+    #[case::sync(ActionType::Sync, "🔄")]
+    #[case::upload(ActionType::Upload, "📤")]
+    #[case::download(ActionType::Download, "📥")]
+    #[case::create(ActionType::Create, "📄")]
+    #[case::delete(ActionType::Delete, "🗑️")]
+    #[case::conflict(ActionType::Conflict, "⚠️")]
+    #[case::error(ActionType::Error, "❌")]
+    #[case::stream(ActionType::Stream, "🎬")]
+    fn test_action_type_emoji(#[case] action: ActionType, #[case] expected: &str) {
+        assert_eq!(action.emoji(), expected);
+    }
+
+    // --- TransferOp ---
+
+    #[rstest]
+    #[case::upload(TransferOp::Upload, "📤")]
+    #[case::download(TransferOp::Download, "📥")]
+    #[case::stream(TransferOp::Stream, "🎬")]
+    fn test_transfer_op_emoji(#[case] op: TransferOp, #[case] expected: &str) {
+        assert_eq!(op.emoji(), expected);
+    }
+
+    // --- ActiveTransfer progress ---
+
+    #[rstest]
+    #[case::zero_total(0, 0, 0.0)]
+    #[case::half(500, 1000, 0.5)]
+    #[case::complete(1000, 1000, 1.0)]
+    #[case::quarter(250, 1000, 0.25)]
+    fn test_progress_fraction(
+        #[case] transferred: u64,
+        #[case] total: u64,
+        #[case] expected: f64,
+    ) {
+        let transfer = ActiveTransfer {
+            id: 1,
+            file_name: "test.txt".into(),
+            operation: TransferOp::Upload,
+            bytes_transferred: transferred,
+            total_bytes: total,
+            speed_bps: 0,
+            last_update: None,
+        };
+        let diff = (transfer.progress_fraction() - expected).abs();
+        assert!(diff < 0.001, "Expected {}, got {}", expected, transfer.progress_fraction());
+    }
+
+    // --- SyncProgress ---
+
+    #[rstest]
+    fn test_sync_progress_default_is_synced() {
+        let p = SyncProgress::default();
+        assert!(p.is_synced());
+    }
+
+    #[rstest]
+    #[case::no_changes(0, 0, true)]
+    #[case::all_applied(10, 10, true)]
+    #[case::partial(10, 5, false)]
+    #[case::none_applied(10, 0, false)]
+    fn test_sync_progress_is_synced(
+        #[case] detected: usize,
+        #[case] applied: usize,
+        #[case] expected: bool,
+    ) {
+        let p = SyncProgress { changes_detected: detected, changes_applied: applied, pending_uploads: 0, scanning_total: 0 };
+        assert_eq!(p.is_synced(), expected);
+    }
+
+    // --- ActionEntry ---
+
+    #[rstest]
+    fn test_action_entry_format_for_menu() {
+        let entry = ActionEntry::new(ActionType::Upload, "archivo.txt subido");
+        let formatted = entry.format_for_menu();
+        assert!(formatted.contains("📤"));
+        assert!(formatted.contains("archivo.txt subido"));
+        assert!(formatted.contains("ahora"));
+    }
+
+    // --- ActionHistory: push y recent ---
+
+    #[rstest]
+    fn test_push_and_recent(history: ActionHistory) {
+        history.log(ActionType::Sync, "sync 1");
+        history.log(ActionType::Upload, "upload 1");
+        history.log(ActionType::Download, "download 1");
+
+        let recent = history.recent(2);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].description, "download 1"); // Más reciente primero
+        assert_eq!(recent[1].description, "upload 1");
+    }
+
+    #[rstest]
+    fn test_history_max_capacity(history: ActionHistory) {
+        for i in 0..60 {
+            history.log(ActionType::Sync, format!("entry {}", i));
+        }
+
+        let all = history.all();
+        assert_eq!(all.len(), MAX_HISTORY_ENTRIES);
+        assert_eq!(all[0].description, "entry 59"); // El más reciente
+    }
+
+    // --- Transfers ---
+
+    #[rstest]
+    fn test_start_and_complete_transfer(history: ActionHistory) {
+        let id = history.start_transfer("big_file.zip", TransferOp::Upload, 1_000_000);
+        assert!(id > 0);
+
+        let active = history.active_transfers();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].file_name, "big_file.zip");
+        assert_eq!(active[0].total_bytes, 1_000_000);
+
+        history.complete_transfer(id);
+        assert!(history.active_transfers().is_empty());
+    }
+
+    #[rstest]
+    fn test_update_transfer_progress(history: ActionHistory) {
+        let id = history.start_transfer("file.dat", TransferOp::Download, 1000);
+        history.update_transfer_progress(id, 500);
+
+        let active = history.active_transfers();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].bytes_transferred, 500);
+    }
+
+    // --- Sync Progress API ---
+
+    #[rstest]
+    fn test_set_sync_progress(history: ActionHistory) {
+        history.set_sync_progress(10, 3);
+        let p = history.get_sync_progress();
+        assert_eq!(p.changes_detected, 10);
+        assert_eq!(p.changes_applied, 3);
+        assert!(!p.is_synced());
+    }
+
+    #[rstest]
+    fn test_increment_applied(history: ActionHistory) {
+        history.set_sync_progress(5, 2);
+        history.increment_applied();
+        let p = history.get_sync_progress();
+        assert_eq!(p.changes_applied, 3);
+    }
+
+    #[rstest]
+    fn test_mark_all_synced(history: ActionHistory) {
+        history.set_sync_progress(10, 7);
+        history.mark_all_synced();
+        let p = history.get_sync_progress();
+        assert!(p.is_synced());
+        assert_eq!(p.changes_detected, 0);
+        assert_eq!(p.changes_applied, 0);
+    }
+
+    #[rstest]
+    fn test_set_pending_uploads(history: ActionHistory) {
+        history.set_pending_uploads(5);
+        let p = history.get_sync_progress();
+        assert_eq!(p.pending_uploads, 5);
+    }
+
+    // --- Notifier ---
+
+    #[rstest]
+    fn test_notifier_fires_on_push(history: ActionHistory) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        history.set_notifier(tx);
+
+        history.log(ActionType::Sync, "test");
+
+        // Debe recibir notificación
+        let result = rx.recv_timeout(std::time::Duration::from_millis(100));
+        assert!(result.is_ok(), "Notifier should fire on push");
+    }
+
+    #[rstest]
+    fn test_notifier_fires_on_transfer(history: ActionHistory) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        history.set_notifier(tx);
+
+        history.start_transfer("f.txt", TransferOp::Upload, 100);
+
+        let result = rx.recv_timeout(std::time::Duration::from_millis(100));
+        assert!(result.is_ok(), "Notifier should fire on start_transfer");
+    }
+
+    // --- Clone / thread safety ---
+
+    #[rstest]
+    fn test_clone_shares_state(history: ActionHistory) {
+        let clone = history.clone();
+        history.log(ActionType::Create, "from original");
+
+        let recent = clone.recent(1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].description, "from original");
     }
 }

@@ -574,8 +574,18 @@ impl Uploader {
              return Ok(());
         }
 
-        // 6. Actualizar contenido usando la API (con tracking de progreso)
+        // 6. Guardia anti-0-bytes: no sobrescribir archivo remoto con cache vacío
         let file_size = tokio::fs::metadata(&cache_path).await.map(|m| m.len()).unwrap_or(0);
+        let remote_size = remote_meta.size.unwrap_or(0);
+
+        if should_block_zero_byte_upload(file_size, remote_size) {
+            warn!("🛡️ BLOQUEADO: upload de 0 bytes para archivo que en Drive pesa {} bytes (gdrive_id={}). Limpiando cache corrupto.", remote_size, gdrive_id);
+            let _ = tokio::fs::remove_file(&cache_path).await;
+            self.db.clear_dirty_and_bubble(inode).await?;
+            return Ok(());
+        }
+
+        // 7. Actualizar contenido usando la API (con tracking de progreso)
         let transfer_id = self.history.start_transfer(&local_name, TransferOp::Upload, file_size);
         
         let history_clone = self.history.clone();
@@ -937,7 +947,18 @@ impl Uploader {
 
                 // TODO: Implementar detección de conflictos similar a update_file
 
+                // Guardia anti-0-bytes: no sobrescribir archivo remoto con archivo local vacío
                 let file_size = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
+                if file_size == 0 {
+                    let remote_meta = self.client.get_file_metadata(gdrive_id).await?;
+                    let remote_size = remote_meta.size.unwrap_or(0);
+                    if should_block_zero_byte_upload(file_size, remote_size) {
+                        warn!("🛡️ BLOQUEADO: upload local_sync de 0 bytes para archivo que en Drive pesa {} bytes ({})", remote_size, file.relative_path);
+                        self.db.clear_local_file_dirty(file.id).await?;
+                        return Ok(());
+                    }
+                }
+
                 let transfer_id = self.history.start_transfer(file_name, TransferOp::Upload, file_size);
                 let history_ref = self.history.clone();
                 let progress_cb = Box::new(move |bytes: u64| {
@@ -961,5 +982,32 @@ impl Uploader {
                 Ok(())
             }
         }
+    }
+}
+
+/// Decide si un upload debe bloquearse por protección anti-0-bytes.
+/// Bloquea cuando el archivo local tiene 0 bytes pero el remoto tiene contenido real.
+fn should_block_zero_byte_upload(local_size: u64, remote_size: i64) -> bool {
+    local_size == 0 && remote_size > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::*;
+
+    #[rstest]
+    #[case::block_zero_local_real_remote(0, 1024, true)]
+    #[case::allow_both_zero(0, 0, false)]
+    #[case::allow_real_local(1024, 1024, false)]
+    #[case::allow_real_local_zero_remote(1024, 0, false)]
+    #[case::block_zero_local_large_remote(0, 50_000_000, true)]
+    #[case::allow_remote_unknown(0, -1, false)]
+    fn test_should_block_zero_byte_upload(
+        #[case] local_size: u64,
+        #[case] remote_size: i64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(should_block_zero_byte_upload(local_size, remote_size), expected);
     }
 }

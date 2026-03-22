@@ -1592,7 +1592,8 @@ impl GDriveFS {
         }
 
         // Asegurar que el archivo existe (usando OpenOptions para NO truncar si ganó la carrera el prefetch)
-        if !cache_path.exists() {
+        let cache_was_created = !cache_path.exists();
+        if cache_was_created {
              let _ = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -1722,9 +1723,28 @@ impl GDriveFS {
                             }
                         }
                     }
+                    // Limpiar cache vacío si fue creado por esta invocación
+                    if cache_was_created {
+                        if let Ok(meta) = tokio::fs::metadata(&cache_path_owned).await {
+                            if meta.len() == 0 {
+                                tracing::warn!("🛡️ Eliminando cache vacío tras descarga fallida (inode={})", inode);
+                                let _ = tokio::fs::remove_file(&cache_path_owned).await;
+                            }
+                        }
+                    }
                     return Err(e);
                 },
-                Err(e) => return Err(anyhow::anyhow!("Task panicked: {}", e)),
+                Err(e) => {
+                    if cache_was_created {
+                        if let Ok(meta) = tokio::fs::metadata(&cache_path_owned).await {
+                            if meta.len() == 0 {
+                                tracing::warn!("🛡️ Eliminando cache vacío tras task panic (inode={})", inode);
+                                let _ = tokio::fs::remove_file(&cache_path_owned).await;
+                            }
+                        }
+                    }
+                    return Err(anyhow::anyhow!("Task panicked: {}", e));
+                },
             }
         }
 
@@ -1868,7 +1888,8 @@ impl GDriveFS {
         }
 
         // Asegurar que el archivo existe
-        if !cache_path.exists() {
+        let cache_was_created = !cache_path.exists();
+        if cache_was_created {
              let _ = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -2036,7 +2057,17 @@ impl GDriveFS {
             }
         }
         
-        tracing::info!("✅ {} inteligente completado para: {}", 
+        // Limpiar cache vacío si fue creado por esta invocación y no se descargó nada
+        if cache_was_created {
+            if let Ok(meta) = tokio::fs::metadata(&cache_path).await {
+                if meta.len() == 0 {
+                    tracing::warn!("🛡️ Eliminando cache vacío tras streaming sin datos (inode={})", inode);
+                    let _ = tokio::fs::remove_file(&cache_path).await;
+                }
+            }
+        }
+
+        tracing::info!("✅ {} inteligente completado para: {}",
                       if is_media { "Streaming" } else { "Descarga" }, file_name);
         Ok(())
     }

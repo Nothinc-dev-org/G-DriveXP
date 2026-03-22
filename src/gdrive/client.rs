@@ -222,7 +222,10 @@ impl DriveClient {
         let client = &self.http;
 
         loop {
-            let mut url = "https://www.googleapis.com/drive/v3/files?pageSize=1000&trashed=false&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))".to_string();
+            let mut url = format!(
+                "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
+                urlencoding::encode("trashed = false")
+            );
             
             if let Some(ref token_str) = page_token {
                 url.push_str(&format!("&pageToken={}", token_str));
@@ -260,6 +263,44 @@ impl DriveClient {
 
         tracing::info!("📊 Sincronización: Se recuperaron {} archivos en total", all_files.len());
         Ok(all_files)
+    }
+
+    /// Obtiene una página de archivos de Drive. Retorna (archivos, next_page_token).
+    /// Si next_page_token es None, no hay más páginas.
+    pub async fn fetch_files_page(&self, page_token: Option<&str>) -> Result<(Vec<google_drive3::api::File>, Option<String>)> {
+        let token = self.hub.auth.get_token(&["https://www.googleapis.com/auth/drive"])
+            .await
+            .map_err(|e| anyhow::anyhow!("Error de autenticación: {}", e))?
+            .context("No se obtuvo ningún token válido")?;
+
+        let mut url = format!(
+            "https://www.googleapis.com/drive/v3/files?pageSize=1000&q={}&fields=nextPageToken,files(id,name,parents,mimeType,size,modifiedTime,md5Checksum,version,shared,ownedByMe,capabilities(canMoveItemWithinDrive))",
+            urlencoding::encode("trashed = false")
+        );
+
+        if let Some(pt) = page_token {
+            url.push_str(&format!("&pageToken={}", pt));
+        }
+
+        let response = self.http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .context("Error de red al obtener página de archivos")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Error API Drive fetch_files_page: {} - {}", status, body);
+        }
+
+        let file_list: google_drive3::api::FileList = response.json()
+            .await
+            .context("Error al parsear respuesta JSON de Drive")?;
+
+        let files = file_list.files.unwrap_or_default();
+        Ok((files, file_list.next_page_token))
     }
 
     // ============================================================

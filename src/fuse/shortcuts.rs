@@ -54,29 +54,67 @@ pub fn is_workspace_file(mime_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::*;
 
-    #[test]
-    fn test_is_workspace_file() {
-        assert!(is_workspace_file("application/vnd.google-apps.document"));
-        assert!(is_workspace_file("application/vnd.google-apps.spreadsheet"));
-        assert!(!is_workspace_file("application/pdf"));
-        assert!(!is_workspace_file("image/png"));
+    #[rstest]
+    #[case::document("application/vnd.google-apps.document", true)]
+    #[case::spreadsheet("application/vnd.google-apps.spreadsheet", true)]
+    #[case::presentation("application/vnd.google-apps.presentation", true)]
+    #[case::form("application/vnd.google-apps.form", true)]
+    #[case::drawing("application/vnd.google-apps.drawing", true)]
+    #[case::pdf("application/pdf", false)]
+    #[case::png("image/png", false)]
+    #[case::plain_text("text/plain", false)]
+    #[case::empty("", false)]
+    fn test_is_workspace_file(#[case] mime: &str, #[case] expected: bool) {
+        assert_eq!(is_workspace_file(mime), expected);
     }
 
-    #[test]
-    fn test_generate_html_redirect_document() {
-        let entry = generate_desktop_entry("ABC123", "Mi Documento", "application/vnd.google-apps.document");
-        
+    #[rstest]
+    #[case::document(
+        "application/vnd.google-apps.document",
+        "https://docs.google.com/document/d/ID123/edit"
+    )]
+    #[case::spreadsheet(
+        "application/vnd.google-apps.spreadsheet",
+        "https://docs.google.com/spreadsheets/d/ID123/edit"
+    )]
+    #[case::presentation(
+        "application/vnd.google-apps.presentation",
+        "https://docs.google.com/presentation/d/ID123/edit"
+    )]
+    #[case::form(
+        "application/vnd.google-apps.form",
+        "https://docs.google.com/forms/d/ID123/edit"
+    )]
+    #[case::drawing(
+        "application/vnd.google-apps.drawing",
+        "https://docs.google.com/drawings/d/ID123/edit"
+    )]
+    #[case::fallback(
+        "application/vnd.google-apps.unknown_type",
+        "https://drive.google.com/file/d/ID123/view"
+    )]
+    fn test_generate_desktop_entry_urls(#[case] mime: &str, #[case] expected_url: &str) {
+        let entry = generate_desktop_entry("ID123", "Test", mime);
+        assert!(entry.contains(expected_url), "Expected URL '{}' in:\n{}", expected_url, entry);
+    }
+
+    #[rstest]
+    fn test_html_structure() {
+        let entry = generate_desktop_entry("ABC", "Mi Doc", "application/vnd.google-apps.document");
         assert!(entry.contains("<!DOCTYPE html>"));
+        assert!(entry.contains("<meta charset=\"UTF-8\">"));
         assert!(entry.contains("<meta http-equiv=\"refresh\""));
-        assert!(entry.contains("https://docs.google.com/document/d/ABC123/edit"));
-        assert!(entry.contains("<title>Mi Documento</title>"));
+        assert!(entry.contains("<title>Mi Doc</title>"));
+        assert!(entry.contains("window.location.href="));
     }
 
-    #[test]
-    fn test_generate_html_redirect_spreadsheet() {
-        let entry = generate_desktop_entry("XYZ789", "Hoja de Cálculo", "application/vnd.google-apps.spreadsheet");
-        
-        assert!(entry.contains("https://docs.google.com/spreadsheets/d/XYZ789/edit"));
+    #[rstest]
+    fn test_url_appears_three_times() {
+        let entry = generate_desktop_entry("X", "N", "application/vnd.google-apps.document");
+        let url = "https://docs.google.com/document/d/X/edit";
+        let count = entry.matches(url).count();
+        assert_eq!(count, 3, "URL should appear in meta-refresh, href, and JS redirect");
     }
 }
