@@ -29,7 +29,9 @@ bidireccionalmente, e incluye una extensión de Nautilus con emblemas de estado.
 install -Dm755 g-drive-xp %{buildroot}%{_bindir}/g-drive-xp
 install -Dm755 libgdrivexp_nautilus.so %{buildroot}%{_libdir}/nautilus/extensions-4/libgdrivexp-nautilus.so
 install -Dm644 org.gnome.FedoraDrive.desktop %{buildroot}%{_datadir}/applications/org.gnome.FedoraDrive.desktop
-install -Dm644 org.gnome.FedoraDrive.png %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/org.gnome.FedoraDrive.png
+install -Dm644 org.gnome.FedoraDrive-48.png %{buildroot}%{_datadir}/icons/hicolor/48x48/apps/org.gnome.FedoraDrive.png
+install -Dm644 org.gnome.FedoraDrive-128.png %{buildroot}%{_datadir}/icons/hicolor/128x128/apps/org.gnome.FedoraDrive.png
+install -Dm644 org.gnome.FedoraDrive-256.png %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/org.gnome.FedoraDrive.png
 install -Dm644 emblem-gdrivexp-synced.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/emblems/emblem-gdrivexp-synced.svg
 install -Dm644 emblem-gdrivexp-cloud.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/emblems/emblem-gdrivexp-cloud.svg
 install -Dm644 emblem-gdrivexp-local.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/emblems/emblem-gdrivexp-local.svg
@@ -47,6 +49,8 @@ install -Dm644 emblem-gdrivexp-error.svg %{buildroot}%{_datadir}/icons/hicolor/s
 %{_bindir}/g-drive-xp
 %{_libdir}/nautilus/extensions-4/libgdrivexp-nautilus.so
 %{_datadir}/applications/org.gnome.FedoraDrive.desktop
+%{_datadir}/icons/hicolor/48x48/apps/org.gnome.FedoraDrive.png
+%{_datadir}/icons/hicolor/128x128/apps/org.gnome.FedoraDrive.png
 %{_datadir}/icons/hicolor/256x256/apps/org.gnome.FedoraDrive.png
 %{_datadir}/icons/hicolor/scalable/emblems/emblem-gdrivexp-synced.svg
 %{_datadir}/icons/hicolor/scalable/emblems/emblem-gdrivexp-cloud.svg

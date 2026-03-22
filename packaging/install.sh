@@ -55,7 +55,9 @@ info "Instalando archivo .desktop..."
 sudo install -Dm644 "$SRC/org.gnome.FedoraDrive.desktop" /usr/share/applications/org.gnome.FedoraDrive.desktop
 
 info "Instalando iconos..."
-sudo install -Dm644 "$SRC/org.gnome.FedoraDrive.png" /usr/share/icons/hicolor/256x256/apps/org.gnome.FedoraDrive.png
+sudo install -Dm644 "$SRC/org.gnome.FedoraDrive-48.png" /usr/share/icons/hicolor/48x48/apps/org.gnome.FedoraDrive.png
+sudo install -Dm644 "$SRC/org.gnome.FedoraDrive-128.png" /usr/share/icons/hicolor/128x128/apps/org.gnome.FedoraDrive.png
+sudo install -Dm644 "$SRC/org.gnome.FedoraDrive-256.png" /usr/share/icons/hicolor/256x256/apps/org.gnome.FedoraDrive.png
 for emblem in "$SRC"/emblem-gdrivexp-*.svg; do
     sudo install -Dm644 "$emblem" "/usr/share/icons/hicolor/scalable/emblems/$(basename "$emblem")"
 done
@@ -67,7 +69,8 @@ sudo update-desktop-database /usr/share/applications/ 2>/dev/null || true
 echo ""
 ok "G-DriveXP v${VERSION} instalado correctamente."
 echo ""
-echo "  Ejecuta:  g-drive-xp"
+echo "  La aplicación aparece en el menú de GNOME como 'G-DriveXP'."
+echo "  También puedes ejecutarla desde terminal: g-drive-xp"
 echo ""
 echo "  Para que los emblemas de Nautilus aparezcan, reinicia el explorador:"
 echo "    nautilus -q"

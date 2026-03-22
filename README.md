@@ -87,9 +87,7 @@ Para que aplicaciones de terceros accedan al sistema de archivos virtual:
 
 ## Uso
 
-```bash
-g-drive-xp
-```
+Abre **G-DriveXP** desde el menú de aplicaciones de GNOME. La primera vez te pedirá autenticarte con tu cuenta de Google.
 
 El sistema de archivos se monta en `~/GoogleDrive/`. Los archivos aparecen como:
 - **Online Only**: symlinks al punto de montaje FUSE (sin ocupar espacio)
