@@ -21,6 +21,8 @@ pub enum MirrorCommand {
     Refresh,
     /// Notificación de archivos eliminados en Google Drive
     RemoteDeleted { paths: Vec<String> },
+    /// Notificación de archivos restaurados desde la papelera de Google Drive
+    RemoteRestored { paths: Vec<String> },
     /// Detener watcher y salir del run_loop (previo a shutdown)
     Shutdown,
 }
@@ -394,6 +396,53 @@ impl MirrorManager {
                                 },
                                 Ok(Err(e)) => error!("Error reiniciando watcher tras RemoteDeleted: {:?}", e),
                                 Err(e) => error!("Error en spawn_blocking (watcher restart RemoteDeleted): {:?}", e),
+                            }
+                        }
+                        MirrorCommand::RemoteRestored { paths } => {
+                            self.watcher.take();
+                            while self.watcher_rx.try_recv().is_ok() {}
+
+                            for relative in paths {
+                                let mirror_file = self.ctx.mirror_path.join(&relative);
+                                if tokio::fs::symlink_metadata(&mirror_file).await.is_ok() {
+                                    continue;
+                                }
+
+                                if let Some(parent) = mirror_file.parent() {
+                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                }
+
+                                if let Ok(Some(inode)) = self.ctx.db.resolve_relative_path_to_inode(&relative).await {
+                                    let availability = self.ctx.db.get_availability(inode).await.unwrap_or_default();
+                                    match availability.as_str() {
+                                        "online_only" => {
+                                            let fuse_path = self.ctx.fuse_mount_path.join(&relative);
+                                            match tokio::fs::symlink(&fuse_path, &mirror_file).await {
+                                                Ok(()) => info!("🔗 Restaurado (symlink): {}", relative),
+                                                Err(e) => warn!("Error creando symlink para restaurado: {:?}", e),
+                                            }
+                                        }
+                                        "local_online" => {
+                                            Self::static_handle_set_local_online_opt(&self.ctx, &mirror_file.to_string_lossy(), true).await;
+                                            info!("📥 Restaurado (local): {}", relative);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
+                            let w_tx = self.watcher_tx.clone();
+                            let mirror_path = self.ctx.mirror_path.clone();
+                            let watcher_result = tokio::task::spawn_blocking(move || {
+                                MirrorWatcher::new(&mirror_path, w_tx)
+                            }).await;
+                            match watcher_result {
+                                Ok(Ok(w)) => {
+                                    tracing::debug!("👀 Watcher reactivado tras RemoteRestored");
+                                    self.watcher = Some(w);
+                                },
+                                Ok(Err(e)) => error!("Error reiniciando watcher tras RemoteRestored: {:?}", e),
+                                Err(e) => error!("Error en spawn_blocking (watcher restart RemoteRestored): {:?}", e),
                             }
                         }
                         MirrorCommand::Shutdown => {

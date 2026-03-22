@@ -250,10 +250,13 @@ impl BackgroundSyncer {
             }
 
             // Caso 3: Archivo restaurado (estaba en tombstone pero ya no está trashed)
-            if self.db.has_tombstone(file_id).await? {
+            let was_restored = if self.db.has_tombstone(file_id).await? {
                 tracing::debug!("Cambio detectado: RESTORED file_id={}", file_id);
                 self.db.restore_by_gdrive_id(file_id).await?;
-            }
+                true
+            } else {
+                false
+            };
 
             // Caso 4: Archivo nuevo o modificado
             let name = file.name.as_deref().unwrap_or("unknown");
@@ -386,7 +389,16 @@ impl BackgroundSyncer {
                 file_id, name, is_dir
             );
 
-            // NUEVO: Verificar si este archivo pertenece a un Local Sync Directory
+            // Notificar al MirrorManager si el archivo fue restaurado desde la papelera
+            if was_restored {
+                if let Ok(Some(rel_path)) = self.db.resolve_inode_to_relative_path(inode as u64).await {
+                    let _ = self.mirror_tx.send(
+                        crate::mirror::manager::MirrorCommand::RemoteRestored { paths: vec![rel_path] }
+                    ).await;
+                }
+            }
+
+            // Verificar si este archivo pertenece a un Local Sync Directory
             if let Err(e) = self.process_local_sync_change(&file,file_id).await {
                 tracing::warn!("Error procesando cambio local sync para {}: {:?}", file_id, e);
             }

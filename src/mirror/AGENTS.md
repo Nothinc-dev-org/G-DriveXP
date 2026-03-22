@@ -9,7 +9,7 @@ Implementa la "Arquitectura Espejo": el directorio `~/GoogleDrive/` visible al u
 | Archivo      | Responsabilidad |
 |--------------|----------------|
 | `mod.rs`     | Re-exporta `MirrorManager`, `MirrorCommand`. |
-| `manager.rs` | `MirrorManager`: gestiona el estado del espejo. Recibe comandos via `mpsc::channel` (SetOnlineOnly, SetLocalOnline, Refresh, RemoteDeleted, **Shutdown**). Procesa eventos del watcher. Incluye `hide_online_only_files()` y `restore_hidden_online_only_files()` para integridad al cerrar/abrir. |
+| `manager.rs` | `MirrorManager`: gestiona el estado del espejo. Recibe comandos via `mpsc::channel` (SetOnlineOnly, SetLocalOnline, Refresh, RemoteDeleted, **RemoteRestored**, **Shutdown**). Procesa eventos del watcher. Incluye `hide_online_only_files()` y `restore_hidden_online_only_files()` para integridad al cerrar/abrir. |
 | `watcher.rs` | `MirrorWatcher`: monitorea `~/GoogleDrive/` con `notify` (debounced). Detecta Create, Modify, Rename y Remove en el directorio espejo. |
 
 ## Dependencias
