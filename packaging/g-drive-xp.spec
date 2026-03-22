@@ -1,3 +1,5 @@
+%global debug_package %{nil}
+
 Name:           g-drive-xp
 Version:        1.0.0
 Release:        1%{?dist}
