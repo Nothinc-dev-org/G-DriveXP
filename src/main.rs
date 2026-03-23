@@ -117,15 +117,20 @@ pub fn run_backend(
         // Fase 1: Autenticación OAuth2
         ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Verificando autenticación...".to_string()));
         
-        // Buscar archivo de credenciales
-        let cred_path = "credentials.json";
-        if !std::path::Path::new(cred_path).exists() {
-            tracing::error!("No se encontró el archivo '{}'. Por favor siga las instrucciones de instalación.", cred_path);
+        // Buscar archivo de credenciales: primero en ~/.config/fedoradrive/, luego relativo (desarrollo)
+        let home = std::env::var("HOME").unwrap_or_default();
+        let config_cred = format!("{}/.config/fedoradrive/credentials.json", home);
+        let cred_path = if std::path::Path::new(&config_cred).exists() {
+            config_cred
+        } else if std::path::Path::new("credentials.json").exists() {
+            "credentials.json".to_string()
+        } else {
+            tracing::error!("No se encontró credentials.json en ~/.config/fedoradrive/ ni en el directorio actual");
             ui_sender.input(gui::app_model::AppMsg::UpdateStatus("Error: credentials.json no encontrado".to_string()));
-            anyhow::bail!("Archivo de credenciales no encontrado");
-        }
+            anyhow::bail!("Archivo de credenciales no encontrado. Colóquelo en ~/.config/fedoradrive/credentials.json");
+        };
 
-        let oauth_manager = auth::OAuth2Manager::new_from_file(cred_path)
+        let oauth_manager = auth::OAuth2Manager::new_from_file(&cred_path)
             .await
             .context("Error al inicializar gestor OAuth2")?;
 
