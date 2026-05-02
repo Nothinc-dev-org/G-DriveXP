@@ -18,7 +18,7 @@ Monta un sistema de archivos virtual FUSE, sincroniza metadatos y contenido bidi
 ### Opción 1: Script de instalación (recomendado)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Nothinc-dev-org/G-DriveXP/v1.0.0/packaging/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Nothinc-dev-org/G-DriveXP/v1.0.1/packaging/install.sh | bash
 ```
 
 Descarga los binarios pre-compilados de GitHub Releases e instala el cliente, la extensión de Nautilus, iconos y archivo `.desktop`.
@@ -28,7 +28,7 @@ Descarga los binarios pre-compilados de GitHub Releases e instala el cliente, la
 Descarga el RPM desde la [página de Releases](https://github.com/Nothinc-dev-org/G-DriveXP/releases/latest):
 
 ```bash
-sudo dnf install ./g-drive-xp-1.0.0-1.fc*.x86_64.rpm
+sudo dnf install ./g-drive-xp-1.0.1-1.fc*.x86_64.rpm
 ```
 
 ### Opción 3: Compilar desde fuente
