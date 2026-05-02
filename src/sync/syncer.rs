@@ -177,6 +177,7 @@ impl BackgroundSyncer {
 
         if total_fetched > 0 {
             self.history.mark_all_synced();
+            let _ = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::Refresh).await;
         }
 
         // 5. Purgar tombstones expirados (cada ciclo, es barato)
