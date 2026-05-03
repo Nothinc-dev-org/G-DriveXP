@@ -3,11 +3,11 @@
 # Descarga e instala G-DriveXP con su extensión de Nautilus desde GitHub Releases.
 #
 # Uso:
-#   curl -fsSL https://raw.githubusercontent.com/Nothinc-dev-org/G-DriveXP/v1.0.0/packaging/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Nothinc-dev-org/G-DriveXP/v1.0.1/packaging/install.sh | bash
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 REPO="Nothinc-dev-org/G-DriveXP"
 ARCH="$(uname -m)"
 TARBALL="g-drive-xp-${VERSION}-${ARCH}.tar.gz"

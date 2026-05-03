@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           g-drive-xp
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Cliente nativo de Google Drive para Fedora/GNOME
 License:        GPL-3.0-only
@@ -58,5 +58,7 @@ install -Dm644 emblem-gdrivexp-error.svg %{buildroot}%{_datadir}/icons/hicolor/s
 %{_datadir}/icons/hicolor/scalable/emblems/emblem-gdrivexp-error.svg
 
 %changelog
+* Sat May 02 2026 Nothinc Dev <dev@nothinc.org> - 1.0.1-1
+- Actualización a v1.0.1
 * Sat Mar 22 2026 Nothinc Dev <dev@nothinc.org> - 1.0.0-1
 - Release inicial v1.0.0

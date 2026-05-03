@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PARENT_DIR="$(cd "$REPO_ROOT/.." && pwd)"
-VERSION="1.0.0"
+VERSION="1.0.1"
 ARCH="x86_64"
 NAME="g-drive-xp"
 TARBALL="${NAME}-${VERSION}-${ARCH}.tar.gz"
