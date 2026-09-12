@@ -1,0 +1,3010 @@
+use anyhow::Result;
+use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, SqlitePool};
+use std::path::Path;
+use std::str::FromStr;
+
+/// Sentencia del burbujeo de contadores (ancestros vía dentry, raíz incluida).
+/// Compartida entre `bubble_state_change` (pool) y los borrados transaccionales.
+/// La CTE ya alcanza al inode 1: NO añadir un segundo UPDATE para root
+/// (contaría dos veces).
+const BUBBLE_UPDATE_SQL: &str = r#"
+            WITH RECURSIVE ancestors AS (
+                SELECT parent_inode FROM dentry WHERE child_inode = ?1
+                UNION ALL
+                SELECT d.parent_inode FROM dentry d
+                JOIN ancestors a ON d.child_inode = a.parent_inode
+                WHERE a.parent_inode > 1
+            )
+            UPDATE dir_counters
+            SET dirty_desc_count = MAX(0, dirty_desc_count + ?2),
+                synced_desc_count = MAX(0, synced_desc_count + ?3)
+            WHERE inode IN (SELECT parent_inode FROM ancestors)
+            "#;
+
+/// Repositorio principal de metadatos basado en SQLite
+#[derive(Debug)]
+pub struct MetadataRepository {
+    pool: SqlitePool,
+}
+
+impl MetadataRepository {
+    /// Inicializa la conexión a la base de datos y aplica el esquema
+    pub async fn new(db_path: &Path) -> Result<Self> {
+        // Asegurarse de que el archivo existe (sqlx requiere esto para SQLite)
+        if !db_path.exists() {
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::File::create(db_path)?;
+        }
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .pragma("busy_timeout", "60000")
+            .pragma("synchronous", "NORMAL")
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(60))
+            .connect_with(options)
+            .await?;
+
+        // Inicializar esquema (crea tablas si no existen)
+        sqlx::query(include_str!("schema.sql"))
+            .execute(&pool)
+            .await?;
+        
+        let repo = Self { pool };
+
+        // Aplicar migraciones necesarias para bases de datos existentes
+        repo.apply_migrations().await?;
+        
+        Ok(repo)
+    }
+
+    /// Aplica migraciones manuales para asegurar que el esquema está actualizado
+    async fn apply_migrations(&self) -> Result<()> {
+        // 1. Verificar si la columna deleted_at existe en sync_state
+        let has_deleted_at = sqlx::query("PRAGMA table_info(sync_state)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "deleted_at"
+            });
+
+        if !has_deleted_at {
+            sqlx::query("ALTER TABLE sync_state ADD COLUMN deleted_at INTEGER DEFAULT NULL")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // 2. Verificar si la columna remote_md5 existe en sync_state
+        let has_remote_md5 = sqlx::query("PRAGMA table_info(sync_state)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "remote_md5"
+            });
+
+        if !has_remote_md5 {
+            sqlx::query("ALTER TABLE sync_state ADD COLUMN remote_md5 TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Asegurar que el índice existe (CREATE INDEX IF NOT EXISTS es seguro)
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_sync_deleted ON sync_state(deleted_at) WHERE deleted_at IS NOT NULL")
+            .execute(&self.pool)
+            .await?;
+
+        // 3. Crear tabla file_cache_chunks si no existe
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_cache_chunks (
+                inode INTEGER NOT NULL,
+                start_offset INTEGER NOT NULL,
+                end_offset INTEGER NOT NULL,
+                PRIMARY KEY (inode, start_offset),
+                FOREIGN KEY (inode) REFERENCES inodes(inode) ON DELETE CASCADE
+            )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // 4. Migración: Corregir PRIMARY KEY de dentry_deleted
+        // Verificar si la tabla tiene la PK incorrecta
+        let has_old_pk = sqlx::query(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='dentry_deleted'"
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .and_then(|row: sqlx::sqlite::SqliteRow| {
+            use sqlx::Row;
+            let sql: String = row.get("sql");
+            Some(sql.contains("PRIMARY KEY (parent_inode, name)"))
+        })
+        .unwrap_or(false);
+
+        if has_old_pk {
+            tracing::info!("Aplicando migración: Corrigiendo PRIMARY KEY de dentry_deleted");
+            
+            // Renombrar tabla vieja
+            sqlx::query("ALTER TABLE dentry_deleted RENAME TO dentry_deleted_old")
+                .execute(&self.pool)
+                .await?;
+            
+            // Crear nueva tabla con PK correcto
+            sqlx::query(
+                r#"
+                CREATE TABLE dentry_deleted (
+                    parent_inode INTEGER NOT NULL,
+                    child_inode INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    deleted_at INTEGER NOT NULL,
+                    PRIMARY KEY (child_inode)
+                )
+                "#
+            )
+            .execute(&self.pool)
+            .await?;
+            
+            // Migrar datos (eliminando duplicados por child_inode)
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO dentry_deleted (parent_inode, child_inode, name, deleted_at)
+                SELECT parent_inode, child_inode, name, deleted_at
+                FROM dentry_deleted_old
+                "#
+            )
+            .execute(&self.pool)
+            .await?;
+            
+            // Eliminar tabla vieja
+            sqlx::query("DROP TABLE dentry_deleted_old")
+                .execute(&self.pool)
+                .await?;
+            
+            // Recrear índice
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_tombstone_deleted_at ON dentry_deleted(deleted_at)")
+                .execute(&self.pool)
+                .await?;
+            
+            tracing::info!("Migración de dentry_deleted completada");
+        }
+
+        // 5. Crear tabla local_sync_files para Local Sync híbrido
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS local_sync_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_dir_id INTEGER NOT NULL REFERENCES local_sync_dirs(id) ON DELETE CASCADE,
+                relative_path TEXT NOT NULL,
+                is_dir INTEGER NOT NULL DEFAULT 0,
+                
+                availability TEXT NOT NULL DEFAULT 'local_online',
+                
+                local_mtime INTEGER,
+                local_size INTEGER,
+                local_md5 TEXT,
+                
+                gdrive_id TEXT,
+                remote_md5 TEXT,
+                remote_mtime INTEGER,
+                
+                dirty INTEGER NOT NULL DEFAULT 1,
+                last_synced INTEGER,
+                
+                UNIQUE(sync_dir_id, relative_path)
+            )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_local_sync_files_dirty ON local_sync_files(dirty) WHERE dirty = 1")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_local_sync_files_gdrive ON local_sync_files(gdrive_id)")
+            .execute(&self.pool)
+            .await?;
+
+        // 6. Verificar si la columna availability existe en sync_state
+        let has_availability = sqlx::query("PRAGMA table_info(sync_state)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "availability"
+            });
+
+        if !has_availability {
+            // Default a 'online_only' (nube) para no descargar todo por defecto
+            sqlx::query("ALTER TABLE sync_state ADD COLUMN availability TEXT DEFAULT 'online_only'")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // 7. Verificar si la columna can_move existe en attrs
+        let has_can_move = sqlx::query("PRAGMA table_info(attrs)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "can_move"
+            });
+
+        if !has_can_move {
+            sqlx::query("ALTER TABLE attrs ADD COLUMN can_move BOOLEAN DEFAULT 1")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // 8. Verificar si la columna shared existe en attrs
+        let has_shared = sqlx::query("PRAGMA table_info(attrs)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "shared"
+            });
+
+        if !has_shared {
+            sqlx::query("ALTER TABLE attrs ADD COLUMN shared BOOLEAN DEFAULT 0")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // 9. Verificar si la columna owned_by_me existe en attrs
+        let has_owned_by_me = sqlx::query("PRAGMA table_info(attrs)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "owned_by_me"
+            });
+
+        if !has_owned_by_me {
+            sqlx::query("ALTER TABLE attrs ADD COLUMN owned_by_me BOOLEAN DEFAULT 1")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // 10. Verificar si la columna shortcut_target_id existe en attrs
+        let has_shortcut_target = sqlx::query("PRAGMA table_info(attrs)")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .any(|row: &sqlx::sqlite::SqliteRow| {
+                use sqlx::Row;
+                let name: String = row.get("name");
+                name == "shortcut_target_id"
+            });
+
+        if !has_shortcut_target {
+            sqlx::query("ALTER TABLE attrs ADD COLUMN shortcut_target_id TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // 11. Crear tabla dir_counters (Protocolo Burbujeo de Estados)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS dir_counters (
+                inode INTEGER PRIMARY KEY,
+                dirty_desc_count INTEGER NOT NULL DEFAULT 0,
+                synced_desc_count INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (inode) REFERENCES inodes(inode) ON DELETE CASCADE
+            )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Si la tabla existe pero está vacía y hay datos en dentry, recalcular contadores
+        let counters_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dir_counters")
+            .fetch_one(&self.pool)
+            .await?;
+        let dirs_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attrs WHERE is_dir = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        if counters_count == 0 && dirs_count > 0 {
+            tracing::info!("Migrando: recalculando contadores de directorio (dir_counters)...");
+            self.rebuild_all_dir_counters().await?;
+            tracing::info!("Migración de dir_counters completada");
+        }
+
+        // 12. Crear tabla failed_changes (cuarentena de cambios remotos fallidos).
+        // Sin esto, un cambio que falla se pierde en silencio al avanzar el page token.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS failed_changes (
+                file_id TEXT PRIMARY KEY,
+                failures INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT,
+                updated_at INTEGER NOT NULL
+            )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Obtiene la disponibilidad de un archivo ('online_only' o 'local_online')
+    pub async fn get_availability(&self, inode: u64) -> Result<String> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT availability FROM sync_state WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.unwrap_or_else(|| "online_only".to_string()))
+    }
+
+    /// Establece la disponibilidad de un archivo.
+    /// Si `bubble` es true, propaga el cambio de estado hacia los directorios ancestros
+    /// (comportamiento normal en runtime). Si es false, solo escribe el UPDATE sin
+    /// burbujear — útil durante bootstrap masivo donde se invoca rebuild_all_dir_counters al final.
+    pub async fn set_availability(&self, inode: u64, availability: &str, bubble: bool) -> Result<()> {
+        // 1. Obtener estado previo
+        let prev = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+            "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        // OPTIMIZACIÓN CRÍTICA (Cortocircuito):
+        // 1. Si existe el registro y coincide, ahorramos los INSERT/UPDATE.
+        // 2. Si NO existe el registro (ej. primer arranque), el estado por defecto
+        // implícito es 'online_only'. Si nos piden 'online_only', no necesitamos
+        // escribir una fila nueva, ahorrando miles de INSERTS en el primer bootstrap.
+        match prev {
+            Some((Some(ref prev_av), _, _)) if prev_av == availability => {
+                return Ok(());
+            }
+            // Si la DB (sync_state) dice None, tratarlo por defecto como 'online_only'
+            None if availability == "online_only" => {
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let was_synced = prev.as_ref().map(|(av, d, del)| {
+            let is_local_online = av.as_deref().unwrap_or("online_only") == "local_online";
+            let not_dirty = !d.unwrap_or(false);
+            let not_deleted = del.unwrap_or(0) == 0;
+            is_local_online && not_dirty && not_deleted
+        }).unwrap_or(false);
+
+        // 2. Aplicar cambio
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (inode, availability, dirty, version)
+            VALUES (?, ?, 0, 0)
+            ON CONFLICT(inode) DO UPDATE SET availability = excluded.availability
+            "#
+        )
+        .bind(inode as i64)
+        .bind(availability)
+        .execute(&self.pool)
+        .await?;
+
+        // 3. Burbujear solo si se solicitó (runtime normal)
+        if bubble {
+            let is_dir: Option<bool> = sqlx::query_scalar(
+                "SELECT is_dir FROM attrs WHERE inode = ?"
+            )
+            .bind(inode as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if is_dir == Some(false) {
+                let curr = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+                    "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+                )
+                .bind(inode as i64)
+                .fetch_one(&self.pool)
+                .await?;
+
+                let is_synced = {
+                    let is_local_online = curr.0.as_deref().unwrap_or("online_only") == "local_online";
+                    let not_dirty = !curr.1.unwrap_or(false);
+                    let not_deleted = curr.2.unwrap_or(0) == 0;
+                    is_local_online && not_dirty && not_deleted
+                };
+
+                if was_synced && !is_synced {
+                    self.bubble_state_change(inode, 0, -1).await?;
+                } else if !was_synced && is_synced {
+                    self.bubble_state_change(inode, 0, 1).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Obtiene todos los directorios "vivos" para el bootstrapping del Mirror
+    /// Incluye directorios vacíos que de otro modo serían invisibles.
+    /// Retorna: (inode, path_relativo_desde_root)
+    pub async fn get_all_active_dirs(&self) -> Result<Vec<(u64, String)>> {
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            r#"
+            WITH RECURSIVE dir_tree AS (
+                SELECT
+                    d.child_inode,
+                    CASE 
+                        WHEN a.owned_by_me = 0 THEN 'SHARED/' || d.name
+                        ELSE d.name
+                    END as path,
+                    a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                WHERE d.parent_inode = 1
+
+                UNION ALL
+
+                SELECT
+                    d.child_inode,
+                    dt.path || '/' || d.name,
+                    a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                JOIN dir_tree dt ON d.parent_inode = dt.child_inode
+            )
+            SELECT
+                dt.child_inode,
+                dt.path
+            FROM dir_tree dt
+            LEFT JOIN sync_state s ON dt.child_inode = s.inode
+            WHERE dt.is_dir = 1
+              AND (s.deleted_at IS NULL OR s.deleted_at = 0)
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut results: Vec<(u64, String)> = rows.into_iter()
+            .map(|(inode, path)| (inode as u64, path))
+            .collect();
+
+        // Inyectar el directorio virtual SHARED incondicionalmente
+        results.insert(0, (0xFFFF_FFFF_FFFF_FFFE, "SHARED".to_string()));
+
+        Ok(results)
+    }
+
+    /// Obtiene todos los archivos "vivos" para el Bootstrapping
+    /// Retorna: (inode, path_relativo_desde_root, availability)
+    pub async fn get_all_active_files(&self) -> Result<Vec<(u64, String, String)>> {
+        let rows = sqlx::query_as::<_, (i64, String, String)>(
+            r#"
+            WITH RECURSIVE file_tree AS (
+                -- Caso base: archivos en root (parent_inode = 1)
+                SELECT 
+                    d.child_inode, 
+                    CASE 
+                        WHEN a.owned_by_me = 0 THEN 'SHARED/' || d.name
+                        ELSE d.name
+                    END as path, 
+                    a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                WHERE d.parent_inode = 1
+                
+                UNION ALL
+                
+                -- Caso recursivo: hijos de directorios
+                SELECT 
+                    d.child_inode, 
+                    ft.path || '/' || d.name,
+                    a.is_dir
+                FROM dentry d
+                JOIN attrs a ON d.child_inode = a.inode
+                JOIN file_tree ft ON d.parent_inode = ft.child_inode
+            )
+            SELECT 
+                ft.child_inode,
+                ft.path,
+                COALESCE(s.availability, 'online_only') as availability
+            FROM file_tree ft
+            LEFT JOIN sync_state s ON ft.child_inode = s.inode
+            WHERE ft.is_dir = 0 -- Solo archivos
+              AND (s.deleted_at IS NULL OR s.deleted_at = 0) -- No eliminados
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        
+        Ok(rows.into_iter()
+            .map(|(inode, path, availability)| (inode as u64, path, availability))
+            .collect())
+    }
+
+    /// Obtiene el pool de conexiones crudo si es necesario
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+    
+    /// Buscar inodo por directorio padre y nombre (operación lookup)
+    pub async fn lookup(&self, parent: u64, name: &str) -> Result<Option<u64>> {
+        let row = sqlx::query_scalar::<_, i64>(
+            "SELECT child_inode FROM dentry WHERE parent_inode = ? AND name = ?"
+        )
+        .bind(parent as i64)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        Ok(row.map(|i| i as u64))
+    }
+
+    /// Verifica si un inode tiene al menos una entrada en la tabla dentry.
+    pub async fn has_dentry(&self, inode: u64) -> Result<bool> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dentry WHERE child_inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
+    }
+
+    /// Obtener atributos de archivo (operación getattr)
+    pub async fn get_attrs(&self, inode: u64) -> Result<crate::fuse::attr::FileAttributes> {
+        // Caso especial: Root
+        if inode == 1 {
+            let row = sqlx::query_as::<_, crate::fuse::attr::FileAttributes>(
+                "SELECT * FROM attrs WHERE inode = 1"
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+
+            return Ok(row.unwrap_or_else(crate::fuse::attr::FileAttributes::root));
+        }
+
+        let attrs = sqlx::query_as::<_, crate::fuse::attr::FileAttributes>(
+            "SELECT * FROM attrs WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        
+        Ok(attrs)
+    }
+    /// Listar contenido de un directorio con metadatos extendidos (para readdirplus)
+    pub async fn list_children_extended(&self, parent_inode: u64) -> Result<Vec<(u64, String, bool, Option<String>, String)>> {
+        let children = sqlx::query_as::<_, (i64, String, bool, Option<String>, String)>(
+            r#"
+            SELECT 
+                d.child_inode, 
+                d.name, 
+                a.is_dir,
+                a.mime_type,
+                i.gdrive_id
+            FROM dentry d
+            JOIN attrs a ON d.child_inode = a.inode
+            JOIN inodes i ON d.child_inode = i.inode
+            WHERE d.parent_inode = ?
+            ORDER BY d.name
+            "#
+        )
+        .bind(parent_inode as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        
+        Ok(children.into_iter()
+            .map(|(inode, name, is_dir, mime, gdrive_id)| (inode as u64, name, is_dir, mime, gdrive_id))
+            .collect())
+    }
+
+    /// Listar contenido compartido de la raíz (archivos no propios que cuelgan del inode 1)
+    pub async fn list_non_owned_root_children(&self) -> Result<Vec<(u64, String, bool, Option<String>, String)>> {
+        let children = sqlx::query_as::<_, (i64, String, bool, Option<String>, String)>(
+            r#"
+            SELECT 
+                d.child_inode, 
+                d.name, 
+                a.is_dir,
+                a.mime_type,
+                i.gdrive_id
+            FROM dentry d
+            JOIN attrs a ON d.child_inode = a.inode
+            JOIN inodes i ON d.child_inode = i.inode
+            WHERE d.parent_inode = 1 AND a.owned_by_me = 0
+            ORDER BY d.name
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        
+        Ok(children.into_iter()
+            .map(|(inode, name, is_dir, mime, gdrive_id)| (inode as u64, name, is_dir, mime, gdrive_id))
+            .collect())
+    }
+
+    /// Resuelve un path relativo (desde el root del mirror) a su inode
+    pub async fn resolve_relative_path_to_inode(&self, relative_path: &str) -> Result<Option<u64>> {
+        let parts: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
+        
+        let mut current_inode = 1u64; // Root inode
+        
+        // Si el path empieza con "SHARED", saltamos ese segmento virtual
+        // y seguimos resolviendo desde root (inode 1)
+        let parts_to_resolve = if parts.first() == Some(&"SHARED") {
+            &parts[1..]
+        } else {
+            &parts[..]
+        };
+        
+        for part in parts_to_resolve {
+            match self.lookup(current_inode, part).await? {
+                Some(child_inode) => current_inode = child_inode,
+                None => return Ok(None),
+            }
+        }
+        
+        Ok(Some(current_inode))
+    }
+
+    /// Resuelve un inode a su path relativo reconstruyendo la jerarquía
+    pub async fn resolve_inode_to_relative_path(&self, inode: u64) -> Result<Option<String>> {
+        if inode == 1 {
+            return Ok(Some("".to_string()));
+        }
+
+        let mut current_inode = inode;
+        let mut path_parts = Vec::new();
+
+        // Sin detección de ciclos, un dentry corrupto (A->B->A, p. ej. vía un
+        // rename sin validar) cuelga este loop para siempre (una query por
+        // iteración). Tabla finita ⇒ repetir nodo ⟺ ciclo: visited-set basta.
+        let mut visited = std::collections::HashSet::new();
+        while current_inode != 1 {
+            if !visited.insert(current_inode) {
+                tracing::error!(
+                    "Ciclo de dentry detectado resolviendo inode={} (revisitado {})",
+                    inode,
+                    current_inode
+                );
+                return Ok(None);
+            }
+            let row = sqlx::query_as::<_, (i64, String)>(
+                "SELECT parent_inode, name FROM dentry WHERE child_inode = ?"
+            )
+            .bind(current_inode as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some((parent_inode, name)) = row {
+                path_parts.push(name);
+                current_inode = parent_inode as u64;
+            } else {
+                return Ok(None); // Inodo huérfano
+            }
+        }
+
+        path_parts.reverse();
+        Ok(Some(path_parts.join("/")))
+    }
+
+    /// ¿`node` es `ancestor` o descendiente suyo (cadena de padres vía dentry)?
+    /// Termina aunque haya ciclos preexistentes (visited-set). Se usa para
+    /// rechazar en rename los movimientos que CREARÍAN un ciclo.
+    pub async fn is_descendant_or_self(&self, ancestor: u64, node: u64) -> Result<bool> {
+        let mut cur = node;
+        let mut visited = std::collections::HashSet::new();
+        while cur != 1 {
+            if cur == ancestor {
+                return Ok(true);
+            }
+            if !visited.insert(cur) {
+                return Ok(false); // ciclo sin pasar por ancestor: sin veredicto
+            }
+            let parent: Option<i64> =
+                sqlx::query_scalar("SELECT parent_inode FROM dentry WHERE child_inode = ?")
+                    .bind(cur as i64)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            match parent {
+                Some(p) => cur = p as u64,
+                None => return Ok(false),
+            }
+        }
+        Ok(ancestor == 1)
+    }
+
+    /// Listar contenido de un directorio (para readdir simple)
+    pub async fn list_children(&self, parent_inode: u64) -> Result<Vec<(u64, String, bool)>> {
+        let children = sqlx::query_as::<_, (i64, String, bool)>(
+            r#"
+            SELECT d.child_inode, d.name, a.is_dir 
+            FROM dentry d
+            JOIN attrs a ON d.child_inode = a.inode
+            WHERE d.parent_inode = ?
+            ORDER BY d.name
+            "#
+        )
+        .bind(parent_inode as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        
+        Ok(children.into_iter()
+            .map(|(inode, name, is_dir)| (inode as u64, name, is_dir))
+            .collect())
+    }
+
+    /// Cuenta el número de hijos de un directorio (para verificación rápida de paginación)
+    /// Esta operación es O(1) con el índice de parent_inode
+    pub async fn count_children(&self, parent_inode: u64) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dentry WHERE parent_inode = ?"
+        )
+        .bind(parent_inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        
+        Ok(count as u64)
+    }
+
+    /// Cuenta el número de hijos de un directorio que NO son propiedad del usuario
+    /// y que están en el root (usado para la carpeta compartida virtual)
+    pub async fn count_non_owned_root_children(&self) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) 
+            FROM dentry d
+            JOIN attrs a ON d.child_inode = a.inode
+            WHERE d.parent_inode = 1 AND a.owned_by_me = 0
+            "#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        
+        Ok(count as u64)
+    }
+
+    /// Verifica si la tabla de inodos está vacía (excepto el root si existe)
+    pub async fn is_empty(&self) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inodes")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count <= 1) // 1 si solo existe el root, 0 si está totalmente vacía
+    }
+
+    /// Obtiene o desarrolla un inodo para un gdrive_id dado
+    pub async fn get_or_create_inode(&self, gdrive_id: &str) -> Result<u64> {
+        // Intentar obtener existente
+        let existing = sqlx::query_scalar::<_, i64>("SELECT inode FROM inodes WHERE gdrive_id = ?")
+            .bind(gdrive_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        if let Some(inode) = existing {
+            return Ok(inode as u64);
+        }
+
+        // Crear nuevo
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let insert_result = sqlx::query("INSERT INTO inodes (gdrive_id, created_at) VALUES (?, ?)")
+            .bind(gdrive_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await;
+
+        match insert_result {
+            Ok(result) => Ok(result.last_insert_rowid() as u64),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                // Si hubo una colisión durante la inserción simultánea, simplemente lo leemos
+                let existing = sqlx::query_scalar::<_, i64>("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                    .bind(gdrive_id)
+                    .fetch_one(&self.pool)
+                    .await?;
+                Ok(existing as u64)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Obtiene o crea inodos para una lista de gdrive_ids de forma masiva
+    pub async fn get_or_create_inodes_bulk(&self, gdrive_ids: &[String]) -> Result<std::collections::HashMap<String, u64>> {
+        if gdrive_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut results = std::collections::HashMap::new();
+
+        for batch in gdrive_ids.chunks(500) {
+            let mut tx = self.pool.begin().await?;
+
+            for id in batch {
+                // Intentar obtener existente
+                let existing: Option<i64> = sqlx::query_scalar("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+
+                if let Some(inode) = existing {
+                    results.insert(id.clone(), inode as u64);
+                    continue;
+                }
+
+                // Crear nuevo
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs() as i64;
+
+                let insert_result = sqlx::query("INSERT INTO inodes (gdrive_id, created_at) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await;
+
+                match insert_result {
+                    Ok(res) => {
+                        results.insert(id.clone(), res.last_insert_rowid() as u64);
+                    }
+                    Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                        let inode: i64 = sqlx::query_scalar("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                            .bind(id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                        results.insert(id.clone(), inode as u64);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            tx.commit().await?;
+        }
+
+        Ok(results)
+    }
+
+    /// Inserta o actualiza metadatos de un archivo
+    pub async fn upsert_file_metadata(
+        &self,
+        inode: u64,
+        size: i64,
+        mtime: i64,
+        mode: u32,
+        is_dir: bool,
+        mime_type: Option<&str>,
+        can_move: bool,
+        shared: bool,
+        owned_by_me: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO attrs (inode, size, mtime, ctime, mode, is_dir, mime_type, can_move, shared, owned_by_me)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(inode) DO UPDATE SET
+                size = excluded.size,
+                mtime = excluded.mtime,
+                mode = excluded.mode,
+                is_dir = excluded.is_dir,
+                mime_type = excluded.mime_type,
+                can_move = excluded.can_move,
+                shared = excluded.shared,
+                owned_by_me = excluded.owned_by_me
+            "#
+        )
+        .bind(inode as i64)
+        .bind(size)
+        .bind(mtime)
+        .bind(mtime) // Usamos mtime como ctime por simplicidad inicial
+        .bind(mode as i32)
+        .bind(is_dir)
+        .bind(mime_type)
+        .bind(can_move)
+        .bind(shared)
+        .bind(owned_by_me)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Actualiza específicamente el campo de propiedad (para correcciones masivas)
+    pub async fn update_ownership(&self, inode: u64, owned_by_me: bool) -> Result<()> {
+        sqlx::query("UPDATE attrs SET owned_by_me = ? WHERE inode = ?")
+            .bind(owned_by_me)
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Actualiza la propiedad de múltiples archivos en una sola transacción
+    pub async fn update_bulk_ownership(&self, items: &[(u64, bool)]) -> Result<()> {
+        if items.is_empty() { return Ok(()); }
+        let mut tx = self.pool.begin().await?;
+        for (inode, owned) in items {
+            sqlx::query("UPDATE attrs SET owned_by_me = ? WHERE inode = ?")
+                .bind(owned)
+                .bind(*inode as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Inserta o actualiza metadatos de múltiples archivos en una sola transacción
+    pub async fn upsert_bulk_file_metadata(&self, items: &[BulkFileMetadata]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        for item in items {
+            sqlx::query(
+                r#"
+                INSERT INTO attrs (inode, size, mtime, ctime, mode, is_dir, mime_type, can_move, shared, owned_by_me)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(inode) DO UPDATE SET
+                    size = excluded.size,
+                    mtime = excluded.mtime,
+                    mode = excluded.mode,
+                    is_dir = excluded.is_dir,
+                    mime_type = excluded.mime_type,
+                    can_move = excluded.can_move,
+                    shared = excluded.shared,
+                    owned_by_me = excluded.owned_by_me
+                "#
+            )
+            .bind(item.inode as i64)
+            .bind(item.size)
+            .bind(item.mtime)
+            .bind(item.mtime)
+            .bind(item.mode as i32)
+            .bind(item.is_dir)
+            .bind(item.mime_type.as_deref())
+            .bind(item.can_move)
+            .bind(item.shared)
+            .bind(item.owned_by_me)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Inserta o actualiza una entrada de directorio
+    /// IMPORTANTE: Un archivo solo puede tener UN parent. Antes de insertar,
+    /// eliminamos cualquier dentry existente para este child_inode.
+    pub async fn upsert_dentry(&self, parent_inode: u64, child_inode: u64, name: &str) -> Result<()> {
+        // Misma clase de fallo que los borrados: tx DEFERRED multi-sentencia
+        // bajo escritura concurrente → BUSY; reintentar y converger.
+        retry_on_busy(|| async {
+        // Transacción + orden invertido (INSERT primero, DELETE del enlace viejo
+        // después). Con DELETE-primero, la ventana exponía el nombre como
+        // inexistente a lectores concurrentes (→ inodos duplicados/huérfanos
+        // que luego suben como `file_N` a la raíz) y un crash dejaba huérfano
+        // permanente. Con INSERT-primero, lo peor visible es el enlace viejo
+        // aún resolviendo (stale pero válido), y la tx lo hace atómico.
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Insertar el nuevo dentry (roba el nombre si estaba ocupado)
+        sqlx::query(
+            r#"
+            INSERT INTO dentry (parent_inode, child_inode, name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(parent_inode, name) DO UPDATE SET
+                child_inode = excluded.child_inode
+            "#
+        )
+        .bind(parent_inode as i64)
+        .bind(child_inode as i64)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+
+        // 2. Eliminar cualquier dentry anterior para este child_inode
+        //    (un archivo solo puede estar en un directorio a la vez),
+        //    excepto el que acabamos de escribir.
+        sqlx::query("DELETE FROM dentry WHERE child_inode = ? AND NOT (parent_inode = ? AND name = ?)")
+            .bind(child_inode as i64)
+            .bind(parent_inode as i64)
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+        }).await
+    }
+
+    // ============================================================
+    // Métodos para Sync Meta (persistencia de page tokens)
+    // ============================================================
+
+    /// Guarda o actualiza un valor en sync_meta
+    pub async fn set_sync_meta(&self, key: &str, value: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        sqlx::query(
+            r#"
+            INSERT INTO sync_meta (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            "#
+        )
+        .bind(key)
+        .bind(value)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Inserta o actualiza múltiples entradas de directorio en una sola transacción
+    pub async fn upsert_bulk_dentries(&self, items: &[BulkDentry]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        for item in items {
+            // 1. Insertar el nuevo dentry (mismo orden invertido que upsert_dentry:
+            //    el nombre nuevo nunca queda inexistente a mitad de escritura)
+            sqlx::query(
+                r#"
+                INSERT INTO dentry (parent_inode, child_inode, name)
+                VALUES (?, ?, ?)
+                ON CONFLICT(parent_inode, name) DO UPDATE SET
+                    child_inode = excluded.child_inode
+                "#
+            )
+            .bind(item.parent_inode as i64)
+            .bind(item.child_inode as i64)
+            .bind(&item.name)
+            .execute(&mut *tx)
+            .await?;
+
+            // 2. Eliminar cualquier dentry anterior para este child_inode,
+            //    excepto el recién escrito.
+            sqlx::query("DELETE FROM dentry WHERE child_inode = ? AND NOT (parent_inode = ? AND name = ?)")
+                .bind(item.child_inode as i64)
+                .bind(item.parent_inode as i64)
+                .bind(&item.name)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Obtiene un valor de sync_meta
+    pub async fn get_sync_meta(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM sync_meta WHERE key = ?"
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    /// Elimina una clave de sync_meta
+    pub async fn delete_sync_meta(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sync_meta WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Verifica si existen chunks cacheados para un inodo
+    pub async fn has_any_chunks(&self, inode: u64) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM file_cache_chunks WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count > 0)
+    }
+
+    // ============================================================
+    // Métodos para Conflict Detection (Remote MD5 Tracking)
+    // ============================================================
+
+    /// Obtiene el MD5 remoto conocido para un archivo
+    pub async fn get_remote_md5(&self, inode: u64) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT remote_md5 FROM sync_state WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    /// Actualiza el MD5 remoto conocido para un archivo
+    pub async fn set_remote_md5(&self, inode: u64, md5: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (inode, dirty, version, remote_md5)
+            VALUES (?, 0, 0, ?)
+            ON CONFLICT(inode) DO UPDATE SET remote_md5 = excluded.remote_md5
+            "#
+        )
+        .bind(inode as i64)
+        .bind(md5)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // ============================================================
+    // Protocolo "Burbujeo de Estados" — Contadores pre-calculados
+    // ============================================================
+
+    /// Burbujea un cambio de estado desde un archivo hacia todos sus directorios ancestros.
+    /// `delta_dirty` y `delta_synced` son incrementos (pueden ser negativos).
+    /// Ejemplo: archivo pasa de synced→dirty → delta_dirty=+1, delta_synced=-1
+    pub async fn bubble_state_change(
+        &self,
+        child_inode: u64,
+        delta_dirty: i32,
+        delta_synced: i32,
+    ) -> Result<()> {
+        if delta_dirty == 0 && delta_synced == 0 {
+            return Ok(());
+        }
+
+        sqlx::query(BUBBLE_UPDATE_SQL)
+        .bind(child_inode as i64)
+        .bind(delta_dirty)
+        .bind(delta_synced)
+        .execute(&self.pool)
+        .await?;
+
+        // NOTA: no hace falta un UPDATE separado para root (inode 1): la CTE
+        // de arriba ya lo incluye (la condición `> 1` solo detiene más
+        // recursión, no excluye la fila que vale 1). Un segundo UPDATE aquí
+        // contaba la raíz DOS veces (bug de doble-burbujeo).
+
+        Ok(())
+    }
+
+    /// Inicializa una fila en dir_counters para un directorio si no existe.
+    pub async fn ensure_dir_counter(&self, inode: u64) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO dir_counters (inode, dirty_desc_count, synced_desc_count) VALUES (?, 0, 0)"
+        )
+        .bind(inode as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Marca un inode como dirty y burbujea el cambio a sus ancestros.
+    /// Detecta automáticamente el estado previo para calcular el delta correcto.
+    /// Solo burbujea para archivos (is_dir=0).
+    pub async fn set_dirty_and_bubble(&self, inode: u64) -> Result<()> {
+        // Obtener estado previo y si es directorio
+        let prev = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+            "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let was_dirty = prev.as_ref().map(|(_, d, del)| {
+            d.unwrap_or(false) || del.map(|v| v > 0).unwrap_or(false)
+        }).unwrap_or(false);
+
+        let was_synced = prev.as_ref().map(|(av, d, del)| {
+            let is_local_online = av.as_deref().unwrap_or("online_only") == "local_online";
+            let not_dirty = !d.unwrap_or(false);
+            let not_deleted = del.unwrap_or(0) == 0;
+            is_local_online && not_dirty && not_deleted
+        }).unwrap_or(false);
+
+        // Marcar como dirty
+        sqlx::query(
+            "INSERT INTO sync_state (inode, dirty, version, md5_checksum) VALUES (?, 1, 0, NULL) ON CONFLICT(inode) DO UPDATE SET dirty = 1"
+        )
+        .bind(inode as i64)
+        .execute(&self.pool)
+        .await?;
+
+        // Solo burbujear para archivos
+        let is_dir: Option<bool> = sqlx::query_scalar(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if is_dir == Some(false) {
+            // El archivo ahora es dirty seguro
+            if was_dirty {
+                // Ya era dirty, no hay cambio en contadores
+            } else if was_synced {
+                // Era synced, ahora es dirty
+                self.bubble_state_change(inode, 1, -1).await?;
+            } else {
+                // Archivo no era dirty ni synced (ej: online_only), ahora es dirty
+                self.bubble_state_change(inode, 1, 0).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Limpia el flag dirty y burbujea el cambio a los ancestros.
+    /// Solo burbujea para archivos (is_dir=0).
+    pub async fn clear_dirty_and_bubble(&self, inode: u64) -> Result<()> {
+        // Verificar estado previo
+        let prev = sqlx::query_as::<_, (Option<String>, bool, Option<i64>)>(
+            "SELECT availability, dirty, deleted_at FROM sync_state WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let was_dirty = prev.as_ref().map(|(_, d, del)| {
+            *d || del.map(|v| v > 0).unwrap_or(false)
+        }).unwrap_or(false);
+
+        let was_synced = prev.as_ref().map(|(av, d, del)| {
+            let is_local_online = av.as_deref().unwrap_or("online_only") == "local_online";
+            let not_dirty = !d;
+            let not_deleted = del.unwrap_or(0) == 0;
+            is_local_online && not_dirty && not_deleted
+        }).unwrap_or(false);
+
+        // Limpiar dirty
+        sqlx::query("UPDATE sync_state SET dirty = 0 WHERE inode = ?")
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        // Solo burbujear para archivos
+        let is_dir: Option<bool> = sqlx::query_scalar(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if is_dir == Some(false) {
+            let curr = sqlx::query_as::<_, (Option<String>, bool, Option<i64>)>(
+                "SELECT availability, dirty, deleted_at FROM sync_state WHERE inode = ?"
+            )
+            .bind(inode as i64)
+            .fetch_one(&self.pool)
+            .await?;
+
+            let is_dirty = curr.1 || curr.2.unwrap_or(0) > 0;
+            let is_synced = {
+                let is_local_online = curr.0.as_deref().unwrap_or("online_only") == "local_online";
+                let not_dirty = !curr.1;
+                let not_deleted = curr.2.unwrap_or(0) == 0;
+                is_local_online && not_dirty && not_deleted
+            };
+
+            let delta_dirty = if was_dirty && !is_dirty { -1 } else if !was_dirty && is_dirty { 1 } else { 0 };
+            let delta_synced = if was_synced && !is_synced { -1 } else if !was_synced && is_synced { 1 } else { 0 };
+
+            if delta_dirty != 0 || delta_synced != 0 {
+                self.bubble_state_change(inode, delta_dirty, delta_synced).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Limpia entradas dirty-delete que quedaron pendientes de sesiones anteriores.
+    /// Esto previene que el uploader envíe a papelera archivos que no fueron
+    /// realmente eliminados por el usuario (e.g., limpieza de huérfanos del mirror).
+    pub async fn clear_stale_dirty_deletes(&self) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE sync_state SET dirty = 0, deleted_at = NULL WHERE dirty = 1 AND deleted_at IS NOT NULL"
+        )
+        .execute(&self.pool)
+        .await?;
+        let count = result.rows_affected() as usize;
+        if count > 0 {
+            tracing::info!("🧹 Limpiadas {} entradas dirty-delete stale de sesión anterior", count);
+        }
+        Ok(count)
+    }
+
+    /// Recalcula todos los contadores de directorio desde cero.
+    /// Optimizado: Calcula de abajo hacia arriba (bottom-up) para evitar subconsultas recursivas lentas.
+    pub async fn rebuild_all_dir_counters(&self) -> Result<()> {
+        tracing::info!("Iniciando rebuild de contadores de directorio (optimizado)...");
+
+        // Fase 1 (TX corta): Limpiar tabla y rellenar con contadores a 0
+        {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM dir_counters").execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO dir_counters (inode, dirty_desc_count, synced_desc_count) SELECT inode, 0, 0 FROM attrs WHERE is_dir = 1"
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+
+        // Fase 2 (solo lectura, sin TX de escritura): Obtener datos para cálculo en memoria
+        let dentry_rows: Vec<(i64, i64)> = sqlx::query_as("SELECT parent_inode, child_inode FROM dentry")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let file_states: Vec<(i64, bool, bool)> = sqlx::query_as(
+            r#"
+            SELECT
+                a.inode,
+                (s.dirty = 1 OR (s.deleted_at IS NOT NULL AND s.deleted_at > 0)) as is_dirty,
+                (COALESCE(s.availability, 'online_only') = 'local_online' AND COALESCE(s.dirty, 0) = 0 AND (s.deleted_at IS NULL OR s.deleted_at = 0)) as is_synced
+            FROM attrs a
+            LEFT JOIN sync_state s ON a.inode = s.inode
+            WHERE a.is_dir = 0
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Fase 3 (cálculo en memoria, sin DB): Construir contadores
+        let mut child_to_parent = std::collections::HashMap::new();
+        for (parent, child) in dentry_rows {
+            child_to_parent.insert(child, parent);
+        }
+
+        let mut dirty_counts = std::collections::HashMap::new();
+        let mut synced_counts = std::collections::HashMap::new();
+
+        for (inode, is_dirty, is_synced) in file_states {
+            if !is_dirty && !is_synced { continue; }
+
+            let mut curr = inode;
+            let mut seen = std::collections::HashSet::new();
+            while let Some(&parent) = child_to_parent.get(&curr) {
+                if !seen.insert(curr) {
+                    // Ciclo preexistente: cortar (contadores parciales para este
+                    // archivo) en vez de girar al 100% CPU para siempre.
+                    tracing::debug!("rebuild: ciclo de dentry bajo inode={}", inode);
+                    break;
+                }
+                if is_dirty {
+                    *dirty_counts.entry(parent).or_insert(0) += 1;
+                }
+                if is_synced {
+                    *synced_counts.entry(parent).or_insert(0) += 1;
+                }
+                if parent == 1 { break; }
+                curr = parent;
+            }
+        }
+
+        // Fase 4 (escritura en batches): Volcar resultados a la DB
+        let all_updates: Vec<(i64, i64, i64)> = {
+            let mut updates = std::collections::HashMap::new();
+            for (inode, count) in dirty_counts {
+                updates.entry(inode).or_insert((0i64, 0i64)).0 = count;
+            }
+            for (inode, count) in synced_counts {
+                updates.entry(inode).or_insert((0i64, 0i64)).1 = count;
+            }
+            updates.into_iter().map(|(inode, (d, s))| (inode, d, s)).collect()
+        };
+
+        for batch in all_updates.chunks(500) {
+            let mut tx = self.pool.begin().await?;
+            for &(inode, dirty, synced) in batch {
+                sqlx::query("UPDATE dir_counters SET dirty_desc_count = ?, synced_desc_count = ? WHERE inode = ?")
+                    .bind(dirty)
+                    .bind(synced)
+                    .bind(inode)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
+
+        tracing::info!("Contadores de directorio recalculados (operación optimizada)");
+        Ok(())
+    }
+
+    /// Verifica si un inode tiene cambios locales pendientes de subir
+    pub async fn is_dirty(&self, inode: u64) -> Result<bool> {
+        let dirty = sqlx::query_scalar::<_, bool>(
+            "SELECT dirty FROM sync_state WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
+
+        Ok(dirty)
+    }
+
+    /// Calcula el estado de sincronización agregado de todos los archivos
+    /// descendientes de un directorio, de forma recursiva via CTE.
+    /// Retorna (has_local_only, has_synced, total_files).
+    pub async fn get_directory_aggregate_status(&self, parent_inode: u64) -> Result<(bool, bool, i64)> {
+        // O(1): lectura directa de contadores pre-calculados
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT dirty_desc_count, synced_desc_count FROM dir_counters WHERE inode = ?"
+        )
+        .bind(parent_inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some((dirty, synced)) => {
+                let total = dirty + synced;
+                Ok((dirty > 0, synced > 0, total))
+            }
+            None => Ok((false, false, 0)),
+        }
+    }
+
+    /// Estado agregado para la carpeta virtual SHARED.
+    /// Usa contadores pre-calculados con SHARED_INODE como clave.
+    pub async fn get_shared_directory_aggregate_status(&self) -> Result<(bool, bool, i64)> {
+        // SHARED_INODE = 0xFFFFFFFFFFFFFFFE
+        let shared_inode = 0xFFFFFFFFFFFFFFFEu64;
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT dirty_desc_count, synced_desc_count FROM dir_counters WHERE inode = ?"
+        )
+        .bind(shared_inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some((dirty, synced)) => {
+                let total = dirty + synced;
+                Ok((dirty > 0, synced > 0, total))
+            }
+            None => Ok((false, false, 0)),
+        }
+    }
+
+    // ============================================================
+    // Métodos para Soft Delete (Tombstones)
+    // ============================================================
+
+    /// Obtiene el inode asociado a un gdrive_id
+    pub async fn get_inode_by_gdrive_id(&self, gdrive_id: &str) -> Result<Option<u64>> {
+        let row = sqlx::query_scalar::<_, i64>(
+            "SELECT inode FROM inodes WHERE gdrive_id = ?"
+        )
+        .bind(gdrive_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|i| i as u64))
+    }
+
+    /// Marca un archivo o directorio y todo su contenido (recursivamente) como eliminado.
+    /// Atómico (una transacción): o se aplica completo o nada.
+    /// Idempotente: repetir sobre un subárbol ya borrado retorna true sin cambios.
+    pub async fn soft_delete_by_gdrive_id(&self, gdrive_id: &str) -> Result<bool> {
+        // Reintento ante BUSY: dos borrados concurrentes se serializan.
+        retry_on_busy(|| async {
+        let mut tx = self.pool.begin().await?;
+        let (did, _) = Self::soft_delete_tree_tx(&mut tx, gdrive_id).await?;
+        tx.commit().await?;
+        Ok(did)
+        }).await
+    }
+
+    /// Núcleo transaccional del soft delete. Corre sobre tx abierta (sin commit:
+    /// el llamador puede añadir writes atómicos). Retorna (aplicó_algo, root_inode).
+    async fn soft_delete_tree_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        gdrive_id: &str,
+    ) -> Result<(bool, Option<u64>)> {
+        // Reborrow como conexión: el `&mut Transaction` prestado no satisface
+        // `Executor` en `.execute()/.fetch_*()`; `&mut Connection` sí.
+        let tx: &mut sqlx::SqliteConnection = &mut **tx;
+        let root_inode: Option<u64> =
+            sqlx::query_scalar("SELECT inode FROM inodes WHERE gdrive_id = ?")
+                .bind(gdrive_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|i: i64| i as u64);
+        let root_inode = match root_inode {
+            Some(i) => i,
+            None => return Ok((false, None)),
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        // 0. Burbujeo: contar archivos descendientes que estaban synced (no dirty)
+        // antes de marcarlos como dirty. Estos son los que cambian de estado.
+        let synced_becoming_dirty: i64 = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            SELECT COUNT(*) FROM subordinates sub
+            JOIN attrs a ON sub.child_inode = a.inode
+            LEFT JOIN sync_state ss ON sub.child_inode = ss.inode
+            WHERE a.is_dir = 0
+              AND (COALESCE(ss.availability, 'online_only') = 'local_online')
+              AND (COALESCE(ss.dirty, 0) = 0)
+              AND (ss.deleted_at IS NULL OR ss.deleted_at = 0)
+            "#
+        )
+        .bind(root_inode as i64)
+        .fetch_one(&mut *tx)
+        .await?;
+
+
+
+        // Archivos nuevos sin sync_state
+        let new_files: i64 = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            SELECT COUNT(*) FROM subordinates sub
+            JOIN attrs a ON sub.child_inode = a.inode
+            WHERE a.is_dir = 0
+              AND sub.child_inode NOT IN (SELECT inode FROM sync_state)
+            "#
+        )
+        .bind(root_inode as i64)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // 1. Identificar recursivamente todos los inodos hijos (incluyendo el raíz)
+        let sql_deleted_dentries = r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode, parent_inode, name FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode, d.parent_inode, d.name
+                FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            INSERT OR REPLACE INTO dentry_deleted (parent_inode, child_inode, name, deleted_at)
+            SELECT parent_inode, child_inode, name, ? FROM subordinates
+        "#;
+
+        sqlx::query(sql_deleted_dentries)
+            .bind(root_inode as i64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+        // 2. Marcar sync_state para todos los inodos afectados
+        let sql_update_sync = r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode
+                FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            UPDATE sync_state
+            SET deleted_at = ?, dirty = 1
+            WHERE inode IN (SELECT child_inode FROM subordinates)
+        "#;
+
+        sqlx::query(sql_update_sync)
+            .bind(root_inode as i64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+        // Insertar los que falten
+        let sql_insert_sync = r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode
+                FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            INSERT INTO sync_state (inode, dirty, version, deleted_at)
+            SELECT child_inode, 1, 0, ?
+            FROM subordinates
+            WHERE child_inode NOT IN (SELECT inode FROM sync_state)
+        "#;
+
+        sqlx::query(sql_insert_sync)
+            .bind(root_inode as i64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+        // 2.5. Burbujear el cambio de estado ANTES de eliminar dentries
+        // (bubble_state_change necesita las dentries para caminar hacia los ancestros)
+        let delta_dirty = synced_becoming_dirty + new_files; // Nuevos dirty
+        let delta_synced = -synced_becoming_dirty; // Dejaron de ser synced
+        if delta_dirty != 0 || delta_synced != 0 {
+            sqlx::query(BUBBLE_UPDATE_SQL)
+                .bind(root_inode as i64)
+                .bind(delta_dirty as i32)
+                .bind(delta_synced as i32)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // 3. Limpiar dentry original para todos los inodos afectados
+        // IMPORTANTE: Esto debe ser lo ÚLTIMO porque las CTEs anteriores dependen de dentry.
+        let sql_cleanup_dentry = r#"
+            WITH RECURSIVE subordinates AS (
+                SELECT child_inode FROM dentry WHERE child_inode = ?
+                UNION ALL
+                SELECT d.child_inode
+                FROM dentry d
+                JOIN subordinates s ON d.parent_inode = s.child_inode
+            )
+            DELETE FROM dentry WHERE child_inode IN (SELECT child_inode FROM subordinates)
+        "#;
+
+        sqlx::query(sql_cleanup_dentry)
+            .bind(root_inode as i64)
+            .execute(&mut *tx)
+            .await?;
+
+        tracing::info!("Recursive soft delete applied for gdrive_id={}, root_inode={}", gdrive_id, root_inode);
+        Ok((true, Some(root_inode)))
+    }
+
+    /// Soft delete para eliminaciones REMOTAS (no marca dirty).
+    /// La eliminación ya ocurrió en GDrive y no necesita re-subirse.
+    /// Atómico junto al soft delete interno: o converge completo o nada.
+    pub async fn soft_delete_remote(&self, gdrive_id: &str) -> Result<bool> {
+        retry_on_busy(|| async {
+        let mut tx = self.pool.begin().await?;
+        let (result, inode) = Self::soft_delete_tree_tx(&mut tx, gdrive_id).await?;
+        if result {
+            if let Some(root_inode) = inode {
+                // Limpiar dirty para este inode y todos sus descendientes
+                // (ya fueron movidos a dentry_deleted por soft_delete_by_gdrive_id)
+                sqlx::query(r#"
+                    WITH RECURSIVE subordinates AS (
+                        SELECT child_inode FROM dentry_deleted WHERE child_inode = ?
+                        UNION ALL
+                        SELECT d.child_inode FROM dentry_deleted d
+                        JOIN subordinates s ON d.parent_inode = s.child_inode
+                    )
+                    UPDATE sync_state SET dirty = 0
+                    WHERE inode IN (SELECT child_inode FROM subordinates)
+                      AND deleted_at IS NOT NULL
+                "#)
+                .bind(root_inode as i64)
+                .execute(&mut *tx)
+                .await?;
+
+                tracing::debug!("Remote soft delete: dirty cleared for gdrive_id={}", gdrive_id);
+            }
+        }
+        tx.commit().await?;
+        Ok(result)
+        }).await
+    }
+
+    /// Restaura un archivo eliminado (quita tombstone)
+    /// Mueve el dentry de vuelta, elimina deleted_at
+    pub async fn restore_by_gdrive_id(&self, gdrive_id: &str) -> Result<bool> {
+        let inode = match self.get_inode_by_gdrive_id(gdrive_id).await? {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+
+        // Estado previo
+        let prev = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+            "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let was_dirty = prev.as_ref().map(|(_, d, del)| {
+            d.unwrap_or(false) || del.map(|v| v > 0).unwrap_or(false)
+        }).unwrap_or(false);
+
+        let was_synced = prev.as_ref().map(|(av, d, del)| {
+            let is_local_online = av.as_deref().unwrap_or("online_only") == "local_online";
+            let not_dirty = !d.unwrap_or(false);
+            let not_deleted = del.unwrap_or(0) == 0;
+            is_local_online && not_dirty && not_deleted
+        }).unwrap_or(false);
+
+        // 1. Restaurar dentry desde dentry_deleted
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO dentry (parent_inode, child_inode, name)
+            SELECT parent_inode, child_inode, name
+            FROM dentry_deleted WHERE child_inode = ?
+            "#
+        )
+        .bind(inode as i64)
+        .execute(&self.pool)
+        .await?;
+
+        // 2. Eliminar de dentry_deleted
+        sqlx::query("DELETE FROM dentry_deleted WHERE child_inode = ?")
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        // 3. Limpiar deleted_at en sync_state
+        sqlx::query("UPDATE sync_state SET deleted_at = NULL WHERE inode = ?")
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        // 4. Burbujear
+        let is_dir: Option<bool> = sqlx::query_scalar(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if is_dir == Some(false) {
+            let curr = sqlx::query_as::<_, (Option<String>, Option<bool>, Option<i64>)>(
+                "SELECT s.availability, s.dirty, s.deleted_at FROM sync_state s WHERE s.inode = ?"
+            )
+            .bind(inode as i64)
+            .fetch_one(&self.pool)
+            .await?;
+
+            let is_dirty = curr.1.unwrap_or(false) || curr.2.unwrap_or(0) > 0;
+            let is_synced = {
+                let is_local_online = curr.0.as_deref().unwrap_or("online_only") == "local_online";
+                let not_dirty = !curr.1.unwrap_or(false);
+                let not_deleted = curr.2.unwrap_or(0) == 0;
+                is_local_online && not_dirty && not_deleted
+            };
+
+            let delta_dirty = if was_dirty && !is_dirty { -1 } else if !was_dirty && is_dirty { 1 } else { 0 };
+            let delta_synced = if was_synced && !is_synced { -1 } else if !was_synced && is_synced { 1 } else { 0 };
+
+            if delta_dirty != 0 || delta_synced != 0 {
+                self.bubble_state_change(inode, delta_dirty, delta_synced).await?;
+            }
+        } else if is_dir == Some(true) {
+            // Restaurar directorio: asegurar que tiene fila en dir_counters
+            self.ensure_dir_counter(inode).await?;
+        }
+
+        tracing::debug!("Archivo restaurado: gdrive_id={}, inode={}", gdrive_id, inode);
+        Ok(true)
+    }
+
+    /// Verifica si un gdrive_id tiene un tombstone activo
+    pub async fn has_tombstone(&self, gdrive_id: &str) -> Result<bool> {
+        let inode = match self.get_inode_by_gdrive_id(gdrive_id).await? {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dentry_deleted WHERE child_inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count > 0)
+    }
+
+    /// Registra un fallo al aplicar un cambio remoto en la cuarentena.
+    /// Retorna el conteo acumulado de fallos para ese `file_id`.
+    /// Un éxito posterior debe llamar a `clear_change_failure`.
+    pub async fn record_change_failure(&self, file_id: &str, err: &str) -> Result<i64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        sqlx::query(
+            r#"
+            INSERT INTO failed_changes (file_id, failures, last_error, updated_at)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+                failures = failures + 1,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            "#
+        )
+        .bind(file_id)
+        .bind(err)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        let failures: i64 = sqlx::query_scalar("SELECT failures FROM failed_changes WHERE file_id = ?")
+            .bind(file_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(failures)
+    }
+
+    /// Limpia la cuarentena de un cambio que volvió a aplicarse con éxito.
+    pub async fn clear_change_failure(&self, file_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM failed_changes WHERE file_id = ?")
+            .bind(file_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Hard delete: elimina permanentemente registros con deleted_at > grace_period
+    /// Retorna el número de registros eliminados
+    pub async fn purge_expired_tombstones(&self, grace_days: i64) -> Result<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        
+        let cutoff = now - (grace_days * 24 * 60 * 60);
+
+        // Obtener inodos a purgar
+        let inodes_to_purge: Vec<i64> = sqlx::query_scalar(
+            "SELECT child_inode FROM dentry_deleted WHERE deleted_at < ?"
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if inodes_to_purge.is_empty() {
+            return Ok(0);
+        }
+
+        let mut purged = 0u64;
+        for inode in &inodes_to_purge {
+            match self.hard_delete_inode(*inode as u64).await {
+                Ok(()) => purged += 1,
+                // Un item patológico (p.ej. tombstone de root, rechazado por
+                // el guard) no debe bloquear la purga del resto: se registra
+                // y se sigue. Sin esto, un solo tombstone malo atasca la
+                // purga entera en cada ciclo para siempre.
+                Err(e) => tracing::error!("No se pudo purgar tombstone inode={}: {:?}", inode, e),
+            }
+        }
+
+        tracing::info!("Purgados {} tombstones expirados (grace_days={})", purged, grace_days);
+        Ok(purged)
+    }
+
+    /// Elimina permanentemente un inode y todos sus registros asociados
+    /// Núcleo transaccional del hard delete. Corre sobre tx abierta por el
+    /// llamador (todo o nada: sin filas a medias ante crash o concurrencia).
+    async fn hard_delete_inode_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        inode: u64,
+    ) -> Result<()> {
+        // Ver nota en soft_delete_tree_tx: rebajar a conexión para Executor.
+        let tx: &mut sqlx::SqliteConnection = &mut **tx;
+        let inode_i64 = inode as i64;
+
+        // Burbujear: decrementar contadores de ancestros según estado previo del archivo
+        // (solo para archivos, no directorios — los directorios eliminados ya tuvieron
+        // sus descendientes procesados en soft_delete)
+        let is_dir: Option<bool> = sqlx::query_scalar(
+            "SELECT is_dir FROM attrs WHERE inode = ?"
+        )
+        .bind(inode_i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if is_dir == Some(false) {
+            // Verificar estado actual del archivo para calcular delta
+            let state = sqlx::query_as::<_, (Option<bool>, Option<i64>)>(
+                "SELECT dirty, deleted_at FROM sync_state WHERE inode = ?"
+            )
+            .bind(inode_i64)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some((dirty, deleted_at)) = state {
+                let was_dirty = dirty.unwrap_or(false) || deleted_at.map(|v| v > 0).unwrap_or(false);
+                let (dd, ds) = if was_dirty { (-1, 0) } else { (0, -1) };
+                sqlx::query(BUBBLE_UPDATE_SQL)
+                    .bind(inode_i64)
+                    .bind(dd)
+                    .bind(ds)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        // Eliminar de todas las tablas relacionadas
+        for sql in [
+            "DELETE FROM dentry WHERE child_inode = ?",
+            "DELETE FROM dentry_deleted WHERE child_inode = ?",
+            "DELETE FROM sync_state WHERE inode = ?",
+            "DELETE FROM attrs WHERE inode = ?",
+            "DELETE FROM file_cache_chunks WHERE inode = ?",
+            // Limpiar dir_counters si era directorio
+            "DELETE FROM dir_counters WHERE inode = ?",
+            "DELETE FROM inodes WHERE inode = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(inode_i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tracing::debug!("Hard delete completado para inode={}", inode);
+        Ok(())
+    }
+
+    /// Hard delete de un subárbol completo (hojas primero, misma tx).
+    /// Sin esto, borrar un directorio con hijos con edges vivos fallaba con
+    /// FK constraint (las tablas viejas no tienen ON DELETE CASCADE) y el
+    /// cambio entraba en loop de cuarentena sin converger jamás.
+    /// UNION (no UNION ALL): dentry puede contener ciclos y la recolección
+    /// debe terminar igual; los re-alcances son no-ops idempotentes.
+    async fn hard_delete_subtree_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        root_inode: u64,
+    ) -> Result<()> {
+        // Guardia raíz: borrar el 1 por este camino vaciaría el árbol entero.
+        // Falla ruidoso en vez de wipe silencioso (Drive nunca emite eso).
+        if root_inode == 1 {
+            anyhow::bail!("hard delete rechaza el inode raíz (1): vaciaría el árbol");
+        }
+        let order: Vec<i64> = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE sub(id, depth) AS (
+                SELECT ?1, 0
+                UNION
+                SELECT d.child_inode, s.depth + 1
+                FROM dentry d
+                JOIN sub s ON d.parent_inode = s.id
+            )
+            SELECT id FROM sub ORDER BY depth DESC
+            "#,
+        )
+        .bind(root_inode as i64)
+        .fetch_all(&mut **tx)
+        .await?;
+        for inode in order {
+            Self::hard_delete_inode_tx(tx, inode as u64).await?;
+        }
+        Ok(())
+    }
+
+    async fn hard_delete_inode(&self, inode: u64) -> Result<()> {
+        retry_on_busy(|| async {
+        let mut tx = self.pool.begin().await?;
+        Self::hard_delete_subtree_tx(&mut tx, inode).await?;
+        tx.commit().await?;
+        Ok(())
+        }).await
+    }
+
+    /// Hard delete por gdrive_id: elimina permanentemente un archivo de la DB
+    /// Usado cuando un archivo es eliminado permanentemente de Google Drive
+    pub async fn hard_delete_by_gdrive_id(&self, gdrive_id: &str) -> Result<bool> {
+        retry_on_busy(|| async {
+        let inode = match self.get_inode_by_gdrive_id(gdrive_id).await? {
+            Some(i) => i,
+            None => return Ok(false), // No existe, nada que eliminar
+        };
+
+        self.hard_delete_inode(inode).await?;
+        tracing::info!("Hard delete aplicado: gdrive_id={}, inode={}", gdrive_id, inode);
+        Ok(true)
+        }).await
+    }
+
+    // ============================================================
+    // Métodos para File Cache Chunks (On-Demand Caching)
+    // ============================================================
+
+    /// Registra un rango descargado en la caché
+    pub async fn add_cached_chunk(&self, inode: u64, start: u64, end: u64) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO file_cache_chunks (inode, start_offset, end_offset)
+            VALUES (?, ?, ?)
+            "#
+        )
+        .bind(inode as i64)
+        .bind(start as i64)
+        .bind(end as i64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Limpia todos los chunks cacheados de un inodo (usado en caso de corrupción detectada)
+    pub async fn clear_chunks(&self, inode: u64) -> Result<()> {
+        sqlx::query("DELETE FROM file_cache_chunks WHERE inode = ?")
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::warn!("🧹 Chunks limpiados para inode: {}", inode);
+        Ok(())
+    }
+
+    /// Limpia TODOS los chunks de caché (todas las filas de file_cache_chunks).
+    /// Usado en recuperación post-crash para eliminar estado obsoleto.
+    pub async fn clear_all_chunks(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM file_cache_chunks")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Obtiene el offset máximo registrado en los chunks (para validar consistencia de tamaño)
+    pub async fn get_max_cached_offset(&self, inode: u64) -> Result<u64> {
+        let max_offset: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(end_offset) FROM file_cache_chunks WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        Ok(max_offset.unwrap_or(0) as u64)
+    }
+
+    /// Obtiene el total de bytes cacheados sumando todos los chunks
+    pub async fn get_cached_bytes_count(&self, inode: u64) -> Result<u64> {
+        let total: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(end_offset - start_offset + 1) FROM file_cache_chunks WHERE inode = ?"
+        )
+        .bind(inode as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        Ok(total.unwrap_or(0) as u64)
+    }
+
+    /// Obtiene los rangos faltantes para un archivo en un intervalo dado
+    /// Retorna una lista de (start, end) que necesitan descargarse
+    pub async fn get_missing_ranges(&self, inode: u64, requested_start: u64, requested_end: u64) -> Result<Vec<(u64, u64)>> {
+        // Obtener todos los chunks cacheados para este inode que se solapan con el rango solicitado
+        let cached_chunks: Vec<(i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT start_offset, end_offset
+            FROM file_cache_chunks
+            WHERE inode = ?
+              AND end_offset >= ?
+              AND start_offset <= ?
+            ORDER BY start_offset
+            "#
+        )
+        .bind(inode as i64)
+        .bind(requested_start as i64)
+        .bind(requested_end as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Si no hay chunks, el rango completo falta
+        if cached_chunks.is_empty() {
+            return Ok(vec![(requested_start, requested_end)]);
+        }
+
+        let mut missing = Vec::new();
+        let mut current_pos = requested_start;
+
+        for (start, end) in cached_chunks {
+            let start = start as u64;
+            let end = end as u64;
+
+            // Si hay un gap antes de este chunk
+            if current_pos < start {
+                missing.push((current_pos, start - 1));
+            }
+
+            // Avanzar más allá del chunk actual
+            current_pos = current_pos.max(end + 1);
+        }
+
+        // Si queda espacio después del último chunk
+        if current_pos <= requested_end {
+            missing.push((current_pos, requested_end));
+        }
+
+        Ok(missing)
+    }
+
+
+    /// Limpia todos los chunks cacheados para un inode (útil al invalidar caché)
+    #[allow(dead_code)]
+    pub async fn clear_cached_chunks(&self, inode: u64) -> Result<()> {
+        sqlx::query("DELETE FROM file_cache_chunks WHERE inode = ?")
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    // ============================================================
+    // Métodos para Local Sync Directories
+    // ============================================================
+
+    /// Añade un directorio local a la lista de sincronización
+    pub async fn add_local_sync_dir(&self, local_path: &Path) -> Result<i64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let path_str = local_path.to_string_lossy().to_string();
+
+        let id = sqlx::query(
+            r#"
+            INSERT INTO local_sync_dirs (local_path, enabled, created_at)
+            VALUES (?, 1, ?)
+            "#
+        )
+        .bind(&path_str)
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        tracing::info!("Directorio local añadido: {} (id={})", path_str, id);
+        Ok(id)
+    }
+
+    /// Elimina un directorio local de la sincronización
+    pub async fn remove_local_sync_dir(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM local_sync_dirs WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::info!("Directorio local eliminado: id={}", id);
+        Ok(())
+    }
+
+    /// Activa/desactiva la sincronización de un directorio local
+    pub async fn toggle_local_sync_dir(&self, id: i64, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE local_sync_dirs SET enabled = ? WHERE id = ?")
+            .bind(enabled)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::debug!("Directorio local {} (id={})", if enabled { "activado" } else { "desactivado" }, id);
+        Ok(())
+    }
+
+    /// Obtiene todos los directorios locales configurados
+    pub async fn get_local_sync_dirs(&self) -> Result<Vec<LocalSyncDir>> {
+        let dirs = sqlx::query_as::<_, LocalSyncDir>(
+            "SELECT id, local_path, gdrive_folder_id, enabled, last_sync, created_at FROM local_sync_dirs ORDER BY created_at"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(dirs)
+    }
+
+    /// Obtiene solo los directorios locales habilitados
+    pub async fn get_enabled_local_sync_dirs(&self) -> Result<Vec<LocalSyncDir>> {
+        let dirs = sqlx::query_as::<_, LocalSyncDir>(
+            "SELECT id, local_path, gdrive_folder_id, enabled, last_sync, created_at FROM local_sync_dirs WHERE enabled = 1 ORDER BY created_at"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(dirs)
+    }
+
+    /// Establece el gdrive_folder_id para un directorio local
+    pub async fn set_gdrive_folder_id(&self, id: i64, gdrive_id: &str) -> Result<()> {
+        sqlx::query("UPDATE local_sync_dirs SET gdrive_folder_id = ? WHERE id = ?")
+            .bind(gdrive_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::debug!("GDrive folder ID {} asociado a local_sync_dir id={}", gdrive_id, id);
+        Ok(())
+    }
+
+    /// Actualiza el timestamp de última sincronización
+    pub async fn update_last_sync(&self, id: i64) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        sqlx::query("UPDATE local_sync_dirs SET last_sync = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    // ============================================================
+    // Métodos para Local Sync Files (Hybrid Local Sync)
+    // ============================================================
+
+    /// Inserta o actualiza un archivo en local_sync_files
+    pub async fn upsert_local_sync_file(
+        &self,
+        sync_dir_id: i64,
+        relative_path: &str,
+        is_dir: bool,
+        availability: &str,
+        local_mtime: Option<i64>,
+        local_size: Option<i64>,
+        local_md5: Option<&str>,
+    ) -> Result<i64> {
+        let id = sqlx::query(
+            r#"
+            INSERT INTO local_sync_files 
+                (sync_dir_id, relative_path, is_dir, availability, local_mtime, local_size, local_md5, dirty)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(sync_dir_id, relative_path) DO UPDATE SET
+                is_dir = excluded.is_dir,
+                availability = excluded.availability,
+                local_mtime = excluded.local_mtime,
+                local_size = excluded.local_size,
+                local_md5 = excluded.local_md5,
+                dirty = 1
+            "#
+        )
+        .bind(sync_dir_id)
+        .bind(relative_path)
+        .bind(is_dir)
+        .bind(availability)
+        .bind(local_mtime)
+        .bind(local_size)
+        .bind(local_md5)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        Ok(id)
+    }
+
+    /// Obtiene archivos dirty para subir
+    pub async fn get_dirty_local_sync_files(&self) -> Result<Vec<LocalSyncFile>> {
+        let files = sqlx::query_as::<_, LocalSyncFile>(
+            "SELECT * FROM local_sync_files WHERE dirty = 1 ORDER BY id"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(files)
+    }
+
+    /// Obtiene un archivo local por sync_dir_id y relative_path
+    pub async fn get_local_sync_file(&self, sync_dir_id: i64, relative_path: &str) -> Result<Option<LocalSyncFile>> {
+        let file = sqlx::query_as::<_, LocalSyncFile>(
+            "SELECT * FROM local_sync_files WHERE sync_dir_id = ? AND relative_path = ?"
+        )
+        .bind(sync_dir_id)
+        .bind(relative_path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(file)
+    }
+
+    /// Busca un archivo local por gdrive_id
+    pub async fn find_local_sync_file_by_gdrive_id(&self, gdrive_id: &str) -> Result<Option<LocalSyncFile>> {
+        let file = sqlx::query_as::<_, LocalSyncFile>(
+            "SELECT * FROM local_sync_files WHERE gdrive_id = ?"
+        )
+        .bind(gdrive_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(file)
+    }
+
+    /// Obtiene un directorio local por ID
+    pub async fn get_local_sync_dir(&self, id: i64) -> Result<LocalSyncDir> {
+        let dir = sqlx::query_as::<_, LocalSyncDir>(
+            "SELECT * FROM local_sync_dirs WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(dir)
+    }
+
+    /// Cambia el modo de disponibilidad de un archivo
+    pub async fn set_file_availability(&self, sync_dir_id: i64, relative_path: &str, availability: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE local_sync_files SET availability = ? WHERE sync_dir_id = ? AND relative_path = ?"
+        )
+        .bind(availability)
+        .bind(sync_dir_id)
+        .bind(relative_path)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Actualiza metadatos locales de un archivo
+    pub async fn update_local_file_metadata(
+        &self,
+        sync_dir_id: i64,
+        relative_path: &str,
+        availability: &str,
+        local_size: i64,
+        local_mtime: i64,
+        local_md5: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE local_sync_files 
+            SET availability = ?, local_size = ?, local_mtime = ?, local_md5 = ?
+            WHERE sync_dir_id = ? AND relative_path = ?
+            "#
+        )
+        .bind(availability)
+        .bind(local_size)
+        .bind(local_mtime)
+        .bind(local_md5)
+        .bind(sync_dir_id)
+        .bind(relative_path)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Actualiza metadatos remotos desde un cambio de Drive
+    pub async fn update_local_file_from_remote(
+        &self,
+        file_id: i64,
+        remote_md5: Option<&str>,
+        remote_mtime: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE local_sync_files SET remote_md5 = ?, remote_mtime = ?, dirty = 0 WHERE id = ?"
+        )
+        .bind(remote_md5)
+        .bind(remote_mtime)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Actualiza solo metadatos remotos (para archivos online_only)
+    pub async fn update_local_file_remote_metadata(&self, file_id: i64, remote_md5: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE local_sync_files SET remote_md5 = ? WHERE id = ?"
+        )
+        .bind(remote_md5)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Limpia el flag dirty de un archivo después de una subida exitosa
+    pub async fn clear_local_file_dirty(&self, file_id: i64) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        sqlx::query(
+            "UPDATE local_sync_files SET dirty = 0, last_synced = ? WHERE id = ?"
+        )
+        .bind(now)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Establece el gdrive_id para un archivo local después de crearlo en Drive
+    pub async fn set_local_file_gdrive_id(&self, file_id: i64, gdrive_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE local_sync_files SET gdrive_id = ? WHERE id = ?"
+        )
+        .bind(gdrive_id)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Busca un archivo de local sync por su path absoluto del filesystem
+    /// Útil para comandos IPC que reciben file:// URIs de Nautilus
+    pub async fn find_local_sync_file_by_absolute_path(
+        &self,
+        absolute_path: &str,
+    ) -> Result<Option<LocalSyncFile>> {
+        // Obtener todas las carpetas locales habilitadas
+        let sync_dirs = self.get_enabled_local_sync_dirs().await?;
+        
+        // Intentar encontrar qué carpeta contiene este path
+        for dir in sync_dirs {
+            let base_path = &dir.local_path;
+            
+            // Si el absolute_path empieza con este base_path
+            if absolute_path.starts_with(base_path) {
+                // Calcular relative_path
+                let relative_path = absolute_path
+                    .strip_prefix(base_path)
+                    .unwrap_or("")
+                    .trim_start_matches('/');
+                
+                // Buscar el archivo en la DB
+                if let Some(file) = self.get_local_sync_file(dir.id, relative_path).await? {
+                    return Ok(Some(file));
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    /// Resuelve un path absoluto a (sync_dir_id, relative_path)
+    /// Lanza error si el path no pertenece a ninguna carpeta Local Sync
+    pub async fn resolve_local_sync_path(
+        &self,
+        absolute_path: &str,
+    ) -> Result<(i64, String)> {
+        let sync_dirs = self.get_enabled_local_sync_dirs().await?;
+        
+        for dir in sync_dirs {
+            let base_path = &dir.local_path;
+            
+            if absolute_path.starts_with(base_path) {
+                let relative_path = absolute_path
+                    .strip_prefix(base_path)
+                    .unwrap_or("")
+                    .trim_start_matches('/')
+                    .to_string();
+                
+                return Ok((dir.id, relative_path));
+            }
+        }
+        
+        Err(anyhow::anyhow!("Path no pertenece a ninguna carpeta Local Sync: {}", absolute_path))
+    }
+
+    pub async fn set_shortcut_target_id(&self, inode: u64, target_id: &str) -> Result<()> {
+        sqlx::query("UPDATE attrs SET shortcut_target_id = ? WHERE inode = ?")
+            .bind(target_id)
+            .bind(inode as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_bulk_shortcut_targets(&self, items: &[(u64, String)]) -> Result<()> {
+        if items.is_empty() { return Ok(()); }
+        let mut tx = self.pool.begin().await?;
+        for (inode, target_id) in items {
+            sqlx::query("UPDATE attrs SET shortcut_target_id = ? WHERE inode = ?")
+                .bind(target_id)
+                .bind(*inode as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn resolve_shortcut_sizes(&self) -> Result<usize> {
+        let result = sqlx::query(
+            r#"UPDATE attrs SET size = (
+                SELECT a2.size FROM inodes i2 JOIN attrs a2 ON i2.inode = a2.inode
+                WHERE i2.gdrive_id = attrs.shortcut_target_id AND a2.size > 0
+            )
+            WHERE shortcut_target_id IS NOT NULL AND size = 0
+            AND EXISTS (
+                SELECT 1 FROM inodes i2 JOIN attrs a2 ON i2.inode = a2.inode
+                WHERE i2.gdrive_id = attrs.shortcut_target_id AND a2.size > 0
+            )"#
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
+    }
+}
+/// Struct que representa un directorio local sincronizado
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LocalSyncDir {
+    pub id: i64,
+    pub local_path: String,
+    pub gdrive_folder_id: Option<String>,
+    pub enabled: bool,
+    pub last_sync: i64,
+    pub created_at: i64,
+}
+
+/// Struct que representa un archivo individual en Local Sync
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LocalSyncFile {
+    pub id: i64,
+    pub sync_dir_id: i64,
+    pub relative_path: String,
+    pub is_dir: bool,
+    
+    pub availability: String,  // 'local_online' | 'online_only'
+    
+    pub local_mtime: Option<i64>,
+    pub local_size: Option<i64>,
+    pub local_md5: Option<String>,
+    
+    pub gdrive_id: Option<String>,
+    pub remote_md5: Option<String>,
+    pub remote_mtime: Option<i64>,
+    
+    pub dirty: bool,
+    pub last_synced: Option<i64>,
+}
+
+/// Reintenta una operación transaccional ante SQLITE_BUSY ("database is locked").
+/// En WAL, dos tx DEFERRED que escriben a la vez fallan con BUSY_SNAPSHOT
+/// (el busy_timeout del pool no cubre ese caso); el perdedor reintenta con
+/// tx fresca y converge porque estas operaciones son idempotentes.
+/// Presupuesto acotado (~20 s): agotado, se devuelve el último error para
+/// que el llamador (reintento del syncer / cuarentena) decida.
+async fn retry_on_busy<T, F, Fut>(mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const MAX_ATTEMPTS: u32 = 400;
+    let mut attempt = 0u32;
+    loop {
+        match f().await {
+            Err(e) if is_busy_error(&e) && attempt < MAX_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Detecta SQLITE_BUSY en cualquiera de sus variantes (incl. SNAPSHOT).
+fn is_busy_error(e: &anyhow::Error) -> bool {
+    if let Some(sqlx::Error::Database(db_err)) = e.downcast_ref::<sqlx::Error>() {
+        if let Some(code) = db_err.code() {
+            // BUSY primario ("5") o extendido ("517" = SNAPSHOT, etc.).
+            if code == "5" || (code.len() == 3 && code.starts_with('5')) {
+                return true;
+            }
+        }
+        if db_err.message().to_lowercase().contains("database is locked") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Struct para inserción masiva de metadatos
+#[derive(Debug, Clone)]
+pub struct BulkFileMetadata {
+    pub inode: u64,
+    pub size: i64,
+    pub mtime: i64,
+    pub mode: u32,
+    pub is_dir: bool,
+    pub mime_type: Option<String>,
+    pub can_move: bool,
+    pub shared: bool,
+    pub owned_by_me: bool,
+}
+
+/// Struct para inserción masiva de dentries
+#[derive(Debug, Clone)]
+pub struct BulkDentry {
+    pub parent_inode: u64,
+    pub child_inode: u64,
+    pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    async fn test_db(name: &str) -> (tempfile::TempDir, MetadataRepository) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = MetadataRepository::new(&tmp.path().join(name)).await.unwrap();
+        // Invariante: inode raíz = 1 (las FKs de dentry lo exigen como padre).
+        assert_eq!(db.get_or_create_inode("root").await.unwrap(), 1);
+        (tmp, db)
+    }
+
+    #[tokio::test]
+    async fn upsert_dentry_mueve_enlace_sin_duplicar() {
+        let (_tmp, db) = test_db("m.sqlite").await;
+        let dir = db.get_or_create_inode("temp_dir").await.unwrap();
+        db.upsert_dentry(1, dir, "dir").await.unwrap();
+        let x = db.get_or_create_inode("temp_x").await.unwrap();
+        db.upsert_dentry(dir, x, "a").await.unwrap();
+        // Mover (dir,a) -> (dir,b): el enlace viejo debe desaparecer.
+        db.upsert_dentry(dir, x, "b").await.unwrap();
+        assert!(db.lookup(dir, "a").await.unwrap().is_none());
+        assert_eq!(db.lookup(dir, "b").await.unwrap(), Some(x));
+    }
+
+    #[tokio::test]
+    async fn upsert_dentry_nunca_expone_nombre_inexistente() {
+        // Dos escritores alternan el dueño de (1,"n"); un observador resuelve
+        // en bucle. Con DELETE+INSERT no atómico, el observador puede ver None
+        // en la ventana entre ambos statements (→ duplicados/huérfanos).
+        let (_tmp, db) = test_db("t.sqlite").await;
+        let db = std::sync::Arc::new(db);
+        let a = db.get_or_create_inode("temp_a").await.unwrap();
+        let b = db.get_or_create_inode("temp_b").await.unwrap();
+        db.upsert_dentry(1, a, "n").await.unwrap();
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let wdb = db.clone();
+        let wstop = stop.clone();
+        let writer = tokio::spawn(async move {
+            let mut toggle = false;
+            while !wstop.load(Ordering::Relaxed) {
+                toggle = !toggle;
+                let child = if toggle { a } else { b };
+                wdb.upsert_dentry(1, child, "n").await.unwrap();
+            }
+        });
+
+        let mut torn_reads = 0u32;
+        for _ in 0..5000 {
+            if db.lookup(1, "n").await.unwrap().is_none() {
+                torn_reads += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.await.unwrap();
+        assert_eq!(torn_reads, 0, "el nombre desapareció {} veces durante upserts concurrentes", torn_reads);
+        // Estado final consistente: el nombre existe y apunta a un dueño válido.
+        let winner = db.lookup(1, "n").await.unwrap();
+        assert!(winner == Some(a) || winner == Some(b));
+    }
+
+    /// Crea root + dir `dname` con `n` archivos synced/local_online limpios.
+    /// Retorna (dir_inode, file_inodes).
+    async fn synced_tree(db: &MetadataRepository, dname: &str, n: usize) -> (u64, Vec<u64>) {
+        let dir = db.get_or_create_inode(&format!("temp_dir_{}", dname)).await.unwrap();
+        db.upsert_dentry(1, dir, dname).await.unwrap();
+        db.upsert_file_metadata(dir, 0, 0, 0o755, true, None, true, false, true).await.unwrap();
+        let mut files = Vec::new();
+        for i in 0..n {
+            let f = db.get_or_create_inode(&format!("temp_{}_{}", dname, i)).await.unwrap();
+            let fname = format!("f{}.txt", i);
+            db.upsert_dentry(dir, f, &fname).await.unwrap();
+            db.upsert_file_metadata(f, 100, 0, 0o644, false, Some("text/plain"), true, false, true).await.unwrap();
+            db.set_availability(f, "local_online", false).await.unwrap();
+            files.push(f);
+        }
+        (dir, files)
+    }
+
+    async fn counters(db: &MetadataRepository, inode: u64) -> (i64, i64) {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT dirty_desc_count, synced_desc_count FROM dir_counters WHERE inode = ?",
+        )
+        .bind(inode as i64)
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+        row.unwrap_or((0, 0))
+    }
+
+    #[tokio::test]
+    async fn soft_delete_estado_final_completo() {
+        let (_tmp, db) = test_db("sd.sqlite").await;
+        db.ensure_dir_counter(1).await.unwrap();
+        let (dir, files) = synced_tree(&db, "d", 2).await;
+        assert!(db.soft_delete_by_gdrive_id("temp_dir_d").await.unwrap());
+        // Dentry original gone, tumbas con nombres, estado marcado.
+        assert!(db.lookup(1, "d").await.unwrap().is_none());
+        for f in &files {
+            let gone = db.resolve_inode_to_relative_path(*f).await.unwrap();
+            assert!(gone.is_none(), "dentry residual para {}", f);
+            assert!(db.is_dirty(*f).await.unwrap(), "debe quedar dirty para subir el delete");
+        }
+        // Contadores exactos: 2 synced->dirty (sin doble-burbujeo en root).
+        assert_eq!(counters(&db, 1).await, (2, 0));
+        // Idempotente: segunda llamada true sin cambiar nada.
+        assert!(db.soft_delete_by_gdrive_id("temp_dir_d").await.unwrap());
+        assert_eq!(counters(&db, 1).await, (2, 0));
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn hard_delete_limpia_todas_las_tablas() {
+        let (_tmp, db) = test_db("hd.sqlite").await;
+        db.ensure_dir_counter(1).await.unwrap();
+        let (_dir, files) = synced_tree(&db, "d", 1).await;
+        let f = files[0];
+        db.set_dirty_and_bubble(f).await.unwrap();
+        assert!(db.hard_delete_by_gdrive_id("temp_d_0").await.unwrap());
+        assert!(db.lookup(1, "d").await.unwrap().is_some(), "el dir sobrevive");
+        assert!(db.resolve_inode_to_relative_path(f).await.unwrap().is_none());
+        assert!(db.get_inode_by_gdrive_id("temp_d_0").await.unwrap().is_none());
+        assert!(!db.is_dirty(f).await.unwrap());
+        assert!(db.get_attrs(f).await.is_err(), "attrs residuales");
+    }
+
+    /// Directorio con hijos con edges vivos, SIN pasar por tombstones: antes
+    /// fallaba con FK constraint (tablas viejas sin CASCADE) y el cambio
+    /// cuarentenaba en loop; ahora limpia el subárbol entero sin violaciones.
+    #[tokio::test]
+    async fn hard_delete_subtree_limpia_hijos_con_edges_vivos() {
+        let (_tmp, db) = test_db("subtree.sqlite").await;
+        db.ensure_dir_counter(1).await.unwrap();
+        let dir = db.get_or_create_inode("temp_dirS").await.unwrap();
+        let sub = db.get_or_create_inode("temp_subS").await.unwrap();
+        let f = db.get_or_create_inode("temp_fS").await.unwrap();
+        db.upsert_dentry(1, dir, "dx").await.unwrap();
+        db.upsert_dentry(dir, sub, "sx").await.unwrap();
+        db.upsert_dentry(sub, f, "fx").await.unwrap();
+        for (inode, is_dir) in [(dir, true), (sub, true), (f, false)] {
+            db.upsert_file_metadata(inode, 10, 0, 0o644, is_dir, None, true, false, true)
+                .await
+                .unwrap();
+            db.ensure_dir_counter(inode).await.unwrap();
+        }
+        db.set_dirty_and_bubble(f).await.unwrap();
+        db.add_cached_chunk(f, 0, 100).await.unwrap();
+
+        assert!(db.hard_delete_by_gdrive_id("temp_dirS").await.unwrap());
+
+        // Cero filas del subárbol en las 6 tablas con FK a inodes.
+        for inode in [dir, sub, f] {
+            for (table, col) in [
+                ("dentry", "child_inode"),
+                ("attrs", "inode"),
+                ("sync_state", "inode"),
+                ("file_cache_chunks", "inode"),
+                ("dir_counters", "inode"),
+                ("inodes", "inode"),
+            ] {
+                let n: i64 =
+                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {} WHERE {} = ?", table, col))
+                        .bind(inode as i64)
+                        .fetch_one(&db.pool)
+                        .await
+                        .unwrap();
+                assert_eq!(n, 0, "residuo en {} para inode {}", table, inode);
+            }
+        }
+        // Sin edges colgando ni violaciones FK en toda la DB.
+        let dangling: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dentry WHERE parent_inode NOT IN (SELECT inode FROM inodes)",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(dangling, 0);
+        let fk: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fk, 0);
+        // Root intacto.
+        assert!(db.get_inode_by_gdrive_id("root").await.unwrap().is_some());
+    }
+
+    /// El guard de raíz falla ruidoso y no toca nada (Drive nunca emite eso;
+    /// sin guard, el subárbol de 1 vaciaría el árbol entero).
+    #[tokio::test]
+    async fn hard_delete_rechaza_raiz() {
+        let (_tmp, db) = test_db("rootguard.sqlite").await;
+        assert!(db.hard_delete_by_gdrive_id("root").await.is_err());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inodes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Un tombstone patológico (root, rechazado por el guard) no bloquea la
+    /// purga del resto: se registra y se sigue.
+    #[tokio::test]
+    async fn purge_continua_tras_item_patologico() {
+        let (_tmp, db) = test_db("purgect.sqlite").await;
+        let f = db.get_or_create_inode("temp_pF").await.unwrap();
+        db.upsert_file_metadata(f, 5, 0, 0o644, false, None, true, false, true)
+            .await
+            .unwrap();
+        for (parent, child, name) in [(0i64, 1i64, "root"), (1i64, f as i64, "pf")] {
+            sqlx::query(
+                "INSERT INTO dentry_deleted (parent_inode, child_inode, name, deleted_at) VALUES (?, ?, ?, 0)",
+            )
+            .bind(parent)
+            .bind(child)
+            .bind(name)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        // deleted_at=0 << cutoff: ambos expiran, pero solo el normal se purga.
+        assert_eq!(db.purge_expired_tombstones(7).await.unwrap(), 1);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dentry_deleted")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        assert!(db.get_inode_by_gdrive_id("root").await.unwrap().is_some());
+        assert!(db
+            .get_inode_by_gdrive_id("temp_pF")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn soft_deletes_concurrentes_cuadran_contadores() {
+        // Dos borrados solapados de subárboles disjuntos bajo el mismo padre:
+        // sin atomicidad por operación, conteos y burbujeo se desfasan.
+        let (_tmp, db) = test_db("cc.sqlite").await;
+        let db = std::sync::Arc::new(db);
+        db.ensure_dir_counter(1).await.unwrap();
+        synced_tree(&db, "a", 2).await;
+        synced_tree(&db, "b", 2).await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for gid in ["temp_dir_a", "temp_dir_b"] {
+            let dbc = db.clone();
+            let bc = barrier.clone();
+            let gid = gid.to_string();
+            handles.push(tokio::spawn(async move {
+                bc.wait().await;
+                dbc.soft_delete_by_gdrive_id(&gid).await.unwrap()
+            }));
+        }
+        for h in handles {
+            assert!(h.await.unwrap());
+        }
+        assert_eq!(counters(&db, 1).await, (4, 0));
+        assert!(db.lookup(1, "a").await.unwrap().is_none());
+        assert!(db.lookup(1, "b").await.unwrap().is_none());
+    }
+
+    /// Claim 7 (rojo): un ciclo A<->B en dentry no debe colgar al resolver.
+    /// La API no puede crear ciclos (el 2º upsert borra el enlace del 1º),
+    /// así que se construyen con SQL directo, como lo haría un rename sin validar.
+    #[tokio::test]
+    async fn resolve_inode_ciclo_no_cuelga() {
+        let (_t, db) = test_db("resolve_cycle").await;
+        let a = db.get_or_create_inode("temp_cyc_a").await.unwrap();
+        let b = db.get_or_create_inode("temp_cyc_b").await.unwrap();
+        for (p, c, n) in [(b, a, "a"), (a, b, "b")] {
+            sqlx::query("INSERT INTO dentry (parent_inode, child_inode, name) VALUES (?, ?, ?)")
+                .bind(p as i64)
+                .bind(c as i64)
+                .bind(n)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.resolve_inode_to_relative_path(a),
+        )
+        .await;
+        assert!(r.is_ok(), "el resolver se colgó ante un ciclo de dentry");
+        assert!(r.unwrap().unwrap().is_none());
+    }
+
+    /// Claim 7 (rojo): self-loop (padre de sí mismo) tampoco debe colgar.
+    #[tokio::test]
+    async fn resolve_inode_self_loop_no_cuelga() {
+        let (_t, db) = test_db("resolve_selfloop").await;
+        let x = db.get_or_create_inode("temp_self_x").await.unwrap();
+        sqlx::query("INSERT INTO dentry (parent_inode, child_inode, name) VALUES (?, ?, ?)")
+            .bind(x as i64)
+            .bind(x as i64)
+            .bind("x")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.resolve_inode_to_relative_path(x),
+        )
+        .await;
+        assert!(r.is_ok(), "el resolver se colgó ante un self-loop");
+        assert!(r.unwrap().unwrap().is_none());
+    }
+
+    /// Claim 7 (rojo): el rebuild de contadores también camina padres en memoria.
+    #[tokio::test]
+    async fn rebuild_con_ciclo_termina() {
+        let (_t, db) = test_db("rebuild_cycle").await;
+        let a = db.get_or_create_inode("temp_rb_a").await.unwrap();
+        let b = db.get_or_create_inode("temp_rb_b").await.unwrap();
+        db.upsert_file_metadata(b, 10, 0, 0o644, false, None, true, false, true)
+            .await
+            .unwrap();
+        db.set_availability(b, "local_online", false).await.unwrap();
+        for (p, c, n) in [(b, a, "a"), (a, b, "b")] {
+            sqlx::query("INSERT INTO dentry (parent_inode, child_inode, name) VALUES (?, ?, ?)")
+                .bind(p as i64)
+                .bind(c as i64)
+                .bind(n)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.rebuild_all_dir_counters(),
+        )
+        .await;
+        assert!(r.is_ok(), "el rebuild se colgó ante un ciclo de dentry");
+        r.unwrap().unwrap();
+    }
+
+    /// Claim 7: el chequeo anti-ciclo de rename distingue casos.
+    #[tokio::test]
+    async fn is_descendant_or_self_casos() {
+        let (_t, db) = test_db("desc_cases").await;
+        // 1/dirA/{f,sub/h}
+        let dir_a = db.get_or_create_inode("temp_dd_a").await.unwrap();
+        db.upsert_dentry(1, dir_a, "dirA").await.unwrap();
+        let f = db.get_or_create_inode("temp_dd_f").await.unwrap();
+        db.upsert_dentry(dir_a, f, "f").await.unwrap();
+        let sub = db.get_or_create_inode("temp_dd_sub").await.unwrap();
+        db.upsert_dentry(dir_a, sub, "sub").await.unwrap();
+        let h = db.get_or_create_inode("temp_dd_h").await.unwrap();
+        db.upsert_dentry(sub, h, "h").await.unwrap();
+
+        assert!(db.is_descendant_or_self(dir_a, dir_a).await.unwrap()); // self
+        assert!(db.is_descendant_or_self(dir_a, sub).await.unwrap()); // hijo
+        assert!(db.is_descendant_or_self(dir_a, h).await.unwrap()); // nieto
+        assert!(!db.is_descendant_or_self(sub, dir_a).await.unwrap()); // padre no es descendiente
+        assert!(!db.is_descendant_or_self(f, h).await.unwrap()); // ramas distintas
+        assert!(!db.is_descendant_or_self(dir_a, 1).await.unwrap()); // root no cuelga de nadie
+        assert!(!db.is_descendant_or_self(999_999, h).await.unwrap()); // ancestro inexistente
+    }
+}

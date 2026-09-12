@@ -1,0 +1,30 @@
+# AGENTS.md — Módulo `gui/`
+
+## Propósito
+
+Interfaz gráfica de usuario construida con Relm4 (patrón MVU) sobre GTK4 y Libadwaita. Muestra estado de sincronización, transferencias activas, historial de acciones y configuración.
+
+## Archivos
+
+| Archivo        | Responsabilidad |
+|----------------|----------------|
+| `mod.rs`       | Re-exporta submódulos. |
+| `app_model.rs` | `AppModel`: componente Relm4 principal. Gestiona estado completo de la aplicación. Recibe mensajes `AppMsg` desde el backend thread. Renderiza con widgets Libadwaita (HeaderBar, ListBox, ProgressBar, etc.). |
+| `history.rs`   | `ActionHistory`: registro thread-safe (`Arc<Mutex>`) de acciones (descargas, subidas, errores) y transferencias activas con progreso. |
+| `tray.rs`      | `TrayIcon`: icono en bandeja del sistema via `ksni` (StatusNotifierItem sobre DBus). |
+
+## Dependencias
+
+- **Externas**: `relm4` (con feature `libadwaita`), `gtk4`, `libadwaita`, `ksni`.
+- **Internas**: `db::MetadataRepository`, `auth::clear_all_auth_data`, `mirror::MirrorCommand`.
+
+## Notas para Agentes
+
+- **Thread safety**: GTK4 NO es thread-safe. Todas las actualizaciones de widgets deben pasar por `ComponentSender<AppModel>` (mensajes `AppMsg`).
+- **run_backend()**: se ejecuta en `std::thread::spawn` desde `AppModel::init`. El runtime Tokio vive en ese hilo.
+- **Hard Reset**: la GUI puede limpiar toda la autenticación y base de datos. Usa `HARD_RESET_IN_PROGRESS` (AtomicBool global) para coordinar el cierre.
+- **Shutdown delegado**: `AppMsg::Quit` NO ejecuta `process::exit()` ni `unmount_and_wait()`. Solo llama `utils::shutdown::request_shutdown()` para señalizar al backend, que ejecuta la secuencia completa (ocultar archivos → desmontar → exit). Esto evita race conditions entre el hilo GTK y el runtime Tokio. Ver ADR-006.
+- **Reinicio en un clic (ADR-034)**: `AppMsg::Restart` programa el relanzado del binario actual con espera activa al propio PID (`while kill -0 …`, sin carrera con el apagado coordinado) y luego `request_shutdown()`. Visible solo con el espejo degradado (`model.mirror_degraded`, sondeado de `MIRROR_DEGRADED` en `RefreshActivity`). No testear en unit (relanzaría el proceso de test).
+- **ViewMode**: Main (dashboard) y Activity (detalle de transferencias).
+- **Feature `libadwaita` en Relm4**: OBLIGATORIO. Sin él, `adw::init()` no se ejecuta y la app no se integra correctamente con el dock de GNOME (no aparece icono ni nombre). Ver ADR-008.
+- **Integración desktop**: El `.desktop` file (`data/org.gnome.FedoraDrive.desktop`) y el symlink del binario en `~/.local/bin/` son instalados por `scripts/install-icons.sh`. GIO descarta silenciosamente el `.desktop` si `Exec` no resuelve a un binario en PATH.

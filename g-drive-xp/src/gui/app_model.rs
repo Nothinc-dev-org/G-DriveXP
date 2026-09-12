@@ -1,0 +1,1055 @@
+use relm4::prelude::*;
+use gtk::prelude::*;
+use libadwaita as adw;
+use adw::prelude::*;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+use super::history::{ActionHistory, ActionType, ActionEntry, ActiveTransfer, TransferOp};
+use super::tray::TrayIcon;
+
+pub struct AppModel {
+    pub status_message: String,
+    pub is_connected: bool,
+    pub mirror_path: Option<std::path::PathBuf>,
+    pub fuse_mount_path: Option<std::path::PathBuf>,
+    pub sync_paused: Arc<AtomicBool>,
+    pub history: ActionHistory,
+    pub db: Option<Arc<crate::db::MetadataRepository>>,
+    pub login_url: Option<String>,
+    // Actividad reciente
+    pub activity_entries: Vec<ActionEntry>,
+    // Salud del espejo (MIRROR_DEGRADED del backend; se sondea en RefreshActivity)
+    pub mirror_degraded: bool,
+    pub active_transfers: Vec<ActiveTransfer>,
+    pub sync_detected: usize,
+    pub sync_applied: usize,
+    pub pending_uploads: usize,
+    pub scanning_total: usize,
+    // Directorios de sincronización
+    pub local_sync_dirs: Vec<crate::db::repository::LocalSyncDir>,
+    // Referencias a widgets dinámicos
+    pub uploads_listbox: Option<gtk::ListBox>,
+    pub downloads_listbox: Option<gtk::ListBox>,
+    pub history_listbox: Option<gtk::ListBox>,
+    pub sync_dirs_listbox: Option<gtk::ListBox>,
+    // Navegación
+    pub current_view: ViewMode,
+    // Shutdown
+    pub shutdown_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Main,
+    Activity,
+}
+
+impl AppModel {
+    fn sync_hint_text(&self) -> String {
+        // Escaneo en curso tiene prioridad visual
+        if self.scanning_total > 0 {
+            return format!("Escaneados {} archivos", self.scanning_total);
+        }
+
+        let has_pending_downloads = self.sync_detected != self.sync_applied;
+        let has_pending_uploads = self.pending_uploads > 0;
+        let has_active_real_transfers = self.active_transfers.iter().any(|t| t.operation != TransferOp::Stream);
+
+        if has_active_real_transfers || has_pending_downloads || has_pending_uploads {
+            if has_pending_downloads {
+                format!("{}/{} Cambios aplicados", self.sync_applied, self.sync_detected)
+            } else if has_pending_uploads {
+                format!("{} Cambios pendientes", self.pending_uploads)
+            } else {
+                "Sincronizando...".to_string()
+            }
+        } else {
+            "Sin Novedad, mi general".to_string()
+        }
+    }
+
+    /// Reconstruye el contenido del listbox de transfers activos
+    fn rebuild_transfers_box(transfers_box: &gtk::ListBox, transfers: &[&ActiveTransfer]) {
+        // Limpiar
+        while let Some(child) = transfers_box.first_child() {
+            transfers_box.remove(&child);
+        }
+
+        for transfer in transfers {
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            row.set_margin_top(4);
+            row.set_margin_bottom(4);
+            row.set_margin_start(8);
+            row.set_margin_end(8);
+
+            let label = gtk::Label::new(Some(&format!(
+                "{} {}",
+                transfer.operation.emoji(),
+                transfer.file_name
+            )));
+            label.set_halign(gtk::Align::Start);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            row.append(&label);
+
+            let progress = gtk::ProgressBar::new();
+            progress.set_fraction(transfer.progress_fraction());
+            if transfer.total_bytes > 0 {
+                let mb_done = transfer.bytes_transferred as f64 / (1024.0 * 1024.0);
+                let mb_total = transfer.total_bytes as f64 / (1024.0 * 1024.0);
+                
+                let speed_str = if transfer.speed_bps >= 1024 * 1024 {
+                    format!("{:.1} MB/s", transfer.speed_bps as f64 / (1024.0 * 1024.0))
+                } else if transfer.speed_bps >= 1024 {
+                    format!("{:.1} KB/s", transfer.speed_bps as f64 / 1024.0)
+                } else {
+                    format!("{} B/s", transfer.speed_bps)
+                };
+
+                progress.set_text(Some(&format!("{:.1}/{:.1} MB ({})", mb_done, mb_total, speed_str)));
+                progress.set_show_text(true);
+            }
+            row.append(&progress);
+
+            transfers_box.append(&row);
+        }
+    }
+
+    /// Reconstruye el contenido del listbox de historial
+    fn rebuild_history_listbox(history_listbox: &gtk::ListBox, entries: &[ActionEntry]) {
+        // Limpiar
+        while let Some(child) = history_listbox.first_child() {
+            history_listbox.remove(&child);
+        }
+
+        if entries.is_empty() {
+            let label = gtk::Label::new(Some("Sin actividad reciente"));
+            label.set_css_classes(&["dim-label"]);
+            label.set_margin_top(8);
+            label.set_margin_bottom(8);
+            history_listbox.append(&label);
+            return;
+        }
+
+        for entry in entries {
+            let label = gtk::Label::new(Some(&entry.format_for_menu()));
+            label.set_halign(gtk::Align::Start);
+            label.set_margin_top(2);
+            label.set_margin_bottom(2);
+            label.set_margin_start(8);
+            label.set_margin_end(8);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            history_listbox.append(&label);
+        }
+    }
+
+    /// Reconstruye el listbox de directorios locales
+    fn rebuild_sync_dirs_box(box_widget: &gtk::ListBox, dirs: &[crate::db::repository::LocalSyncDir], sender: &ComponentSender<Self>) {
+        while let Some(child) = box_widget.first_child() {
+            box_widget.remove(&child);
+        }
+
+        // Fila para "Añadir Carpeta..." siempre visible
+        let add_row = adw::ActionRow::new();
+        add_row.set_title("Añadir Carpeta...");
+        add_row.set_activatable(true);
+        let add_icon = gtk::Image::from_icon_name("list-add-symbolic");
+        add_row.add_prefix(&add_icon);
+        let sender_clone = sender.clone();
+        add_row.connect_activated(move |_| {
+            sender_clone.input(AppMsg::SelectNewSyncDir);
+        });
+        box_widget.append(&add_row);
+
+        if dirs.is_empty() {
+            let label = gtk::Label::new(Some("Ninguna carpeta adicional configurada"));
+            label.set_css_classes(&["dim-label"]);
+            label.set_margin_top(16);
+            label.set_margin_bottom(16);
+            box_widget.append(&label);
+            return;
+        }
+
+        for dir in dirs {
+            let row = adw::ActionRow::new();
+            row.set_title(&dir.local_path);
+            row.set_subtitle(if dir.enabled { "Sincronizando activamente" } else { "Sincronización pausada para esta carpeta" });
+            
+            let id = dir.id;
+            
+            let switch = gtk::Switch::new();
+            switch.set_active(dir.enabled);
+            switch.set_valign(gtk::Align::Center);
+            let sender_clone = sender.clone();
+            switch.connect_active_notify(move |s| {
+                sender_clone.input(AppMsg::ToggleSyncDir(id, s.is_active()));
+            });
+            row.add_suffix(&switch);
+            
+            let btn_remove = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .css_classes(["flat", "destructive-action"])
+                .valign(gtk::Align::Center)
+                .build();
+            let sender_clone2 = sender.clone();
+            btn_remove.connect_clicked(move |_| {
+                sender_clone2.input(AppMsg::RemoveSyncDir(id));
+            });
+            row.add_suffix(&btn_remove);
+            
+            box_widget.append(&row);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum AppMsg {
+    UpdateStatus(String),
+    SetConnected(bool),
+    SetPaths { mirror: std::path::PathBuf, fuse: std::path::PathBuf },
+    SetDatabase(Arc<crate::db::MetadataRepository>),
+    OpenInNautilus,
+    SetPauseSync(bool),
+    Logout,
+    LogoutDone,
+    Hide,
+    Quit,
+    ShowWindow,
+    PrepareShutdown,
+    // Mensajes para el historial
+    LogAction(ActionType, String),
+    HardReset,
+    // Relanza el proceso tras apagado coordinado (recupera el mirror sin restart)
+    Restart,
+    Login,
+    SetLoginUrl(String),
+    // Gestión de directorios
+    LoadSyncDirs,
+    SyncDirsLoaded(Vec<crate::db::repository::LocalSyncDir>),
+    SelectNewSyncDir,
+    AddSyncDir(std::path::PathBuf),
+    RemoveSyncDir(i64),
+    ToggleSyncDir(i64, bool),
+    // Refresco periódico de actividad
+    RefreshActivity,
+    // Navegación
+    ShowActivityView,
+    ShowMainView,
+}
+
+#[relm4::component(pub)]
+#[allow(unused_assignments)]
+impl Component for AppModel {
+    type Init = ();
+    type Input = AppMsg;
+    type Output = ();
+    type CommandOutput = ();
+
+    view! {
+        adw::ApplicationWindow {
+            set_title: Some("G-DriveXP"),
+            set_default_size: (450, 560),
+
+            #[wrap(Some)]
+            set_content = &gtk::Box {
+                set_orientation: gtk::Orientation::Vertical,
+
+                // Header con navegación
+                append = &adw::HeaderBar {
+                    pack_start = &gtk::Button {
+                        set_icon_name: "go-previous-symbolic",
+                        #[watch]
+                        set_visible: model.current_view == ViewMode::Activity,
+                        connect_clicked[sender] => move |_| {
+                            sender.input(AppMsg::ShowMainView);
+                        },
+                    },
+
+                    #[wrap(Some)]
+                    set_title_widget = &gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 12,
+                        set_halign: gtk::Align::Center,
+
+                        #[name = "logo_image"]
+                        append = &gtk::Image {
+                            set_pixel_size: 32,
+                            #[watch]
+                            set_visible: model.current_view == ViewMode::Main,
+                        },
+
+                        append = &adw::WindowTitle {
+                            set_title: "G-DriveXP",
+                            #[watch]
+                            set_subtitle: match model.current_view {
+                                ViewMode::Main => "Cliente de Google Drive",
+                                ViewMode::Activity => "Actividad Reciente",
+                            },
+                        },
+                    },
+                },
+
+                // Stack para alternar vistas
+                #[name = "main_stack"]
+                append = &gtk::Stack {
+                    set_vexpand: true,
+                    set_transition_type: gtk::StackTransitionType::SlideLeftRight,
+
+                    // ========== VISTA PRINCIPAL ==========
+                    add_named[Some("main")] = &gtk::ScrolledWindow {
+                        set_hscrollbar_policy: gtk::PolicyType::Never,
+
+                        #[wrap(Some)]
+                        set_child = &adw::Clamp {
+                            set_maximum_size: 600,
+                            set_margin_all: 16,
+
+                            #[wrap(Some)]
+                            set_child = &gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_spacing: 24,
+
+                                // Botón principal: Abrir en Archivos
+                                append = &gtk::Button {
+                                    #[watch]
+                                    set_visible: model.is_connected,
+                                    set_css_classes: &["suggested-action", "pill"],
+                                    set_halign: gtk::Align::Center,
+                                    set_margin_top: 8,
+                                    set_margin_bottom: 16,
+
+                                    #[wrap(Some)]
+                                    set_child = &gtk::Box {
+                                        set_orientation: gtk::Orientation::Horizontal,
+                                        set_spacing: 8,
+
+                                        append = &gtk::Image {
+                                            set_icon_name: Some("folder-open-symbolic"),
+                                        },
+
+                                        append = &gtk::Label {
+                                            set_label: "Abrir en Archivos",
+                                        },
+                                    },
+
+                                    connect_clicked[sender] => move |_| {
+                                        sender.input(AppMsg::OpenInNautilus);
+                                    },
+                                },
+
+                                // Estado actual
+                                append = &adw::PreferencesGroup {
+                                    #[watch]
+                                    set_visible: model.is_connected,
+                                    set_title: "Estado",
+
+                                    add = &adw::ActionRow {
+                                        set_title: "Conexión",
+                                        #[watch]
+                                        set_subtitle: if model.is_connected { "Conectado a Google Drive" } else { "Desconectado" },
+
+                                        add_suffix = &gtk::Image {
+                                            #[watch]
+                                            set_icon_name: Some(if model.is_connected { "object-select-symbolic" } else { "dialog-error-symbolic" }),
+                                            #[watch]
+                                            set_css_classes: if model.is_connected { &["success"] } else { &["error"] },
+                                        },
+                                    },
+
+                                    add = &adw::ActionRow {
+                                        set_title: "Estado",
+                                        #[watch]
+                                        set_subtitle: if model.scanning_total > 0 { "Escaneando..." } else { &model.status_message },
+                                    },
+                                    // Banner persistente de espejo degradado (latch, no texto transitorio)
+                                    add = &adw::ActionRow {
+                                        #[watch]
+                                        set_visible: model.mirror_degraded,
+                                        set_title: "Espejo degradado",
+                                        set_subtitle: "La vigilancia local está caída: los cambios del espejo no se detectan. Pulsa Reiniciar en Cuenta.",
+                                        set_css_classes: &["error"],
+
+                                        add_suffix = &gtk::Image {
+                                            set_icon_name: Some("dialog-warning-symbolic"),
+                                        },
+                                    },
+                                },
+
+                                // Botón para ver actividad reciente
+                                append = &adw::PreferencesGroup {
+                                    #[watch]
+                                    set_visible: model.is_connected,
+
+                                    add = &adw::ActionRow {
+                                        #[watch]
+                                        set_title: &model.sync_hint_text(),
+                                        set_subtitle: "Actividad Reciente",
+                                        set_activatable: true,
+
+                                        add_prefix = &gtk::Image {
+                                            #[watch]
+                                            set_icon_name: Some(
+                                                if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                                    "view-refresh-symbolic"
+                                                } else {
+                                                    "object-select-symbolic"
+                                                }
+                                            ),
+                                            #[watch]
+                                            set_css_classes: if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                                &["accent"]
+                                            } else {
+                                                &["success"]
+                                            },
+                                        },
+
+                                        add_suffix = &gtk::Image {
+                                            set_icon_name: Some("go-next-symbolic"),
+                                        },
+
+                                        connect_activated[sender] => move |_| {
+                                            sender.input(AppMsg::ShowActivityView);
+                                        },
+                                    },
+                                },
+
+                                // Sección Configuración
+                                append = &adw::PreferencesGroup {
+                                    #[watch]
+                                    set_visible: model.is_connected,
+                                    set_title: "Configuración",
+
+                                    add = &adw::SwitchRow {
+                                        set_title: "Pausar sincronización",
+                                        set_subtitle: "Detiene temporalmente la sincronización",
+                                        #[watch]
+                                        set_active: model.sync_paused.load(Ordering::Relaxed),
+
+                                        connect_active_notify[sender] => move |switch| {
+                                            sender.input(AppMsg::SetPauseSync(switch.is_active()));
+                                        },
+                                    },
+                                },
+
+                                // Sección Directorios Adicionales
+                                append = &adw::PreferencesGroup {
+                                    set_visible: false, // Oculto hasta nuevo aviso
+                                    set_title: "Carpetas Locales Sincronizadas",
+                                    set_description: Some("Seleccione directorios fuera del espejo de Google Drive para sincronizar"),
+
+                                    #[name = "sync_dirs_box"]
+                                    add = &gtk::ListBox {
+                                        set_css_classes: &["boxed-list"],
+                                        set_selection_mode: gtk::SelectionMode::None,
+                                    },
+                                },
+
+                                // Sección Cuenta
+                                append = &adw::PreferencesGroup {
+                                    #[watch]
+                                    set_visible: model.is_connected,
+                                    set_title: "Cuenta",
+
+                                    add = &adw::ActionRow {
+                                        set_title: "Cerrar sesión",
+                                        set_subtitle: "Desvincula esta cuenta de Google",
+                                        set_activatable: true,
+
+                                        add_suffix = &gtk::Image {
+                                            set_icon_name: Some("system-log-out-symbolic"),
+                                        },
+
+                                        connect_activated[sender] => move |_| {
+                                            sender.input(AppMsg::Logout);
+                                        },
+                                    },
+
+                                    // Fila de reinicio: solo visible con el espejo degradado
+                                    // (recupera en un clic lo que antes exigía relanzar a mano).
+                                    add = &adw::ActionRow {
+                                        #[watch]
+                                        set_visible: model.mirror_degraded,
+                                        set_title: "Reiniciar",
+                                        set_subtitle: "Relanza la aplicación para recuperar el espejo",
+                                        set_activatable: true,
+
+                                        add_suffix = &gtk::Image {
+                                            set_icon_name: Some("view-refresh-symbolic"),
+                                        },
+
+                                        connect_activated[sender] => move |_| {
+                                            sender.input(AppMsg::Restart);
+                                        },
+                                    },
+
+                                    add = &adw::ActionRow {
+                                        set_title: "Hard Reset",
+                                        set_subtitle: "BORRADO TOTAL: Reinicia DB, Cache y Archivos.",
+                                        set_activatable: true,
+                                        set_css_classes: &["destructive-action"],
+
+                                        add_suffix = &gtk::Image {
+                                            set_icon_name: Some("user-trash-symbolic"),
+                                        },
+
+                                        connect_activated[sender] => move |_| {
+                                            sender.input(AppMsg::HardReset);
+                                        },
+                                    },
+                                },
+
+                                // PANTALLA DE LOGIN (SOLO SI NO ESTÁ CONECTADO)
+                                append = &gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_valign: gtk::Align::Center,
+                                    set_halign: gtk::Align::Center,
+                                    set_spacing: 16,
+                                    set_margin_top: 40,
+                                    #[watch]
+                                    set_visible: !model.is_connected,
+
+                                    append = &gtk::Image {
+                                        set_pixel_size: 96,
+                                        set_icon_name: Some("avatar-default-symbolic"),
+                                        set_css_classes: &["dim-label"],
+                                    },
+
+                                    append = &gtk::Label {
+                                        set_label: "Inicie sesión para continuar",
+                                        set_css_classes: &["title-1"],
+                                    },
+
+                                    append = &gtk::Button {
+                                        #[watch]
+                                        set_label: if model.login_url.is_some() { "Iniciar Sesión" } else { "Generando enlace..." },
+                                        #[watch]
+                                        set_sensitive: model.login_url.is_some(),
+                                        set_css_classes: &["suggested-action", "pill"],
+                                        set_margin_top: 16,
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(AppMsg::Login);
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    } -> {
+                        set_name: "main",
+                    },
+
+                    // ========== VISTA DE ACTIVIDAD ==========
+                    add_named[Some("activity")] = &gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 16,
+                        set_margin_all: 16,
+
+                        // Tarjeta de estado global
+                        append = &gtk::ListBox {
+                            set_css_classes: &["boxed-list"],
+                            set_selection_mode: gtk::SelectionMode::None,
+
+                            append = &adw::ActionRow {
+                                #[watch]
+                                set_title: &model.sync_hint_text(),
+                                set_subtitle: "Estado General",
+
+                                add_prefix = &gtk::Image {
+                                    #[watch]
+                                    set_icon_name: Some(
+                                        if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                            "view-refresh-symbolic"
+                                        } else {
+                                            "object-select-symbolic"
+                                        }
+                                    ),
+                                    #[watch]
+                                    set_css_classes: if model.scanning_total > 0 || model.active_transfers.iter().any(|t| t.operation != TransferOp::Stream) || model.sync_detected != model.sync_applied || model.pending_uploads > 0 {
+                                        &["accent"]
+                                    } else {
+                                        &["success"]
+                                    },
+                                },
+                            },
+                        },
+
+                        // Label "Descargando de Google Drive"
+                        append = &gtk::Label {
+                            set_label: "Descargando de Google Drive",
+                            set_halign: gtk::Align::Start,
+                            set_css_classes: &["heading"],
+                            #[watch]
+                            set_visible: model.active_transfers.iter().any(|t| t.operation == TransferOp::Download),
+                        },
+
+                        // Descargas activas
+                        #[name = "downloads_box"]
+                        append = &gtk::ListBox {
+                            set_css_classes: &["boxed-list"],
+                            set_selection_mode: gtk::SelectionMode::None,
+                            #[watch]
+                            set_visible: model.active_transfers.iter().any(|t| t.operation == TransferOp::Download),
+                        },
+
+                        // Label "Subiendo a Google Drive"
+                        append = &gtk::Label {
+                            set_label: "Subiendo a Google Drive",
+                            set_halign: gtk::Align::Start,
+                            set_css_classes: &["heading"],
+                            #[watch]
+                            set_visible: model.active_transfers.iter().any(|t| t.operation == TransferOp::Upload),
+                        },
+
+                        // Cargas activas
+                        #[name = "uploads_box"]
+                        append = &gtk::ListBox {
+                            set_css_classes: &["boxed-list"],
+                            set_selection_mode: gtk::SelectionMode::None,
+                            #[watch]
+                            set_visible: model.active_transfers.iter().any(|t| t.operation == TransferOp::Upload),
+                        },
+
+                        // Label "Historial"
+                        append = &gtk::Label {
+                            set_label: "Historial",
+                            set_halign: gtk::Align::Start,
+                            set_css_classes: &["heading"],
+                            #[watch]
+                            set_visible: !model.active_transfers.is_empty(),
+                        },
+
+                        // Historial scrolleable (pantalla completa)
+                        append = &gtk::ScrolledWindow {
+                            set_vexpand: true,
+                            set_hscrollbar_policy: gtk::PolicyType::Never,
+                            set_propagate_natural_height: false,
+
+                            #[wrap(Some)]
+                            #[name = "history_listbox"]
+                            set_child = &gtk::ListBox {
+                                set_css_classes: &["boxed-list"],
+                                set_selection_mode: gtk::SelectionMode::None,
+                            },
+                        },
+                    } -> {
+                        set_name: "activity",
+                    },
+
+                    #[watch]
+                    set_visible_child_name: match model.current_view {
+                        ViewMode::Main => "main",
+                        ViewMode::Activity => "activity",
+                    },
+                },
+            }
+        }
+    }
+
+    fn init(
+        _init: Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        // Forzar tema oscuro
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+
+        // Icono de la app para taskbar/dock (independiente del .desktop lookup)
+        gtk::Window::set_default_icon_name("org.gnome.FedoraDrive");
+
+        let sync_paused = Arc::new(AtomicBool::new(false));
+        let history = ActionHistory::new();
+
+        let mut model = AppModel {
+            status_message: "Iniciando G-DriveXP...".to_string(),
+            is_connected: false,
+            mirror_path: None,
+            fuse_mount_path: None,
+            sync_paused: sync_paused.clone(),
+            history: history.clone(),
+            db: None,
+            login_url: None,
+            activity_entries: Vec::new(),
+            mirror_degraded: false,
+            active_transfers: Vec::new(),
+            sync_detected: 0,
+            sync_applied: 0,
+            pending_uploads: 0,
+            scanning_total: 0,
+            local_sync_dirs: Vec::new(),
+            uploads_listbox: None,
+            downloads_listbox: None,
+            history_listbox: None,
+            sync_dirs_listbox: None,
+            current_view: ViewMode::Main,
+            shutdown_requested: false,
+        };
+
+        // Iniciar icono de bandeja
+        let tray = TrayIcon::new(history.clone(), sync_paused.clone());
+        let _tray_handle = tray.spawn();
+
+        // Registrar acción para mostrar ventana desde el tray (D-Bus)
+        let app = relm4::main_application();
+        let sender_show = sender.clone();
+        let show_action: gtk::gio::SimpleAction = gtk::gio::SimpleAction::new("show-window", None);
+        show_action.connect_activate(move |_, _| {
+            sender_show.input(AppMsg::ShowWindow);
+        });
+        app.add_action(&show_action);
+
+        // Timer de refresco de actividad cada 2 segundos
+        let sender_timer = sender.clone();
+        gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+            sender_timer.input(AppMsg::RefreshActivity);
+            gtk::glib::ControlFlow::Continue
+        });
+
+        // Atajo de teclado: Ctrl+Q para cerrar
+        let sender_quit = sender.clone();
+        let controller = gtk::ShortcutController::new();
+        let trigger = gtk::ShortcutTrigger::parse_string("<Control>q");
+        let action = gtk::CallbackAction::new(move |_, _| {
+            sender_quit.input(AppMsg::Quit);
+            gtk::glib::Propagation::Stop
+        });
+        let shortcut = gtk::Shortcut::new(trigger, Some(action));
+        controller.add_shortcut(shortcut);
+        root.add_controller(controller);
+
+        // Spawnear el backend en un hilo separado
+        let sender_clone = sender.clone();
+        let history_clone = history.clone();
+        let sync_paused_clone = sync_paused.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::run_backend(sender_clone, history_clone, sync_paused_clone) {
+                tracing::error!("Error en el backend: {:?}", e);
+            }
+        });
+
+        let widgets = view_output!();
+
+        // Guardar referencias a widgets dinámicos en el model
+        model.uploads_listbox = Some(widgets.uploads_box.clone());
+        model.downloads_listbox = Some(widgets.downloads_box.clone());
+        model.history_listbox = Some(widgets.history_listbox.clone());
+        model.sync_dirs_listbox = Some(widgets.sync_dirs_box.clone());
+
+        // Cargar logo embebido y asignarlo al widget
+        let logo_bytes = include_bytes!("../../assets/logo.png");
+        if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(logo_bytes)) {
+            let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+            widgets.logo_image.set_paintable(Some(&texture));
+        } else {
+            widgets.logo_image.set_icon_name(Some("drive-harddisk-symbolic"));
+        }
+
+        // Configurar manejador de cierre de ventana: Ocultar en lugar de Cerrar
+        let sender_clone = sender.clone();
+        root.connect_close_request(move |window| {
+            window.set_visible(false);
+            sender_clone.input(AppMsg::Hide);
+            gtk::glib::Propagation::Stop // Detener propagación para que no se destruya la ventana
+        });
+
+        ComponentParts { model, widgets }
+    }
+
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>, root: &Self::Root) {
+        match msg {
+            AppMsg::UpdateStatus(msg) => {
+                self.status_message = msg;
+            }
+            AppMsg::SetConnected(connected) => {
+                self.is_connected = connected;
+            }
+            AppMsg::SetPaths { mirror, fuse } => {
+                self.mirror_path = Some(mirror);
+                self.fuse_mount_path = Some(fuse);
+            }
+            AppMsg::OpenInNautilus => {
+                if let Some(ref path) = self.mirror_path {
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(path)
+                        .spawn();
+                } else {
+                    // Fallback al directorio por defecto
+                    let default = dirs::home_dir()
+                        .map(|h| h.join("GoogleDrive"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/GoogleDrive"));
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(default)
+                        .spawn();
+                }
+            }
+            AppMsg::SetPauseSync(paused) => {
+                let current = self.sync_paused.load(Ordering::Relaxed);
+                if current != paused {
+                    self.sync_paused.store(paused, Ordering::Relaxed);
+                    if paused {
+                        tracing::info!("Sincronización pausada");
+                        self.history.log(ActionType::Sync, "Sincronización pausada");
+                    } else {
+                        tracing::info!("Sincronización reanudada");
+                        self.history.log(ActionType::Sync, "Sincronización reanudada");
+                    }
+                }
+            }
+            AppMsg::Logout => {
+                tracing::info!("Cerrando sesión...");
+                self.status_message = "Cerrando sesión...".to_string();
+                // Revocar en Google + borrar lo local en background: el
+                // shutdown coordinado espera a LogoutDone (cortar antes
+                // dejaría el revoke a medias).
+                let sender = _sender.clone();
+                _sender.oneshot_command(async move {
+                    if let Err(e) = crate::auth::logout().await {
+                        tracing::error!("Error al cerrar sesión: {:?}", e);
+                    }
+                    sender.input(AppMsg::LogoutDone);
+                });
+            }
+            AppMsg::LogoutDone => {
+                // Apagado coordinado (no process::exit directo: fingiría un
+                // crash y el próximo arranque purgaría la caché). El backend
+                // desmonta FUSE en orden y escribe el marcador limpio.
+                crate::utils::shutdown::request_shutdown();
+            }
+            AppMsg::LogAction(action_type, description) => {
+                self.history.log(action_type, description);
+            }
+            AppMsg::Hide => {
+                tracing::info!("Ventana oculta, la aplicación sigue en background...");
+            }
+            AppMsg::ShowWindow => {
+                root.present();
+            }
+            AppMsg::SetDatabase(db) => {
+                self.db = Some(db);
+                _sender.input(AppMsg::LoadSyncDirs);
+            }
+            AppMsg::PrepareShutdown => {
+                self.shutdown_requested = true;
+                tracing::info!("🛑 Shutdown preparado, deteniendo operaciones de UI...");
+                
+                // El backend está esperando nuestra confirmación para proceder
+                // Todas las operaciones de GTK que puedan acceder a FUSE se bloquean ahora
+            }
+            AppMsg::Quit => {
+                tracing::info!("Cerrando aplicación...");
+                // Solo señalizar — el backend en main.rs ejecuta: hide → unmount → exit
+                crate::utils::shutdown::request_shutdown();
+            }
+            AppMsg::Restart => {
+                tracing::warn!("Reinicio solicitado: relanzando tras apagado coordinado...");
+                // Esperar a que ESTE proceso muera (sin carrera con el
+                // desmontaje FUSE y el marcador limpio del apagado
+                // coordinado) y relanzar el binario actual — mismo patrón
+                // que HardReset pero con apagado limpio, no exit inmediato.
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!(
+                            "while kill -0 {} 2>/dev/null; do sleep 0.5; done; sleep 1; {:?} &",
+                            std::process::id(),
+                            exe
+                        ))
+                        .spawn();
+                }
+                self.status_message = "Reiniciando...".to_string();
+                crate::utils::shutdown::request_shutdown();
+            }
+            AppMsg::HardReset => {
+                tracing::warn!("Ejecutando Hard Reset delegado a hilo secundario...");
+
+                // 1. Señalar que Hard Reset está en curso (evita que main.rs haga exit)
+                crate::HARD_RESET_IN_PROGRESS.store(true, Ordering::SeqCst);
+
+                // 2. Detener nuevos ciclos de sincronización/descarga de inmediato
+                self.sync_paused.store(true, Ordering::Relaxed);
+                
+                // 2. Dar retroalimentación en UI
+                self.status_message = "Purgando sistema, por favor espere...".to_string();
+
+                // 3. Clonar parámetros necesarios antes de mover al hilo
+                let fuse_path = self.fuse_mount_path.clone();
+
+                // 4. Delegar trabajo pesado (I/O bloqueante) a un hilo de sistema
+                std::thread::spawn(move || {
+                    tracing::info!("Hilo de limpieza en background iniciado.");
+
+                    // ORDEN CRÍTICO:
+                    // 1) Desmontar FUSE primero — si no, `rm -rf ~/GoogleDrive`
+                    //    atraviesa el mount FUSE y cada UNLINK propaga soft-deletes
+                    //    a Google Drive (¡borra datos de la nube!).
+                    // 2) Ejecutar limpieza (ahora ~/GoogleDrive es un dir normal).
+                    // 3) process::exit(0) inmediato — gana la carrera contra
+                    //    el exit de main.rs que reacciona al FUSE handle terminado.
+
+                    // Paso 1: Desmontar FUSE
+                    if let Some(path) = fuse_path {
+                        let _ = crate::utils::mount::unmount_and_wait(&path);
+                    }
+
+                    // Paso 2: Limpieza de datos locales (FUSE ya desmontado,
+                    //         rm -rf no pasa por el filesystem virtual)
+                    if let Err(e) = crate::utils::cleanup::perform_hard_reset() {
+                        tracing::error!("Error durante limpieza profunda: {:?}", e);
+                    }
+
+                    // Paso 2b: limpiar también el keyring (perform_hard_reset
+                    // solo toca disco: sin esto la sesión sobrevivía localmente
+                    // y el próximo arranque entraba sin pedir login).
+                    if let Err(e) = crate::auth::clear_all_auth_data() {
+                        tracing::error!("Error al limpiar credenciales del keyring: {:?}", e);
+                    }
+
+                    // Paso 3: Programar auto-reinicio
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(format!("sleep 2; {:?} &", exe))
+                            .spawn();
+                    }
+
+                    // Paso 4: Terminar proceso inmediatamente
+                    tracing::warn!("Hard Reset completado. Terminando proceso.");
+                    std::process::exit(0);
+                });
+            }
+            AppMsg::Login => {
+                if let Some(ref url) = self.login_url {
+                    tracing::info!("[System] Abriendo navegador para login: {}", url);
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(url)
+                        .spawn();
+                } else {
+                    tracing::warn!("[System] Intento de login sin URL disponible. Por favor espere.");
+                }
+            }
+            AppMsg::SetLoginUrl(url) => {
+                tracing::info!("URL de login recibida: {}", url);
+                self.login_url = Some(url);
+            }
+            AppMsg::LoadSyncDirs => {
+                match self.db.clone() {
+                    Some(db) => {
+                        let sender = _sender.clone();
+                        _sender.oneshot_command(async move {
+                            match db.get_local_sync_dirs().await {
+                                Ok(dirs) => sender.input(AppMsg::SyncDirsLoaded(dirs)),
+                                Err(e) => {
+                                    tracing::warn!("No se pudieron cargar las carpetas sincronizadas: {:?}", e);
+                                    sender.input(AppMsg::UpdateStatus(format!("Error cargando carpetas: {}", e)));
+                                }
+                            }
+                        });
+                    }
+                    None => tracing::warn!("LoadSyncDirs ignorado: DB aún no disponible (backend iniciando)"),
+                }
+            }
+            AppMsg::SyncDirsLoaded(dirs) => {
+                self.local_sync_dirs = dirs;
+                if let Some(ref box_widget) = self.sync_dirs_listbox {
+                    Self::rebuild_sync_dirs_box(box_widget, &self.local_sync_dirs, &_sender);
+                }
+            }
+            AppMsg::SelectNewSyncDir => {
+                let dialog = gtk::FileDialog::builder()
+                    .title("Seleccionar carpeta para sincronizar")
+                    .build();
+                let sender_clone = _sender.clone();
+                // Pass the root window explicitly since context requires it in GTK4
+                dialog.select_folder(Some(root), gtk::gio::Cancellable::NONE, move |res| {
+                    if let Ok(folder) = res {
+                        if let Some(path) = folder.path() {
+                            sender_clone.input(AppMsg::AddSyncDir(path));
+                        }
+                    }
+                });
+            }
+            AppMsg::AddSyncDir(path) => {
+                match self.db.clone() {
+                    Some(db) => {
+                        let sender = _sender.clone();
+                        _sender.oneshot_command(async move {
+                            match db.add_local_sync_dir(&path).await {
+                                Ok(_) => sender.input(AppMsg::LoadSyncDirs),
+                                Err(e) => {
+                                    tracing::warn!("No se pudo agregar la carpeta {:?}: {:?}", path, e);
+                                    sender.input(AppMsg::UpdateStatus(format!("Error agregando carpeta: {}", e)));
+                                }
+                            }
+                        });
+                    }
+                    None => tracing::warn!("AddSyncDir ignorado: DB aún no disponible (backend iniciando)"),
+                }
+            }
+            AppMsg::RemoveSyncDir(id) => {
+                match self.db.clone() {
+                    Some(db) => {
+                        let sender = _sender.clone();
+                        _sender.oneshot_command(async move {
+                            match db.remove_local_sync_dir(id).await {
+                                Ok(_) => sender.input(AppMsg::LoadSyncDirs),
+                                Err(e) => {
+                                    tracing::warn!("No se pudo quitar la carpeta sync id={}: {:?}", id, e);
+                                    sender.input(AppMsg::UpdateStatus(format!("Error quitando carpeta: {}", e)));
+                                }
+                            }
+                        });
+                    }
+                    None => tracing::warn!("RemoveSyncDir ignorado: DB aún no disponible (backend iniciando)"),
+                }
+            }
+            AppMsg::ToggleSyncDir(id, enabled) => {
+                match self.db.clone() {
+                    Some(db) => {
+                        let sender = _sender.clone();
+                        _sender.oneshot_command(async move {
+                            match db.toggle_local_sync_dir(id, enabled).await {
+                                Ok(_) => sender.input(AppMsg::LoadSyncDirs),
+                                Err(e) => {
+                                    tracing::warn!("No se pudo cambiar la carpeta sync id={}: {:?}", id, e);
+                                    sender.input(AppMsg::UpdateStatus(format!("Error cambiando carpeta: {}", e)));
+                                }
+                            }
+                        });
+                    }
+                    None => tracing::warn!("ToggleSyncDir ignorado: DB aún no disponible (backend iniciando)"),
+                }
+            }
+            AppMsg::RefreshActivity => {
+                // Leer datos del historial compartido
+                self.activity_entries = self.history.recent(20);
+                // Sondear la salud del espejo (flag del backend, sin canal nuevo).
+                self.mirror_degraded =
+                    crate::mirror::MIRROR_DEGRADED.load(Ordering::SeqCst);
+                self.active_transfers = self.history.active_transfers();
+                let progress = self.history.get_sync_progress();
+                self.sync_detected = progress.changes_detected;
+                self.sync_applied = progress.changes_applied;
+                self.pending_uploads = progress.pending_uploads;
+                self.scanning_total = progress.scanning_total;
+
+                // Rebuild imperativo de los listbox dinámicos
+                if let Some(ref uploads_box) = self.uploads_listbox {
+                    let uploads: Vec<&ActiveTransfer> = self.active_transfers.iter()
+                        .filter(|t| t.operation == TransferOp::Upload).collect();
+                    Self::rebuild_transfers_box(uploads_box, &uploads);
+                }
+                if let Some(ref downloads_box) = self.downloads_listbox {
+                    let downloads: Vec<&ActiveTransfer> = self.active_transfers.iter()
+                        .filter(|t| t.operation == TransferOp::Download).collect(); // Esto ya filtra por Download (excluyendo Stream)
+                    Self::rebuild_transfers_box(downloads_box, &downloads);
+                }
+                if let Some(ref history_box) = self.history_listbox {
+                    Self::rebuild_history_listbox(history_box, &self.activity_entries);
+                }
+            }
+            AppMsg::ShowActivityView => {
+                self.current_view = ViewMode::Activity;
+            }
+            AppMsg::ShowMainView => {
+                self.current_view = ViewMode::Main;
+            }
+        }
+    }
+}

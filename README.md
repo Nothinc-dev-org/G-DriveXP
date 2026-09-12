@@ -1,115 +1,36 @@
 # G-DriveXP
 
 Cliente nativo de Google Drive para Fedora Workstation/GNOME, escrito en Rust.
+Monta un sistema de archivos virtual FUSE asíncrono, sincroniza metadatos y
+contenido bidireccionalmente, y se integra con Nautilus mediante extensión nativa.
 
-Monta un sistema de archivos virtual FUSE, sincroniza metadatos y contenido bidireccionalmente, y se integra con el explorador Nautilus mediante emblemas de estado.
+## Estructura
 
-## Características
+| Directorio      | Contenido |
+|-----------------|-----------|
+| `g-drive-xp/`   | Crate principal: daemon, GUI (GTK4/Libadwaita), FUSE, sync, SQLite |
+| `nautilus-ext/` | Extensión de Nautilus (cdylib). Espejo del repo [G-DriveXp-nautilus-ext](https://github.com/Nothinc-dev-org/G-DriveXp-nautilus-ext) |
+| `docs/`         | Arquitectura (`architecture.md`) y decisiones (`decisions/`) |
 
-- Sistema de archivos virtual FUSE3 asíncrono
-- Sincronización bidireccional con caché de metadatos SQLite
-- Interfaz nativa GNOME con GTK4/Libadwaita
-- Autenticación OAuth2 con almacenamiento en GNOME Keyring
-- Extensión de Nautilus con emblemas de estado de sincronización
-- Icono en la bandeja del sistema (SNI/DBus)
-
-## Instalación
-
-### Opción 1: Script de instalación (recomendado)
+## Compilar y empaquetar
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Nothinc-dev-org/G-DriveXP/v1.0.1/packaging/install.sh | bash
+make build    # ambos crates en release
+make package  # tarball dist/g-drive-xp-<ver>-x86_64.tar.gz
+make rpm      # RPM de Fedora en dist/
+make install  # instala en el sistema (DESTDIR soportado)
 ```
 
-Descarga los binarios pre-compilados de GitHub Releases e instala el cliente, la extensión de Nautilus, iconos y archivo `.desktop`.
-
-### Opción 2: Paquete RPM
-
-Descarga el RPM desde la [página de Releases](https://github.com/Nothinc-dev-org/G-DriveXP/releases/latest):
+## Instalación (usuarios)
 
 ```bash
-sudo dnf install ./g-drive-xp-1.0.1-1.fc*.x86_64.rpm
+curl -fsSL https://raw.githubusercontent.com/Nothinc-dev-org/G-DriveXP/v1.1.0/g-drive-xp/packaging/install.sh | bash
 ```
 
-### Opción 3: Compilar desde fuente
+O descarga el RPM desde [Releases](https://github.com/Nothinc-dev-org/G-DriveXP/releases/latest).
 
-#### Requisitos
+## Documentación
 
-- Fedora Workstation 39+
-- Rust 1.85+ (Edition 2024)
-
-#### Dependencias de compilación
-
-```bash
-sudo dnf install -y \
-    rust cargo sqlite-devel gtk4-devel \
-    libadwaita-devel fuse3-devel glib2-devel \
-    gobject-introspection-devel cairo-gobject-devel \
-    pango-devel gdk-pixbuf2-devel graphene-devel \
-    openssl-devel pkg-config nautilus-devel
-```
-
-#### Compilar e instalar
-
-```bash
-git clone https://github.com/Nothinc-dev-org/G-DriveXP.git
-cd G-DriveXP
-cargo build --release
-./scripts/install-icons.sh
-```
-
-Para instalar también la extensión de Nautilus, clona el repo hermano y ejecuta el instalador:
-
-```bash
-cd ..
-git clone https://github.com/Nothinc-dev-org/G-DriveXp-nautilus-ext.git
-cd G-DriveXp-nautilus-ext
-cargo build --release
-cd ..
-./G-DriveXP/packaging/build-release.sh
-```
-
-## Configuración
-
-### Credenciales OAuth2
-
-1. Ve a [Google Cloud Console](https://console.cloud.google.com)
-2. Crea un proyecto y habilita la API de Google Drive
-3. Crea credenciales OAuth2 para "Aplicación de escritorio"
-4. Descarga `credentials.json` y colócalo en `~/.config/fedoradrive/credentials.json`
-
-### FUSE (opcional)
-
-Para que aplicaciones de terceros accedan al sistema de archivos virtual:
-
-1. Descomenta `user_allow_other` en `/etc/fuse.conf`
-2. Asegúrate de que tu usuario esté en el grupo `fuse`
-
-## Uso
-
-Abre **G-DriveXP** desde el menú de aplicaciones de GNOME. La primera vez te pedirá autenticarte con tu cuenta de Google.
-
-El sistema de archivos se monta en `~/GoogleDrive/`. Los archivos aparecen como:
-- **Online Only**: symlinks al punto de montaje FUSE (sin ocupar espacio)
-- **Local & Online**: copias reales sincronizadas bidireccionalmente
-
-## Limitaciones conocidas
-
-- Algunas aplicaciones GNOME basadas en GTK4/GJS pueden fallar al abrir archivos Online Only debido a restricciones de seguridad con symlinks. Solución: navega directamente a `~/GoogleDrive/FUSE_Mount/` o sincroniza el archivo a local.
-
-## Extensión de Nautilus
-
-La extensión se instala automáticamente con el RPM o el script de instalación. Muestra emblemas de estado en los archivos dentro de `~/GoogleDrive/`:
-
-| Emblema | Significado |
-|---------|-------------|
-| Verde   | Sincronizado |
-| Azul    | Solo en Drive |
-| Naranja | Pendiente de subida |
-| Rojo    | Error |
-
-Repo de la extensión: [G-DriveXp-nautilus-ext](https://github.com/Nothinc-dev-org/G-DriveXp-nautilus-ext)
-
-## Licencia
-
-GPL-3.0
+- [docs/architecture.md](docs/architecture.md) — arquitectura canónica
+- [g-drive-xp/README.md](g-drive-xp/README.md) — características e instalación del cliente
+- [Plan-Desarrollo.md](Plan-Desarrollo.md) — plan técnico

@@ -1,0 +1,810 @@
+//! Sincronizador en background para detectar y aplicar cambios de Google Drive
+//!
+//! Utiliza la API changes.list para polling incremental de cambios.
+
+use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock;
+use futures::stream::{self, StreamExt};
+
+use crate::db::MetadataRepository;
+use crate::gdrive::client::{DriveClient, CHUNK_TIMEOUT, CONTROL_TIMEOUT};
+
+/// Clave en sync_meta para el page token de changes
+const SYNC_META_PAGE_TOKEN: &str = "changes_page_token";
+
+
+/// Intervalo máximo de backoff en segundos
+const MAX_BACKOFF_SECS: u64 = 300;
+
+
+/// Período de gracia para tombstones en días
+const TOMBSTONE_GRACE_DAYS: i64 = 7;
+
+/// Fallos consecutivos tras los cuales un cambio remoto pasa a cuarentena
+/// visible (se avanza el token con registro de error en lugar de retener
+/// la página para siempre). Con el intervalo base de 60s, ~5 minutos.
+const MAX_CHANGE_FAILURES: i64 = 5;
+
+use crate::gui::history::{ActionHistory, ActionType, TransferOp};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Sincronizador en background que detecta cambios de Google Drive
+pub struct BackgroundSyncer {
+    db: Arc<MetadataRepository>,
+    client: Arc<DriveClient>,
+    interval: Duration,
+    history: ActionHistory,
+    sync_paused: Arc<AtomicBool>,
+    root_id_cache: Arc<RwLock<Option<String>>>,
+    mirror_tx: tokio::sync::mpsc::Sender<crate::mirror::manager::MirrorCommand>,
+}
+
+impl BackgroundSyncer {
+    /// Crea un nuevo sincronizador
+    pub fn new(
+        db: Arc<MetadataRepository>,
+        client: Arc<DriveClient>,
+        interval_secs: u64,
+        history: ActionHistory,
+        sync_paused: Arc<AtomicBool>,
+        mirror_tx: tokio::sync::mpsc::Sender<crate::mirror::manager::MirrorCommand>,
+    ) -> Self {
+        Self {
+            db,
+            client,
+            interval: Duration::from_secs(interval_secs),
+            history,
+            sync_paused,
+            root_id_cache: Arc::new(RwLock::new(None)),
+            mirror_tx,
+        }
+    }
+
+    /// Inicia el loop de sincronización en un task de Tokio separado
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tracing::info!("🔄 Background Syncer iniciado (intervalo: {:?})", self.interval);
+            
+            let mut current_backoff = self.interval;
+            
+            loop {
+                // Verificar si se solicitó shutdown
+                if crate::utils::shutdown::is_shutdown_requested() {
+                    tracing::info!("🛑 Syncer: Shutdown detectado, deteniendo sincronización.");
+                    break;
+                }
+
+                // Verificar si está pausado
+                if self.sync_paused.load(Ordering::Relaxed) {
+                    sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+
+                match self.sync_once().await {
+                    Ok(changes_count) => {
+                        if changes_count > 0 {
+                            tracing::info!("✅ Sincronización completada: {} cambios procesados", changes_count);
+                            self.history.log(
+                                ActionType::Sync, 
+                                format!("Sincronizados {} cambios remotos", changes_count)
+                            );
+                        }
+                        // Reset backoff en caso de éxito
+                        current_backoff = self.interval;
+                    }
+                    Err(e) => {
+                        tracing::error!("❌ Error en sincronización: {:?}", e);
+                        self.history.log(ActionType::Error, "Error en sincronización remota");
+                        
+                        // Exponential backoff
+                        current_backoff = std::cmp::min(
+                            current_backoff * 2,
+                            Duration::from_secs(MAX_BACKOFF_SECS)
+                        );
+                        tracing::warn!("Próximo intento en {:?}", current_backoff);
+                    }
+                }
+                
+                sleep(current_backoff).await;
+            }
+        })
+    }
+
+    /// Ejecuta un ciclo de sincronización
+    /// Retorna el número de cambios aplicados con éxito (NO los meramente listados).
+    /// Público para permitir un sync inicial antes de montar FUSE.
+    pub async fn sync_once(&self) -> Result<usize> {
+        // Asegurarnos de tener el ID del root
+        let root_id = self.get_cached_root_id().await?;
+
+        // 1. Obtener page_token guardado o solicitar uno nuevo
+        let mut page_token = match self.db.get_sync_meta(SYNC_META_PAGE_TOKEN).await? {
+            Some(token) => token,
+            None => {
+                // Primera vez: obtener startPageToken
+                let token = DriveClient::timed("get_start_page_token", CONTROL_TIMEOUT, self.client.get_start_page_token()).await?;
+                self.db.set_sync_meta(SYNC_META_PAGE_TOKEN, &token).await?;
+                tracing::info!("Primer startPageToken obtenido y guardado: {}", token);
+                token
+            }
+        };
+
+        let mut total_fetched = 0;
+        let mut total_applied = 0;
+
+        loop {
+            // 2. Consultar cambios
+            let (changes, next_token, has_more) = DriveClient::timed("list_changes", CONTROL_TIMEOUT, self.client.list_changes(&page_token)).await?;
+            
+            let changes_count = changes.len();
+            total_fetched += changes_count;
+
+            // 3. Procesar cada cambio (con tracking de progreso)
+            if changes_count > 0 {
+                self.history.set_sync_progress(total_fetched, total_applied);
+            }
+            
+            let root_id_arc = Arc::new(root_id.clone());
+
+            let process_results = stream::iter(changes)
+                .map(|change| {
+                    let root_id_ref = root_id_arc.clone();
+                    // Clave de cuarentena: file_id, o fallback estable si falta
+                    // (process_change ya falla sin file_id; la cuarentena lo retiene).
+                    let key = change.file_id.clone().unwrap_or_else(|| "unknown_file_id".to_string());
+                    async move {
+                        let res = self.process_change(change, &root_id_ref).await;
+                        (key, res)
+                    }
+                })
+                .buffer_unordered(4)
+                .collect::<Vec<_>>()
+                .await;
+
+            let mut failed_ids: Vec<String> = Vec::new();
+            let mut quarantined: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (key, res) in process_results {
+                match res {
+                    Ok(()) => {
+                        // Éxito: limpia cuarentena previa y cuenta como aplicado.
+                        if let Err(e) = self.db.clear_change_failure(&key).await {
+                            tracing::warn!("No se pudo limpiar cuarentena de {}: {:?}", key, e);
+                        }
+                        self.history.increment_applied();
+                        total_applied += 1;
+                    }
+                    Err(e) => {
+                        failed_ids.push(key.clone());
+                        let err_short: String = format!("{:?}", e).chars().take(500).collect();
+                        // Si ni la cuarentena se puede registrar, cuenta como no
+                        // cuarentenado (0) → la página se retiene (fail-safe).
+                        let failures = self.db.record_change_failure(&key, &err_short).await.unwrap_or(0);
+                        if failures >= MAX_CHANGE_FAILURES {
+                            quarantined.insert(key.clone());
+                            tracing::error!("⛔ Cambio en cuarentena tras {} fallos (file_id={}): se avanza con registro visible. Último error: {}", failures, key, err_short);
+                            self.history.log(ActionType::Error, format!("Cambio en cuarentena: {} ({} fallos)", key, failures));
+                        } else {
+                            tracing::warn!("Error procesando cambio individual (file_id={}, fallo {}/{}): {}", key, failures, MAX_CHANGE_FAILURES, err_short);
+                        }
+                    }
+                }
+            }
+
+            // 4. Avanzar token SOLO si la página aplicó completa o los fallidos
+            // ya están en cuarentena visible. Retener = reintentar la MISMA
+            // página en el próximo ciclo (el token guardado no se mueve).
+            // Sin esto, los cambios fallidos se pierden en silencio para siempre.
+            let mut page_advanced = true;
+            if let Some(new_token) = next_token {
+                if should_advance_token(&failed_ids, &quarantined) {
+                    self.db.set_sync_meta(SYNC_META_PAGE_TOKEN, &new_token).await?;
+                    tracing::debug!("Nuevo pageToken guardado: {}", new_token);
+                    page_token = new_token;
+                } else {
+                    page_advanced = false;
+                    tracing::warn!("⏸️ Página retenida: {} cambios fallidos sin cuarentena. Token no avanzado; se reintentará.", failed_ids.len());
+                    self.history.log(ActionType::Error, format!("Sync parcial: {} cambios retenidos para reintento", failed_ids.len()));
+                }
+            }
+
+            if !has_more || !page_advanced {
+                break;
+            }
+        }
+
+        if total_applied > 0 {
+            self.history.mark_all_synced();
+            if let Err(e) = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::Refresh).await {
+                tracing::warn!("⚠️ Aviso al mirror perdido (Refresh): {}", e);
+            }
+        }
+
+        // 5. Purgar tombstones expirados (cada ciclo, es barato)
+        let purged = self.db.purge_expired_tombstones(TOMBSTONE_GRACE_DAYS).await?;
+        if purged > 0 {
+            tracing::info!("Purgados {} tombstones expirados", purged);
+        }
+
+        Ok(total_applied)
+    }
+
+    /// Obtiene el root_id cacheado o lo descarga
+    async fn get_cached_root_id(&self) -> Result<String> {
+        {
+            let guard = self.root_id_cache.read().await;
+            if let Some(id) = &*guard {
+                return Ok(id.clone());
+            }
+        }
+        tracing::info!("Obteniendo ID canónico de Google Drive root...");
+        let id = DriveClient::timed("get_root_file_id", CONTROL_TIMEOUT, self.client.get_root_file_id()).await?;
+        let mut guard = self.root_id_cache.write().await;
+        *guard = Some(id.clone());
+        Ok(id)
+    }
+
+    async fn get_relative_path_for_deletion(&self, file_id: &str) -> Option<String> {
+        if let Ok(Some(inode)) = sqlx::query_scalar::<_, i64>("SELECT inode FROM inodes WHERE gdrive_id = ?")
+            .bind(file_id)
+            .fetch_optional(self.db.pool())
+            .await 
+        {
+            if let Ok(Some(rel_path)) = self.db.resolve_inode_to_relative_path(inode as u64).await {
+                return Some(rel_path);
+            }
+        }
+        None
+    }
+
+    /// Procesa un cambio individual de la API
+    async fn process_change(&self, change: google_drive3::api::Change, root_id: &str) -> Result<()> {
+        let file_id = change.file_id.as_deref()
+            .context("Cambio sin file_id")?;
+
+        // Caso 1: Archivo eliminado permanentemente (ya no existe en Drive)
+        if change.removed == Some(true) {
+            tracing::debug!("Cambio detectado: REMOVED (hard delete) file_id={}", file_id);
+            let path_to_delete = self.get_relative_path_for_deletion(file_id).await;
+            // El archivo fue eliminado permanentemente de Drive (incluyendo papelera vacía)
+            // → Hard delete: eliminar completamente de la DB local
+            self.db.hard_delete_by_gdrive_id(file_id).await?;
+            if let Some(p) = path_to_delete {
+                if let Err(e) = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await {
+                    tracing::warn!("⚠️ Aviso al mirror perdido (RemoteDeleted): {}", e);
+                }
+            }
+            return Ok(());
+        }
+
+        // Caso 2: Archivo con datos
+        if let Some(file) = change.file {
+            // Verificar si está en la papelera
+            if file.trashed == Some(true) {
+                tracing::debug!("Cambio detectado: TRASHED file_id={}", file_id);
+                let path_to_delete = self.get_relative_path_for_deletion(file_id).await;
+                // Usar soft_delete_remote: NO marca dirty porque la eliminación
+                // ya ocurrió en GDrive y no necesita re-subirse por el uploader.
+                self.db.soft_delete_remote(file_id).await?;
+                if let Some(p) = path_to_delete {
+                    if let Err(e) = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await {
+                    tracing::warn!("⚠️ Aviso al mirror perdido (RemoteDeleted): {}", e);
+                }
+                }
+                return Ok(());
+            }
+
+            // Caso 3: Archivo restaurado (estaba en tombstone pero ya no está trashed)
+            let was_restored = if self.db.has_tombstone(file_id).await? {
+                tracing::debug!("Cambio detectado: RESTORED file_id={}", file_id);
+                self.db.restore_by_gdrive_id(file_id).await?;
+                true
+            } else {
+                false
+            };
+
+            // Caso 4: Archivo nuevo o modificado
+            let name = file.name.as_deref().unwrap_or("unknown");
+
+            // Resolver shortcuts: usar mime y size del target
+            let shortcut_info = crate::sync::bootstrap::resolve_shortcut_info(&file);
+            let effective_mime = shortcut_info.as_ref()
+                .map(|(_, mime)| mime.as_str())
+                .or(file.mime_type.as_deref());
+
+            let is_dir = effective_mime == Some("application/vnd.google-apps.folder");
+            let size = file.size.unwrap_or(0);
+            let mtime = file.modified_time
+                .as_ref()
+                .map(|t| t.timestamp())
+                .unwrap_or(0);
+            let mode = if is_dir { 0o755 } else { 0o644 };
+
+            let can_move = file.capabilities.as_ref()
+                .and_then(|c| c.can_move_item_within_drive)
+                .unwrap_or(true);
+
+            let shared = file.shared.unwrap_or(false);
+
+            // Obtener o crear inode
+            let inode = self.db.get_or_create_inode(file_id).await?;
+
+            // Invalidar caché si el contenido del archivo cambió remotamente.
+            // Compara size y md5 anteriores contra los nuevos antes de actualizar.
+            if !is_dir {
+                let old_size: Option<i64> = sqlx::query_scalar(
+                    "SELECT size FROM attrs WHERE inode = ?"
+                )
+                .bind(inode as i64)
+                .fetch_optional(self.db.pool())
+                .await
+                .unwrap_or(None);
+
+                let old_md5 = self.db.get_remote_md5(inode).await.unwrap_or(None);
+                let new_md5 = file.md5_checksum.as_deref();
+
+                let size_changed = old_size.map(|s| s != size).unwrap_or(false);
+                let md5_changed = match (old_md5.as_deref(), new_md5) {
+                    (Some(old), Some(new)) => old != new,
+                    _ => false,
+                };
+
+                if size_changed || md5_changed {
+                    tracing::info!(
+                        "🔄 Contenido remoto cambió para inode {}: size {}→{}, md5_changed={}. Invalidando caché.",
+                        inode,
+                        old_size.unwrap_or(-1),
+                        size,
+                        md5_changed
+                    );
+                    let _ = self.db.clear_chunks(inode).await;
+                }
+            }
+
+            // Actualizar metadatos
+            self.db.upsert_file_metadata(
+                inode,
+                size,
+                mtime,
+                mode,
+                is_dir,
+                effective_mime,
+                can_move,
+                shared,
+                file.owned_by_me.unwrap_or(true),
+            ).await?;
+
+            // Resolver shortcut: guardar target_id y copiar size del target
+            if let Some((target_id, _)) = &shortcut_info {
+                self.db.set_shortcut_target_id(inode, target_id).await?;
+                let _ = self.db.resolve_shortcut_sizes().await;
+            }
+
+            // Actualizar dentry (árbol de directorios)
+            // IMPORTANTE: Si el archivo tiene cambios locales pendientes (dirty),
+            // NO sobreescribir la dentry. El cambio remoto es probablemente un eco
+            // de una operación previa nuestra, y el estado local (posiblemente un
+            // segundo movimiento) tiene prioridad.
+            let is_dirty = self.db.is_dirty(inode).await.unwrap_or(false);
+            let owned = file.owned_by_me.unwrap_or(true);
+            if !is_dirty {
+                if let Some(parents) = &file.parents {
+                    for parent_id in parents {
+                        // Google Drive usa "root" o el ID canónico (root_id) para el "My Drive" del usuario
+                        // Ambos deben mapearse al inode 1 (root del filesystem local)
+                        let parent_inode = if parent_id == "root" || parent_id == root_id {
+                            1u64
+                        } else {
+                            let pi = self.db.get_or_create_inode(parent_id).await?;
+                            // Si el archivo no es nuestro y su padre no está conectado
+                            // al árbol (no tiene dentry), vincularlo directamente al root.
+                            // Los archivos "Shared with me" tienen padres en el Drive
+                            // del propietario original, inalcanzables desde nuestro root.
+                            if !owned && !self.db.has_dentry(pi).await.unwrap_or(true) {
+                                1u64
+                            } else {
+                                pi
+                            }
+                        };
+                        self.db.upsert_dentry(parent_inode, inode, name).await?;
+                    }
+                } else {
+                    // Sin padres → colgar del root
+                    self.db.upsert_dentry(1, inode, name).await?;
+                }
+            } else {
+                tracing::debug!(
+                    "⏭️ Saltando actualización de dentry para inode={} (dirty): el cambio remoto es un eco",
+                    inode
+                );
+            }
+
+            // Asegurar dir_counters para directorios nuevos
+            if is_dir {
+                self.db.ensure_dir_counter(inode).await?;
+            }
+
+            // Actualizar remote_md5 si está disponible (para detección de conflictos)
+            if let Some(md5) = file.md5_checksum.clone() {
+                self.db.set_remote_md5(inode, &md5).await?;
+            }
+
+            tracing::trace!(
+                "Cambio detectado: UPSERT file_id={}, name={}, is_dir={}",
+                file_id, name, is_dir
+            );
+
+            // Notificar al MirrorManager si el archivo fue restaurado desde la papelera
+            if was_restored {
+                if let Ok(Some(rel_path)) = self.db.resolve_inode_to_relative_path(inode as u64).await {
+                    if let Err(e) = self.mirror_tx.send(
+                        crate::mirror::manager::MirrorCommand::RemoteRestored { paths: vec![rel_path] }
+                    ).await {
+                        tracing::warn!("⚠️ Aviso al mirror perdido (RemoteRestored): {}", e);
+                    }
+                }
+            }
+
+            // Verificar si este archivo pertenece a un Local Sync Directory
+            if let Err(e) = self.process_local_sync_change(&file,file_id).await {
+                tracing::warn!("Error procesando cambio local sync para {}: {:?}", file_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Procesa cambios remotos para archivos que pertenecen a Local Sync
+    async fn process_local_sync_change(
+        &self,
+        file: &google_drive3::api::File,
+        file_id: &str,
+    ) -> Result<()> {
+        // Buscar si este archivo está en local_sync_files
+        let local_file = match self.db.find_local_sync_file_by_gdrive_id(file_id).await? {
+            Some(f) => f,
+            None => return Ok(()), // No es un archivo de local sync
+        };
+
+        let base_dir = self.db.get_local_sync_dir(local_file.sync_dir_id).await?;
+        let local_path = std::path::PathBuf::from(&base_dir.local_path).join(&local_file.relative_path);
+
+        tracing::debug!("Procesando cambio local sync: {}", local_file.relative_path);
+
+        match local_file.availability.as_str() {
+            "local_online" => {
+                // dirty=1 + cambio remoto = conflicto potencial: no descargar
+                // ni tocar la fila (el uploader lo resuelve con copia visible).
+                if local_file.dirty {
+                    tracing::warn!("⚠️ Conflicto local-sync: cambio remoto pendiente pero hay edición local sin subir ({}). Se conserva el local; el uploader lo resolverá.", local_file.relative_path);
+                    return Ok(());
+                }
+                // Descargar contenido actualizado al path local
+                if !file.mime_type.as_deref().map(|m| m.contains("folder")).unwrap_or(false) {
+                    let name_display = std::path::PathBuf::from(&local_file.relative_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| local_file.relative_path.clone());
+                    self.history.log(ActionType::Download, format!("Descargando: {}", name_display));
+                    tracing::info!("📥 Descargando actualización para: {}", local_file.relative_path);
+                    
+                    // Descargar archivo usando chunks (con tracking de progreso)
+                    let file_size = file.size.unwrap_or(0) as u64;
+
+                    // Guardia: no sobrescribir archivo local con contenido vacío
+                    if should_protect_local_file(file_size, &local_path).await {
+                        let existing_size = tokio::fs::metadata(&local_path).await.map(|m| m.len()).unwrap_or(0);
+                        tracing::warn!("🛡️ API retornó size=0 para archivo local de {} bytes. No sobrescribiendo: {}", existing_size, local_file.relative_path);
+                        return Ok(());
+                    }
+
+                    let transfer_id = self.history.start_transfer(&name_display, TransferOp::Download, file_size);
+
+                    // Streaming a temporal + rename atómico: el archivo completo
+                    // nunca vive en RAM y jamás se publica un parcial (crash a
+                    // mitad = tmp huérfano que el reintento trunca de nuevo).
+                    // El tmp vive en el mismo dir (rename atómico garantizado).
+                    if let Some(parent) = local_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    let tmp_path = download_temp_path(&local_path);
+                    let dl_result: Result<()> = async {
+                        let mut tmp = tokio::fs::File::create(&tmp_path).await?;
+                        stream_chunks_to_file(
+                            &mut tmp,
+                            file_size,
+                            |off, size| {
+                                DriveClient::timed(
+                                    "download_chunk",
+                                    CHUNK_TIMEOUT,
+                                    self.client.download_chunk(file_id, off, size),
+                                )
+                            },
+                            |off| self.history.update_transfer_progress(transfer_id, off),
+                        )
+                        .await?;
+                        tmp.flush().await?;
+                        tmp.sync_all().await?;
+                        Ok(())
+                    }
+                    .await;
+                    if dl_result.is_err() {
+                        // No dejar parciales: el reintento parte de cero.
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                    }
+                    dl_result?;
+                    commit_temp_file(&tmp_path, &local_path).await?;
+
+                    self.history.complete_transfer(transfer_id);
+                    
+                    // Actualizar metadatos en DB
+                    let md5 = file.md5_checksum.as_deref();
+                    let mtime = file.modified_time.as_ref().map(|t| t.timestamp());
+                    
+                    self.db.update_local_file_from_remote(
+                        local_file.id,
+                        md5,
+                        mtime,
+                    ).await?;
+                    
+                    self.history.log(ActionType::Download, format!("Descargado: {}", name_display));
+                    tracing::info!("✅ Archivo actualizado localmente: {}", local_file.relative_path);
+                }
+            }
+            "online_only" => {
+                // Solo actualizar metadatos (el symlink accederá a FUSE)
+                let md5 = file.md5_checksum.as_deref();
+                self.db.update_local_file_remote_metadata(local_file.id, md5).await?;
+                tracing::debug!("Metadatos remotos actualizados para online_only: {}", local_file.relative_path);
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+/// Descarga por chunks escribiendo directo al archivo (streaming).
+///
+/// RAM acotada a un chunk (10 MB) sin importar el tamaño total. Un chunk
+/// vacío es error: sin esto, el loop pediría el mismo rango eternamente,
+/// quemando un timeout entero por iteración.
+async fn stream_chunks_to_file<W, F, Fut, P>(
+    out: &mut W,
+    file_size: u64,
+    mut fetch_chunk: F,
+    mut on_progress: P,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+    F: FnMut(u64, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    P: FnMut(u64),
+{
+    const CHUNK_SIZE: u32 = 10 * 1024 * 1024; // 10 MB
+    let mut offset = 0u64;
+    while offset < file_size {
+        let size = std::cmp::min(CHUNK_SIZE, (file_size - offset) as u32);
+        let chunk = fetch_chunk(offset, size).await?;
+        if chunk.is_empty() {
+            anyhow::bail!(
+                "chunk vacío en offset {} de {} bytes (servidor atascado)",
+                offset,
+                file_size
+            );
+        }
+        out.write_all(&chunk).await?;
+        offset += chunk.len() as u64;
+        on_progress(offset);
+    }
+    Ok(())
+}
+
+/// Path temporal para descargas en curso: mismo dir que el destino (el rename
+/// posterior es atómico solo dentro del mismo filesystem), sufijo propio que
+/// ningún lector sirve y que el reintento trunca de nuevo.
+fn download_temp_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "descarga".to_string());
+    dest.with_file_name(format!("{}.gdrivexp-part", name))
+}
+
+/// Publica tmp→dest atómicamente. Si el rename no se completa, dest queda
+/// intacto (el lector nunca ve un parcial).
+async fn commit_temp_file(tmp_path: &std::path::Path, dest_path: &std::path::Path) -> Result<()> {
+    tokio::fs::rename(tmp_path, dest_path)
+        .await
+        .with_context(|| format!("rename atómico {:?} → {:?}", tmp_path, dest_path))?;
+    Ok(())
+}
+
+/// Decide si el page token puede avanzar tras procesar una página.
+///
+/// Solo avanza si no hubo fallos, o si TODOS los fallidos ya están en
+/// cuarentena visible (reintentos agotados, con registro de error).
+/// Retener el token = la página se re-lista en el próximo ciclo (los cambios
+/// de Drive son rejugables; aplicar dos veces es idempotente vía upserts).
+/// Avanzar con fallos no cuarentenados = divergencia silenciosa permanente.
+fn should_advance_token(failed_ids: &[String], quarantined: &std::collections::HashSet<String>) -> bool {
+    failed_ids.iter().all(|id| quarantined.contains(id))
+}
+
+/// Decide si se debe proteger un archivo local de sobrescritura con contenido vacío de la API
+async fn should_protect_local_file(api_size: u64, local_path: &std::path::Path) -> bool {
+    if api_size != 0 {
+        return false;
+    }
+    if let Ok(meta) = tokio::fs::metadata(local_path).await {
+        meta.len() > 0
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::*;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    /// Versión sync para testing de la lógica de protección
+    fn should_protect_local_file_sync(api_size: u64, local_exists: bool, local_size: u64) -> bool {
+        api_size == 0 && local_exists && local_size > 0
+    }
+
+    #[rstest]
+    #[case::protect_existing(0, true, 5000, true)]
+    #[case::allow_new_file(0, false, 0, false)]
+    #[case::allow_real_download(1024, true, 5000, false)]
+    #[case::allow_overwrite_empty(0, true, 0, false)]
+    #[case::allow_real_update(2048, true, 1024, false)]
+    fn test_should_protect_local_file(
+        #[case] api_size: u64,
+        #[case] local_exists: bool,
+        #[case] local_size: u64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(should_protect_local_file_sync(api_size, local_exists, local_size), expected);
+    }
+
+    #[rstest]
+    fn test_should_protect_real_file_on_disk() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "contenido real").unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::should_protect_local_file(0, tmp.path()));
+        assert!(result, "Debe proteger archivo existente con contenido cuando API dice size=0");
+    }
+
+    #[tokio::test]
+    async fn test_stream_chunks_escribe_todo_sin_acumular() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("f.gdrivexp-part");
+        let mut out = tokio::fs::File::create(&tmp).await.unwrap();
+        let mut seen = Vec::new();
+        super::stream_chunks_to_file(
+            &mut out,
+            11,
+            |off, _size| async move {
+                Ok(match off {
+                    0 => b"hola ".to_vec(),
+                    _ => b"mundo!".to_vec(),
+                })
+            },
+            |off| seen.push(off),
+        )
+        .await
+        .unwrap();
+        out.flush().await.unwrap();
+        drop(out);
+        assert_eq!(tokio::fs::read(&tmp).await.unwrap(), b"hola mundo!");
+        assert_eq!(seen, vec![5, 11]);
+    }
+
+    #[tokio::test]
+    async fn test_stream_chunks_vacio_aborta_en_vez_de_loopear() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("f.gdrivexp-part");
+        let mut out = tokio::fs::File::create(&tmp).await.unwrap();
+        let r = super::stream_chunks_to_file(
+            &mut out,
+            100,
+            |_off, _size| async move { Ok(Vec::new()) },
+            |_| {},
+        )
+        .await;
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("vacío"), "esperaba error de chunk vacío: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_commit_temp_publica_y_limpia() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("final.txt");
+        let tmp = dir.path().join("final.txt.gdrivexp-part");
+        tokio::fs::write(&dest, b"viejo").await.unwrap();
+        tokio::fs::write(&tmp, b"nuevo").await.unwrap();
+        super::commit_temp_file(&tmp, &dest).await.unwrap();
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"nuevo");
+        assert!(!tmp.exists(), "el tmp debe desaparecer tras publicar");
+    }
+
+    #[tokio::test]
+    async fn test_commit_temp_sin_tmp_no_toca_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("final.txt");
+        tokio::fs::write(&dest, b"viejo").await.unwrap();
+        let r = super::commit_temp_file(&dir.path().join("no-existe.part"), &dest).await;
+        assert!(r.is_err(), "sin tmp debe fallar");
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"viejo");
+    }
+
+    #[test]
+    fn test_download_temp_mismo_dir_y_sufijo() {
+        let dest = std::path::PathBuf::from("/a/b/archivo.txt");
+        let tmp = super::download_temp_path(&dest);
+        assert_eq!(tmp.parent(), dest.parent());
+        assert_ne!(tmp, dest);
+        assert!(
+            tmp.to_string_lossy().ends_with(".gdrivexp-part"),
+            "sufijo inesperado: {}",
+            tmp.display()
+        );
+    }
+
+    #[rstest]
+    fn test_should_not_protect_nonexistent_file() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::should_protect_local_file(0, std::path::Path::new("/tmp/no_existe_xyz_test")));
+        assert!(!result, "No debe proteger archivo que no existe");
+    }
+
+    fn quar(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_token_avanza_sin_fallos() {
+        assert!(super::should_advance_token(&[], &quar(&[])));
+    }
+
+    #[test]
+    fn test_token_retenido_con_fallo_nuevo() {
+        let failed = vec!["abc".to_string()];
+        assert!(!super::should_advance_token(&failed, &quar(&[])));
+    }
+
+    #[test]
+    fn test_token_avanza_solo_con_cuarentena_total() {
+        let failed = vec!["abc".to_string()];
+        assert!(super::should_advance_token(&failed, &quar(&["abc"])));
+    }
+
+    #[test]
+    fn test_token_retenido_si_alguno_sin_cuarentena() {
+        let failed = vec!["abc".to_string(), "def".to_string()];
+        assert!(!super::should_advance_token(&failed, &quar(&["abc"])));
+    }
+
+    #[tokio::test]
+    async fn test_cuarentena_cuenta_y_limpia() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::MetadataRepository::new(&tmp.path().join("q.sqlite"))
+            .await
+            .unwrap();
+        assert_eq!(db.record_change_failure("fid1", "boom").await.unwrap(), 1);
+        assert_eq!(db.record_change_failure("fid1", "boom").await.unwrap(), 2);
+        assert_eq!(db.record_change_failure("fid1", "boom").await.unwrap(), 3);
+        db.clear_change_failure("fid1").await.unwrap();
+        // Tras limpiar (éxito posterior), el contador reinicia
+        assert_eq!(db.record_change_failure("fid1", "boom").await.unwrap(), 1);
+    }
+}

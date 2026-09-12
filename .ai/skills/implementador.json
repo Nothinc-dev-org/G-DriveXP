@@ -1,0 +1,8 @@
+{
+    "name": "Implementador",
+    "description": "Empapa al agente del contexto técnico completo antes de cualquier implementación: arquitectura, módulo implicado, patrones existentes y convenciones del código. Ejecutar antes de escribir código nuevo.",
+    "context_files": [
+        "AGENTS.md",
+        "docs/architecture.md"
+    ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "ProjectManager",
+  "description": "Mantiene la estructura del proyecto, separa código de documentación y actualiza los archivos AGENTS.md. Ejecutar al detectar desorden o al crear módulos.",
+  "context_files": [
+    "AGENTS.md",
+    "docs/architecture.md"
+  ]
+}
