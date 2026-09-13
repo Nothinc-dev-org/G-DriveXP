@@ -1,8 +1,8 @@
 %global debug_package %{nil}
 
 Name:           g-drive-xp
-Version:        1.1.0
-Release:        1%{?dist}
+Version:        1.1.1
+Release:        2%{?dist}
 Summary:        Cliente nativo de Google Drive para Fedora/GNOME
 License:        GPL-3.0-only
 URL:            https://github.com/Nothinc-dev-org/G-DriveXP
@@ -54,6 +54,11 @@ install -Dm644 emblem-gdrivexp-error.svg %{buildroot}%{_datadir}/icons/hicolor/s
 %{_datadir}/icons/hicolor/scalable/emblems/emblem-gdrivexp-error.svg
 
 %changelog
+* Sat Sep 12 2026 Nothinc Dev <dev@nothinc.org> - 1.1.1-2
+- Rebuild con avisos best-effort al mirror (el RPM -1 solo traía el fix de token)
+* Sat Sep 12 2026 Nothinc Dev <dev@nothinc.org> - 1.1.1-1
+- TokenInfo solo-refresh marcado expirado: yup-oauth2 refresca y el backend ya no muere al arrancar ("No se obtuvo ningún token válido")
+- Avisos al mirror best-effort (try_send): el sync pre-FUSE ya no se aparca si el canal se llena, el arranque no se congela
 * Sat Sep 12 2026 Nothinc Dev <dev@nothinc.org> - 1.1.0-1
 - Cierre de sesión con revocación en Google, cuarentena de permanentes en uploader, hard-delete de subárboles, espejo degradado visible con Reiniciar en un clic
 * Sat May 02 2026 Nothinc Dev <dev@nothinc.org> - 1.0.1-1

@@ -1,5 +1,5 @@
-VERSION    = 1.1.0
-RELEASE    = 1
+VERSION    = 1.1.1
+RELEASE    = 2
 ARCH       = x86_64
 NAME       = g-drive-xp
 TARBALL    = $(NAME)-$(VERSION)-$(ARCH).tar.gz

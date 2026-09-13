@@ -218,9 +218,10 @@ impl BackgroundSyncer {
 
         if total_applied > 0 {
             self.history.mark_all_synced();
-            if let Err(e) = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::Refresh).await {
-                tracing::warn!("⚠️ Aviso al mirror perdido (Refresh): {}", e);
-            }
+            crate::mirror::manager::notify_mirror(
+                &self.mirror_tx,
+                crate::mirror::manager::MirrorCommand::Refresh,
+            );
         }
 
         // 5. Purgar tombstones expirados (cada ciclo, es barato)
@@ -273,9 +274,10 @@ impl BackgroundSyncer {
             // → Hard delete: eliminar completamente de la DB local
             self.db.hard_delete_by_gdrive_id(file_id).await?;
             if let Some(p) = path_to_delete {
-                if let Err(e) = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await {
-                    tracing::warn!("⚠️ Aviso al mirror perdido (RemoteDeleted): {}", e);
-                }
+                crate::mirror::manager::notify_mirror(
+                    &self.mirror_tx,
+                    crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] },
+                );
             }
             return Ok(());
         }
@@ -290,9 +292,10 @@ impl BackgroundSyncer {
                 // ya ocurrió en GDrive y no necesita re-subirse por el uploader.
                 self.db.soft_delete_remote(file_id).await?;
                 if let Some(p) = path_to_delete {
-                    if let Err(e) = self.mirror_tx.send(crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] }).await {
-                    tracing::warn!("⚠️ Aviso al mirror perdido (RemoteDeleted): {}", e);
-                }
+                    crate::mirror::manager::notify_mirror(
+                        &self.mirror_tx,
+                        crate::mirror::manager::MirrorCommand::RemoteDeleted { paths: vec![p] },
+                    );
                 }
                 return Ok(());
             }
@@ -440,11 +443,10 @@ impl BackgroundSyncer {
             // Notificar al MirrorManager si el archivo fue restaurado desde la papelera
             if was_restored {
                 if let Ok(Some(rel_path)) = self.db.resolve_inode_to_relative_path(inode as u64).await {
-                    if let Err(e) = self.mirror_tx.send(
-                        crate::mirror::manager::MirrorCommand::RemoteRestored { paths: vec![rel_path] }
-                    ).await {
-                        tracing::warn!("⚠️ Aviso al mirror perdido (RemoteRestored): {}", e);
-                    }
+                    crate::mirror::manager::notify_mirror(
+                        &self.mirror_tx,
+                        crate::mirror::manager::MirrorCommand::RemoteRestored { paths: vec![rel_path] },
+                    );
                 }
             }
 

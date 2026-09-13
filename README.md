@@ -24,7 +24,7 @@ make install  # instala en el sistema (DESTDIR soportado)
 ## Instalación (usuarios)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Nothinc-dev-org/G-DriveXP/v1.1.0/g-drive-xp/packaging/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Nothinc-dev-org/G-DriveXP/v1.1.1/g-drive-xp/packaging/install.sh | bash
 ```
 
 O descarga el RPM desde [Releases](https://github.com/Nothinc-dev-org/G-DriveXP/releases/latest).

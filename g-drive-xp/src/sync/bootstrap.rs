@@ -323,9 +323,10 @@ pub async fn bootstrap_remaining_bfs(
 
     // Recalcular contadores y enviar refresh final
     db.rebuild_all_dir_counters().await?;
-    if let Err(e) = mirror_sender.send(crate::mirror::MirrorCommand::Refresh).await {
-        tracing::warn!("⚠️ Aviso al mirror perdido (Refresh final de bootstrap): {}", e);
-    }
+    crate::mirror::manager::notify_mirror(
+        mirror_sender,
+        crate::mirror::MirrorCommand::Refresh,
+    );
 
     // Señalar fin de escaneo
     history.set_scanning_total(0);

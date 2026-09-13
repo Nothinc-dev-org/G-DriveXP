@@ -14,6 +14,20 @@ use crate::gui::history::{ActionHistory, ActionType, TransferOp};
 /// (GaveUp): cubre muerte de tarea Y ceguera con tarea viva.
 pub static MIRROR_DEGRADED: AtomicBool = AtomicBool::new(false);
 
+/// Aviso best-effort al mirror: jamás bloquea al emisor.
+///
+/// El canal (cap 32) no tiene drenador hasta que el MirrorManager arranca
+/// (post-FUSE, vía supervisor) ni mientras hace bootstrap. Un `send().await`
+/// aquí aparca al sync pre-FUSE para siempre: con ≥32 avisos acumulados
+/// (p.ej. borrados remotos de meses) el arranque se congela sin FUSE, sin IPC,
+/// sin emblemas y sin restaurar `.hidden`. Los avisos son hints: el bootstrap
+/// del mirror y cada Refresh reconcilian el estado de todos modos.
+pub fn notify_mirror(tx: &mpsc::Sender<MirrorCommand>, cmd: MirrorCommand) {
+    if let Err(e) = tx.try_send(cmd) {
+        tracing::warn!("⚠️ Aviso al mirror descartado (canal lleno o sin receptor): {:?}", e);
+    }
+}
+
 const HIDDEN_MANIFEST: &str = ".gdrivexp_hidden_manifest";
 
 /// Comandos para el MirrorManager (desde IPC o GUI)
@@ -1929,6 +1943,21 @@ mod tests {
                 .is_err(),
             "el symlink obsoleto debe desaparecer del espejo"
         );
+    }
+
+    /// Regresión v1.1.1: los avisos al mirror jamás aparcan al emisor.
+    /// Con el canal lleno (cap 32, mirror aún sin arrancar en pre-FUSE),
+    /// el viejo `send().await` congelaba el arranque sin FUSE/IPC/emblemas.
+    #[tokio::test]
+    async fn notify_mirror_nunca_bloquea_con_canal_lleno() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<MirrorCommand>(1);
+        tx.send(MirrorCommand::Refresh).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { notify_mirror(&tx, MirrorCommand::Refresh) },
+        )
+        .await
+        .expect("notify_mirror no debe aparcar jamás");
     }
 
     /// ensure_watcher degrada visible (flag + historial) cuando el watcher

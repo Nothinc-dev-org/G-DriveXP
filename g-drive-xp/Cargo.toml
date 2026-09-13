@@ -1,6 +1,6 @@
 [package]
 name = "g-drive-xp"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 authors = ["FedoraDrive Team"]
 
@@ -35,6 +35,8 @@ relm4 = { version = "0.9", features = ["libadwaita"] }
 # Utilidades
 anyhow = "1.0"
 thiserror = "2.0"
+# Solo para marcar expirado el TokenInfo solo-refresh (forzar refresh en yup-oauth2)
+time = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"

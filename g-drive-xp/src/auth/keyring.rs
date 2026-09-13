@@ -92,12 +92,16 @@ impl KeyringTokenStore {
     }
 
     /// Reconstruye el TokenInfo que yup necesita a partir del refresh.
-    /// Access ausente/expirado => yup refresca solo. Función pura (testeable).
+    /// OJO: yup-oauth2 9 considera "válido" lo no-expirado, y `expires_at: None`
+    /// cuenta como NO expirado. Un TokenInfo solo-refresh sin expiración se
+    /// devuelve tal cual (sin refrescar) y `get_token()` da `Ok(None)` porque
+    /// no hay access token — el backend muere con "No se obtuvo ningún token
+    /// válido". Por eso se marca expirado desde el origen: fuerza el refresh.
     pub fn token_info_from_refresh(refresh_token: String) -> yup_oauth2::storage::TokenInfo {
         yup_oauth2::storage::TokenInfo {
             access_token: None,
             refresh_token: Some(refresh_token),
-            expires_at: None,
+            expires_at: Some(time::OffsetDateTime::UNIX_EPOCH),
             id_token: None,
         }
     }
@@ -284,6 +288,21 @@ mod tests {
         shred_file(&p).unwrap();
         assert!(!p.exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regresión v1.1.1: el TokenInfo solo-refresh DEBE verse expirado.
+    /// Sin expiración, yup-oauth2 9 lo da por válido, no refresca, y
+    /// `get_token()` devuelve `Ok(None)` → el backend muere al arrancar
+    /// ("No se obtuvo ningún token válido", sin FUSE ni IPC ni emblemas).
+    #[test]
+    fn token_solo_refresh_fuerza_refresh_en_yup() {
+        let info = KeyringTokenStore::token_info_from_refresh("REF".to_string());
+        assert!(info.refresh_token.is_some());
+        assert!(info.access_token.is_none());
+        assert!(
+            info.is_expired(),
+            "sin expiración yup no refresca y get_token da Ok(None)"
+        );
     }
 
     #[test]
